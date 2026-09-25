@@ -1,0 +1,167 @@
+# browser-hands
+
+MCP-сервер для Claude Code с одним инструментом `browse(url, goal)`. Он открывает `url` в фоновой вкладке Chrome
+и сам выполняет `goal`: кликает, печатает, выбирает. Действия выбирает модель Jev через OpenRouter. В ответ приходят
+статус, шаги, замеры времени, стоимость и скриншот вкладки. Цикл взят из
+[jev-ultrafast](https://github.com/browser-use/jev-ultrafast) (Browser Use, MIT, коммит
+`1231850a0bf1a0c0341fe408ef1668dbbfdfac46`): атомарный снимок страницы, затем один запрос к Jev (операция и
+спекулятивные цели), затем действие по наблюдаемому узлу. Что изменено: свой CDP-клиент на `websockets` вместо
+browser-harness, OpenRouter вместо TypeSafe API, MCP-сервер и CLI вместо демо-инспектора, телеметрии нет.
+
+## Установка
+
+Нужны macOS, Google Chrome, [uv](https://docs.astral.sh/uv/) и ключ OpenRouter.
+
+Из клона (версии зависимостей — из `uv.lock`); `<путь к клону>` — каталог, куда склонирован репозиторий:
+
+```bash
+cd <путь к клону>
+uv sync
+cp .env.example .env && chmod 600 .env   # вписать OPENROUTER_API_KEY=...
+uv run --env-file .env browser-hands --help
+```
+
+Как инструмент uv (зависимости разрешаются заново, без `uv.lock`):
+
+```bash
+uv tool install <путь к клону>                           # команда browser-hands в ~/.local/bin
+uv tool run --env-file <путь к клону>/.env browser-hands run --url … --goal …
+uv tool uninstall browser-hands                          # откат
+```
+
+Ключ и `BROWSER_HANDS_*` читаются только из окружения, `.env` в окружение загружает `uv --env-file`. FastMCP
+(`serve`) сам читает `.env` из рабочего каталога, но берёт оттуда только переменные `FASTMCP_*`.
+
+## Режимы браузера
+
+- **attach** (по умолчанию) — ваш Chrome с вашими куками. Один раз откройте `chrome://inspect/#remote-debugging`
+  и включите удалённую отладку. При первом подключении Chrome спросит разрешение: нажмите «Разрешить». Окно
+  появляется один раз на процесс сервера. Агент работает в своей фоновой вкладке, ваши вкладки не трогает и
+  закрывает свою в конце (кроме `keep_open`). Пока отладка включена, браузером может управлять любой локальный процесс.
+- **launch** — отдельный Chrome с профилем `~/.cache/browser-hands/chrome-profile`, куки сохраняются между
+  запусками. `--fresh-profile` даёт временный профиль, который удаляется по выходу. `BROWSER_HANDS_HEADLESS=1` или
+  `--headless` запускают Chrome без окна.
+- **ws** — готовый `ws://127.0.0.1:<port>/devtools/browser/<id>` в `BROWSER_HANDS_WS_URL` или `--ws`; важнее режима.
+
+Автоматического перехода из attach в launch нет: если Chrome недоступен, `browse` вернёт `failed` с причиной.
+
+## Переменные
+
+Пустое значение означает значение по умолчанию. Неверное значение — ошибка с именем переменной.
+
+| Переменная | По умолчанию | Что задаёт |
+| --- | --- | --- |
+| `OPENROUTER_API_KEY` | — | ключ для Jev и текстовой модели; подставляется, только если адрес модели на `openrouter.ai` |
+| `BROWSER_HANDS_MODE` | `attach` | `attach` или `launch` |
+| `BROWSER_HANDS_WS_URL` | — | готовый ws-адрес браузера; важнее `MODE` |
+| `BROWSER_HANDS_CHROME_DATA_DIR` | `~/Library/Application Support/Google/Chrome` | attach: где лежит `DevToolsActivePort` |
+| `BROWSER_HANDS_LAUNCH_DATA_DIR` | `~/.cache/browser-hands/chrome-profile` | launch: профиль |
+| `BROWSER_HANDS_CHROME_BINARY` | `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` | launch: какой Chrome запускать |
+| `BROWSER_HANDS_HEADLESS` | `0` | launch без окна (`1/true/yes`) |
+| `BROWSER_HANDS_CONNECT_TIMEOUT_S` | `60` | сколько ждать подключения («Разрешить» в attach) |
+| `BROWSER_HANDS_SCREENSHOT_QUALITY` | `60` | JPEG, 1–100 |
+| `BROWSER_HANDS_SCREENSHOT_SCALE` | `1` | масштаб скриншота, (0; 1]; `0.5` — в 3–4 раза меньше байт |
+| `BROWSER_HANDS_JEV_URL` | `https://openrouter.ai/api/v1/systemone` | адрес Jev |
+| `BROWSER_HANDS_JEV_MODEL` | `jev-latest` | модель Jev |
+| `BROWSER_HANDS_JEV_API_KEY` | `OPENROUTER_API_KEY` | отдельный ключ для Jev; обязателен, если `JEV_URL` не на `openrouter.ai` |
+| `BROWSER_HANDS_TEXT_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-совместимый адрес текстовой модели |
+| `BROWSER_HANDS_TEXT_MODEL` | `inception/mercury-2.5` | модель, которая пишет текст для `TYPE_TEXT` |
+| `BROWSER_HANDS_TEXT_API_KEY` | `OPENROUTER_API_KEY` | отдельный ключ для текстовой модели; обязателен, если `TEXT_BASE_URL` не на `openrouter.ai` |
+| `BROWSER_HANDS_TEXT_REASONING` | `none` | `none` или `low` |
+| `BROWSER_HANDS_MAX_STEPS` | `25` | лимит шагов по умолчанию, 1–50 |
+| `BROWSER_HANDS_TIMEOUT_S` | `90` | дедлайн прогона по умолчанию, секунды, (0; 300] |
+| `BROWSER_HANDS_LOG` | `INFO` | уровень логов; логи идут только в stderr; полный url и цель — только на `DEBUG` |
+
+## CLI
+
+```bash
+uv run --env-file .env browser-hands run --url https://en.wikipedia.org/wiki/Main_Page \
+  --goal "Find and open the Wikipedia article about Gödel's incompleteness theorems." --screenshot traces/run.jpg
+```
+
+Флаги `run`: `--max-steps N` (≤ 50), `--timeout S` (≤ 300), `--keep-open`, `--mode attach|launch`, `--headless`, `--ws URL`,
+`--data-dir P`, `--fresh-profile`, `--json` (RunResult без байтов скриншота), `--screenshot out.jpg`. Флаги важнее
+переменных. Код выхода: `0` при `done`, `2` в остальных случаях. `browser-hands serve` запускает MCP-сервер по stdio
+и принимает те же флаги браузера. Команда `run` заменяет `examples/run.py` из jev-ultrafast, но цель у неё одна.
+
+## Claude Code
+
+Регистрация (для всех проектов пользователя) — из каталога клона: `$(pwd)` при регистрации раскрывается в абсолютный
+путь, и он сохраняется в `~/.claude.json`.
+
+```bash
+cd <путь к клону>
+claude mcp add -s user browser-hands -- uv run --frozen --directory "$(pwd)" --env-file "$(pwd)/.env" browser-hands serve
+```
+
+Проверка: `claude mcp list` показывает `browser-hands: … - ✓ Connected`. Ключ не попадает в `~/.claude.json`: при
+каждом запуске его читает `uv` из `.env`. Режим меняется в `.env` (`BROWSER_HANDS_MODE=launch`) или флагом после
+`serve`. Если сервер поставлен через `uv tool install`, после `--` пишется
+`uv tool run --env-file <путь к клону>/.env browser-hands serve`.
+
+Откат: `claude mcp remove -s user browser-hands`.
+
+Как работает сервер:
+
+- `browse(url, goal, max_steps?, timeout_seconds?, keep_open?)`. Chrome и HTTP-клиенты создаются при первом вызове и
+  живут, пока жив процесс сервера. Мёртвое соединение переподключается при следующем вызове.
+- Второй `browse`, запущенный параллельно, ждёт окончания первого.
+- Отмена (Esc) останавливает агента между шагами (начатый шаг доходит до конца) с `failed: cancelled`. Отменённый
+  вызов, который ещё ждал в очереди, не запускается.
+- Лимиты одного вызова: `max_steps` ≤ 50, `timeout_seconds` ≤ 300.
+- Стартовый `url` — только `http://`, `https://` или `about:blank`; адрес без схемы (`example.com`) дополняется до
+  `https://`. Другие схемы (`file:`, `chrome:`, `data:`, `javascript:` …) дают `failed`, вкладка не открывается.
+- SIGTERM, SIGINT и SIGHUP: сервер отменяет прогон и сразу закрывает Chrome (launch — процесс, attach — соединение).
+- Ошибки (нет ключа, Chrome недоступен, ядро не отвечает) приходят текстом `status: failed` и `error: …`, а не
+  исключением.
+
+## Ответ `browse` и как проверять результат
+
+Текст ответа: `status` (`done|blocked|failed|timeout|step_limit`), `error`, `url`, `title`, список шагов
+`N. OP цель — "текст"`, `cost: $…` (сумма `usage.cost` по шагам), `elapsed Xs (model / text / browser / wait)`.
+К тексту приложен JPEG 1120×780 той же вкладки на момент окончания.
+
+`done` означает только, что модель сочла цель достигнутой. Результат надо проверять по скриншоту и `url`.
+
+## Безопасность и приватность
+
+- **Что уходит в OpenRouter** (Jev и текстовой модели) на каждом шаге: `goal`, url и title страницы, видимый текст
+  до 6000 символов, подписи элементов, значения видимых полей (кроме `password`, `hidden` и `file`), последние шаги.
+- **Скриншот** вкладки в конце прогона попадает в контекст Claude.
+- **attach — это ваши куки.** Агент действует от вашего имени на всех сайтах, где вы вошли. Текст страницы идёт в
+  модель, поэтому страница может управлять агентом через prompt injection. Для незнакомых сайтов — `--mode launch`
+  или `--fresh-profile`.
+- **Необратимое не поручать:** оплаты, отправку писем и сообщений. Или ставить цель «заполни форму и остановись перед
+  отправкой» и проверять по скриншоту.
+- **Потолки:** 50 шагов и 300 с на прогон. Отмена (Esc) останавливает агента между шагами.
+- **Ключи** — только из окружения, в логи и `repr` не попадают. `OPENROUTER_API_KEY` отправляется только на
+  `openrouter.ai`; для другого адреса модели нужен свой `BROWSER_HANDS_JEV_API_KEY` или `BROWSER_HANDS_TEXT_API_KEY`.
+  Логи HTTP-библиотек (`hpack`, `h2`, `httpcore`, `httpx`) не ниже `WARNING` даже при `BROWSER_HANDS_LOG=DEBUG`.
+- **Логи:** на `INFO` — только хост стартового адреса; полный url и цель — на `DEBUG`.
+- **Известное ограничение:** снимок страницы и проверка, не перекрыт ли элемент, выполняются в контексте страницы
+  (без isolated world). Враждебная страница может их обмануть: подменить то, что видит агент, и то, куда он кликнет.
+
+## Ограничения
+
+- Агент не видит iframe, shadow DOM и canvas: снимок страницы их не читает.
+- Загрузка файлов, всплывающие окна и новые вкладки (`target=_blank`) не поддерживаются. Новая вкладка остаётся
+  открытой, закройте её вручную.
+- Не поддерживаются вложенная прокрутка и сложные клавиатурные виджеты. Имена элементов берутся из распространённых
+  HTML/ARIA-атрибутов, а не по полной спецификации accessible name.
+- Если сервер упал или соединение оборвалось, вкладка агента может остаться открытой. Закройте её вручную.
+- В attach вкладка фоновая, Chrome замедляет её таймеры: страницы с логикой на `setTimeout` могут «ждать» дольше.
+- Каждый скриншот в ответе занимает 110–200 КБ base64 в контексте. `BROWSER_HANDS_SCREENSHOT_SCALE=0.5` уменьшает его.
+
+## Разработка
+
+- `bash scripts/check.sh` — ruff, проверка формата, pytest (офлайн, без ключей) и `node --check` для `snapshot.js`.
+- `uv run --env-file .env python scripts/live_wikipedia.py` — живая проверка ядра: launch, headless, стоит доли цента.
+- `uv run --env-file .env python scripts/bench.py --runs 5 --headless --fresh-profile --url … --goal …` —
+  бенчмарк на тёплом Chrome: таблица, медиана и p95 по `elapsed/model/text/browser/wait`, сумма cost, JSONL в
+  `traces/`. Платный.
+
+## Лицензия и происхождение
+
+MIT, см. `LICENSE`. Часть кода (цикл агента, `snapshot.js`, вопросы к модели, исполнитель действий) перенесена из
+jev-ultrafast (Copyright (c) 2026 Browser Use, MIT, коммит `1231850a0bf1a0c0341fe408ef1668dbbfdfac46`); их лицензия —
+`LICENSE-jev-ultrafast`. Демо-инспектор, запись видео, browser-harness и телеметрию не переносили.
