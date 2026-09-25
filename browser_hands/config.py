@@ -51,7 +51,10 @@ class ModelConfig:
     text_model: str = "inception/mercury-2.5"
     text_api_key: str = field(default="", repr=False)  # BROWSER_HANDS_TEXT_API_KEY; OPENROUTER_API_KEY — см. from_env
     text_reasoning: Literal["none", "low"] = "none"
-    request_timeout_s: float = 25.0
+    # Потолок всего HTTP-запроса по часам (соединение, ожидание, тело, повторы 429/503), не дольше остатка дедлайна
+    # прогона. Обычно Jev — 0,5–1 с, текст — 1–1,5 с; 25.09 провайдер держал соединение ~120 с и отдал 200 с ошибкой.
+    jev_timeout_s: float = 10.0  # BROWSER_HANDS_JEV_TIMEOUT_S
+    text_timeout_s: float = 8.0  # BROWSER_HANDS_TEXT_TIMEOUT_S; вышел — агент повторяет запрос один раз
 
 
 @dataclass(slots=True)
@@ -59,6 +62,7 @@ class RunConfig:
     max_steps: int = 25
     timeout_s: float = 90.0
     keep_open: bool = False
+    new_tab: bool = False  # attach: всегда своя вкладка, даже если сайт открыт у пользователя
 
 
 @dataclass(slots=True)
@@ -100,6 +104,8 @@ class Settings:
             text_api_key=_get(env, "TEXT_API_KEY") or _fallback(fallback_key, text_base_url),
             text_reasoning=_choice(_get(env, "TEXT_REASONING"), _REASONING, ENV_PREFIX + "TEXT_REASONING")
             or m.text_reasoning,
+            jev_timeout_s=_float(env, "JEV_TIMEOUT_S", m.jev_timeout_s, maximum=TIMEOUT_LIMIT_S),
+            text_timeout_s=_float(env, "TEXT_TIMEOUT_S", m.text_timeout_s, maximum=TIMEOUT_LIMIT_S),
         )
         run = RunConfig(
             max_steps=_int(env, "MAX_STEPS", r.max_steps, 1, MAX_STEPS_LIMIT),
@@ -144,6 +150,7 @@ def apply_overrides(
     max_steps: int | None = None,
     timeout_s: float | None = None,
     keep_open: bool | None = None,
+    new_tab: bool | None = None,
 ) -> Settings:
     """Флаги CLI поверх env (None = не задан); возвращает новые Settings, исходные не меняет.
 
@@ -171,6 +178,8 @@ def apply_overrides(
         run = replace(run, timeout_s=timeout_s)
     if keep_open is not None:
         run = replace(run, keep_open=keep_open)
+    if new_tab is not None:
+        run = replace(run, new_tab=new_tab)
     return replace(settings, browser=browser, run=run)
 
 

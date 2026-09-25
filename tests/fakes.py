@@ -6,7 +6,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from browser_hands.config import BrowserConfig, ModelConfig, RunConfig
-from browser_hands.types import RunResult, Status, Step, Timing
+from browser_hands.scenario import ScenarioStep
+from browser_hands.types import RunResult, Status, Step, TabKind, Timing
 
 JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00" + b"\x00" * 32 + b"\xff\xd9"
 
@@ -21,8 +22,14 @@ def make_result(
     title: str = "Example",
     error: str | None = None,
     tab_kept: bool = False,
+    tab: TabKind | None = "new",
+    scenario: tuple[int, int] | None = None,
+    jev_calls: int = 0,
 ) -> RunResult:
-    """RunResult с `steps` шагами: нечётные — CLICK, чётные — TYPE_TEXT; `cost` — цена одного шага."""
+    """RunResult с `steps` шагами: нечётные — CLICK, чётные — TYPE_TEXT; `cost` — цена одного шага.
+
+    `scenario=(done, total)` — режим сценария: `scenario_done/total`, у шага i `scenario_step = min(i, total)`.
+    """
     step_list = [
         Step(
             index=i,
@@ -34,6 +41,7 @@ def make_result(
             confidence=0.9,
             timing=Timing(model_ms=600, text_ms=0 if i % 2 else 300, browser_ms=40, wait_ms=50),
             cost=cost,
+            scenario_step=None if scenario is None else min(i, scenario[1]),
         )
         for i in range(1, steps + 1)
     ]
@@ -50,6 +58,10 @@ def make_result(
         model_calls=len(step_list),
         error=error,
         tab_kept=tab_kept,
+        tab=tab,
+        scenario_done=None if scenario is None else scenario[0],
+        scenario_total=None if scenario is None else scenario[1],
+        jev_calls=jev_calls,
     )
 
 
@@ -175,6 +187,7 @@ class FakeCore:
         *,
         screenshot_quality: int,
         screenshot_scale: float,
+        steps: list[ScenarioStep] | None = None,
         cancel: threading.Event | None = None,
     ) -> FakeAgent:
         self.agents.append(
@@ -186,6 +199,7 @@ class FakeCore:
                 "run": run,
                 "screenshot_quality": screenshot_quality,
                 "screenshot_scale": screenshot_scale,
+                "steps": steps,
                 "cancel": cancel,
             }
         )

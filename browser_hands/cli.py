@@ -1,6 +1,7 @@
 """Командная строка: `browser-hands run` — один прогон в терминале, `browser-hands serve` — MCP-сервер по stdio.
 
 Флаги перекрывают переменные `BROWSER_HANDS_*`. Ядро импортируется лениво (через server.BrowseService).
+`run` берёт цель (`--goal`), сценарий (`--steps-file` и/или `--step`) или оба.
 """
 
 import argparse
@@ -19,6 +20,7 @@ from typing import Any
 
 from browser_hands.config import ConfigError, Settings, apply_overrides
 from browser_hands.logging import get_logger
+from browser_hands.scenario import ScenarioError, ScenarioStep, parse_steps
 from browser_hands.server import BrowseService, build_server, format_result
 from browser_hands.types import RunResult
 
@@ -42,10 +44,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = commands.add_parser("run", parents=[browser], help="один прогон: шаги и замеры в stdout")
     run.add_argument("--url", required=True, help="стартовая страница")
-    run.add_argument("--goal", required=True, help="что сделать и когда остановиться")
+    run.add_argument("--goal", default="", help="что сделать и когда остановиться; необязателен при сценарии")
+    run.add_argument(
+        "--steps-file",
+        metavar="P",
+        type=Path,
+        help='сценарий: JSON-список [{"do": "…", "text": "…"}]; do — по-английски, text печатается дословно',
+    )
+    run.add_argument(
+        "--step", metavar="DO", action="append", default=[], help="шаг сценария без текста; повторяемый, после файла"
+    )
     run.add_argument("--max-steps", type=int, metavar="N")
     run.add_argument("--timeout", type=float, metavar="S", help="общий дедлайн прогона, секунды")
-    run.add_argument("--keep-open", action="store_true", default=None, help="не закрывать вкладку (attach)")
+    run.add_argument("--keep-open", action="store_true", default=None, help="не закрывать свою вкладку (attach)")
+    run.add_argument(
+        "--new-tab", action="store_true", default=None, help="attach: своя вкладка, даже если сайт уже открыт у вас"
+    )
     run.add_argument("--json", action="store_true", help="RunResult как JSON (без байтов скриншота)")
     run.add_argument("--screenshot", metavar="out.jpg", type=Path, help="сохранить финальный скриншот")
 
@@ -60,10 +74,14 @@ def main(
     factories: Mapping[str, Any] | None = None,
 ) -> int:
     """Точка входа `browser-hands`. `env` и `factories` (фабрики ядра для BrowseService) — для тестов."""
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "run" and not args.goal.strip() and args.steps_file is None and not args.step:
+        parser.error("run: нужен --goal или сценарий (--steps-file, --step)")
     try:
         settings = _settings(args, os.environ if env is None else env)
-    except ConfigError as exc:
+        steps = _scenario(args) if args.command == "run" else None
+    except (ConfigError, ScenarioError) as exc:
         print(f"browser-hands: {exc}", file=sys.stderr)
         return EXIT_NOT_DONE
 
@@ -71,13 +89,38 @@ def main(
         service = BrowseService(settings, **(factories or {}))
         if args.command == "serve":
             return _serve(service, cleanup)
-        return _run(service, args)
+        return _run(service, args, steps)
+
+
+def _scenario(args: argparse.Namespace) -> list[ScenarioStep] | None:
+    """Шаги из `--steps-file` (JSON-список `{do, text?}`), затем из `--step`; сценария нет — None."""
+    if args.steps_file is None and not args.step:
+        return None
+    raw: list[object] = []
+    if args.steps_file is not None:
+        path: Path = args.steps_file
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ScenarioError(f"--steps-file {path}: {exc.strerror or exc}") from None
+        except ValueError as exc:  # JSONDecodeError, UnicodeDecodeError
+            raise ScenarioError(f"--steps-file {path}: не JSON ({exc})") from None
+        if not isinstance(loaded, list):
+            raise ScenarioError(f"--steps-file {path}: нужен JSON-список шагов, а не {type(loaded).__name__}")
+        raw.extend(loaded)
+    raw.extend({"do": do} for do in args.step)
+    return parse_steps(raw)
 
 
 def _settings(args: argparse.Namespace, env: Mapping[str, str]) -> Settings:
     run_flags: dict[str, Any] = {}
     if args.command == "run":
-        run_flags = {"max_steps": args.max_steps, "timeout_s": args.timeout, "keep_open": args.keep_open}
+        run_flags = {
+            "max_steps": args.max_steps,
+            "timeout_s": args.timeout,
+            "keep_open": args.keep_open,
+            "new_tab": args.new_tab,
+        }
     if args.fresh_profile and (args.mode == "attach" or args.ws):
         raise ConfigError("--fresh-profile — только для launch (без --mode attach и --ws)")
     settings = apply_overrides(
@@ -110,18 +153,19 @@ def _fresh_profile(settings: Settings, *, enabled: bool) -> Iterator[tuple[Setti
         cleanup()
 
 
-def _run(service: BrowseService, args: argparse.Namespace) -> int:
+def _run(service: BrowseService, args: argparse.Namespace, steps: list[ScenarioStep] | None = None) -> int:
     try:
         with _signal_exit(signal.SIGTERM):  # kill → finally: launch-Chrome не остаётся сиротой
-            result = service.browse(args.url, args.goal)  # лимиты и keep_open — уже в settings.run
+            # лимиты, keep_open и new_tab — уже в settings.run
+            result = service.browse(args.url, args.goal, steps=steps)
     finally:
         service.close()
 
     screenshot = _save_screenshot(result, args.screenshot)
     if args.json:
-        print(json.dumps(result_to_json(result, screenshot), ensure_ascii=False, indent=2))
+        print(json.dumps(result_to_json(result, screenshot, scenario=steps), ensure_ascii=False, indent=2))
     else:
-        print(format_result(result, verbose=True))
+        print(format_result(result, verbose=True, steps=steps))
         if screenshot is not None:
             print(f"screenshot saved: {screenshot}")
     return EXIT_DONE if result.status == "done" else EXIT_NOT_DONE
@@ -196,12 +240,19 @@ def _save_screenshot(result: RunResult, path: Path | None) -> Path | None:
     return path
 
 
-def result_to_json(result: RunResult, screenshot: Path | None = None) -> dict[str, Any]:
-    """RunResult → dict для `--json`: байты скриншота заменены размером и путём файла."""
+def result_to_json(
+    result: RunResult, screenshot: Path | None = None, *, scenario: Sequence[ScenarioStep] | None = None
+) -> dict[str, Any]:
+    """RunResult → dict для `--json`: байты скриншота заменены размером и путём файла.
+
+    `scenario` — входной сценарий (ключ `scenario`: `[{do, text}]`); в режиме цели ключа нет.
+    """
     data = asdict(result)
     shot = data.pop("screenshot_jpeg")
     data["screenshot_bytes"] = len(shot) if shot else 0
     data["screenshot_path"] = str(screenshot) if screenshot is not None else None
+    if scenario is not None:
+        data["scenario"] = [asdict(step) for step in scenario]
     return data
 
 
