@@ -391,15 +391,6 @@ class Tab:
         self._browser_s -= seconds
         self._wait_s += seconds
 
-    def _sleep(self, seconds: float) -> None:
-        with self._timed(wait=True):
-            time.sleep(seconds)
-
-    def pause(self, seconds: float) -> None:
-        """Подождать (агент ждёт появления элементов); время идёт в `wait_ms`. Совместимость: agent.py до пакета
-        «сценарий» (docs/plan-waits.md §6.2 — там `await_change` вместо опроса); у вкладки своих пауз больше нет."""
-        self._sleep(seconds)
-
     def _budget(self) -> float | None:
         if self.deadline is None:
             return None
@@ -611,10 +602,6 @@ class Tab:
         if left <= 0:
             return self._pending() == 0
         return self.client.wait_events(self.session_id, lambda: self._cancelled() or self._pending() == 0, left)
-
-    def settle(self, action: dict[str, Any] | None = None) -> dict[str, Any] | None:
-        """Совместимость (agent.py до пакета «сценарий», scripts/eval.py): `await_ready`; None — не ждали."""
-        return self.await_ready(action) or None
 
     def await_ready(self, action: dict[str, Any] | None = None) -> dict[str, Any]:
         """Страница готова к решению после действия (docs/plan-waits.md §2): только чтение, время — `wait_ms`.

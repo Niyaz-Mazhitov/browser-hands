@@ -998,7 +998,6 @@ def test_no_interactive_elements_delays_the_model_until_they_appear(monkeypatch,
     assert len(seen) == 1 and seen[0][1] == []
     assert any(a["kind"] == "click" for a in seen[0][0]["actions"])  # Jev увидел уже готовую страницу
     assert tab.await_change.call_count == 3 and all(c.args == () for c in tab.await_change.call_args_list)
-    tab.pause.assert_not_called()  # ждём изменения страницы, а не опрашиваем по таймеру
     waiting = [r.getMessage() for r in caplog.records if "Нет элементов" in r.getMessage()]
     # одна строка на ожидание (запись может прийти дважды: handler на логгере и корень), только хост, без токена
     assert set(waiting) == {"Нет элементов для действия, жду до 25 с (example.test)"}
@@ -1065,11 +1064,15 @@ def test_empty_page_wait_stops_on_cancel(monkeypatch, owned):
         never_closed(tab)
 
 
-def test_empty_page_mid_run_waits_only_briefly_then_asks_the_model(monkeypatch):
+@pytest.mark.parametrize("step_s", [0.25, 1.5], ids=["change-soon", "fuse"])
+def test_empty_page_mid_run_waits_for_one_change_then_asks_the_model(monkeypatch, step_s):
+    """После первого вызова Jev (форма после Submit — «Thanks» без элементов, прокрутили за контролы) страница уже
+    дождалась готовности после действия: одно ожидание следующего изменения (событие или предохранитель), потом решает
+    Jev. Потолка по времени нет (было `EMPTY_PAGE_WAIT_LATER_S` = 1 с — число на глаз)."""
     tab = make_tab()
     pages = [page(), empty_page("middle of a long article, no controls on screen")]
     tab.observe.side_effect = lambda *_a, **_k: pages.pop(0) if len(pages) > 1 else pages[0]
-    clock = fake_clock(monkeypatch, tab, step_s=0.25)
+    clock = fake_clock(monkeypatch, tab, step_s=step_s)
     asked = []
 
     def choose(*_a, **_k):
@@ -1079,10 +1082,9 @@ def test_empty_page_mid_run_waits_only_briefly_then_asks_the_model(monkeypatch):
     monkeypatch.setattr(loop, "choose", Mock(side_effect=choose))
     result = make_agent(tab, timeout_s=90).run()
     assert result.status == "done" and result.model_calls == 2
-    assert loop.EMPTY_PAGE_WAIT_LATER_S == 1.0  # после действия страница уже успокоилась: форма после Submit — не ждать
-    # не 25 с: после первого вызова Jev — 1 с (ожидание по событиям; каждое здесь — 0,25 «с»); ожидание после клика
-    # (await_ready) часы не двигает
-    assert tab.await_change.call_count == 4 and asked[1] - asked[0] == 1.0
+    assert not hasattr(loop, "EMPTY_PAGE_WAIT_LATER_S")
+    # одно ожидание изменения; ожидание после клика (await_ready) часы не двигает
+    assert tab.await_change.call_count == 1 and asked[1] - asked[0] == step_s
 
 
 def test_empty_page_mid_run_wait_respects_the_deadline(monkeypatch):
@@ -1092,8 +1094,8 @@ def test_empty_page_mid_run_wait_respects_the_deadline(monkeypatch):
     fake_clock(monkeypatch, tab, step_s=0.25)
     choose = scripted(decision("e3", "CLICK"))
     monkeypatch.setattr(loop, "choose", choose)
-    result = make_agent(tab, timeout_s=0.5).run()  # дедлайн раньше потолка 1 с
-    assert result.status == "timeout" and choose.call_count == 1 and tab.await_change.call_count == 2
+    result = make_agent(tab, timeout_s=0.2).run()  # дедлайн вышел во время ожидания изменения
+    assert result.status == "timeout" and choose.call_count == 1 and tab.await_change.call_count == 1
 
 
 def test_second_chance_end_to_end_on_fake_chrome_waits_once_then_reads_the_page(monkeypatch, tmp_path):

@@ -697,6 +697,13 @@ def load_report():
 report_module = load_report()
 
 
+def test_sweep_report_and_calibrate_share_one_frame():
+    from browser_hands import config
+
+    assert report_module.FRAME_S is config.FRAME_S == 1 / 60  # кадр 60 Гц — одно число на оба скрипта
+    assert not hasattr(report_module, "FRAME_MS")
+
+
 def sweep_row(axis, value, *, mode="scenario", ok=True, elapsed=6000, wait=900, label="before", **extra):
     params = {"delay": 700, "remount": value if axis == "remount" else 0, "sendstatus": 1500, "net": 1}
     return {

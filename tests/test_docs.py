@@ -36,8 +36,8 @@ def test_user_tab_rule_is_the_same_in_readme_and_tool_descriptions():
 def test_readme_states_both_empty_page_ceilings():
     text = flat(README)
     assert f"в начале прогона — до {agent.EMPTY_PAGE_WAIT_S:g} с" in text
-    assert f"в середине (после первого решения Jev) — до {agent.EMPTY_PAGE_WAIT_LATER_S:g} с" in text
-    assert f"пауза до {agent.EMPTY_PAGE_WAIT_LATER_S:g} с" in text  # «Ограничения»
+    assert "в середине (после первого решения Jev) — одно ожидание следующего изменения страницы" in text
+    assert "пустой экран в середине работы (например, прокрутили за все кнопки) — одно ожидание следующего" in text
 
 
 def test_readme_limitations_state_settle_and_single_retries():

@@ -233,10 +233,9 @@ def test_wait_action_waits_for_the_next_change_without_a_pause(monkeypatch):
     client = Mock()
     tab = make_tab(client)
     tab.fresh = Mock(return_value=True)
-    tab._sleep = Mock()
     tab.act(p["actions"][3], p)
-    tab._sleep.assert_not_called()  # WAIT — не пауза по часам
-    client.call.assert_not_called()
+    client.call.assert_not_called()  # WAIT — не пауза по часам и не ввод
+    assert not any(hasattr(Tab, name) for name in ("pause", "settle", "_sleep"))  # пауз по времени у вкладки нет
     assert tab.after_input == p["actions"][3]
     client.call_until.return_value = CHANGED
     client.call.side_effect = [READY_DONE, {"result": {"value": p}}]
@@ -383,7 +382,6 @@ def test_waits_are_skipped_after_cancel():
     tab.cancel.set()
     assert tab.await_ready({"kind": "click", "node": 20}) == {}
     assert tab.await_change() == {}
-    assert tab.settle({"kind": "retry"}) is None  # совместимость agent.py: None — не ждали
     client.call.assert_not_called()
     client.call_until.assert_not_called()
 

@@ -82,9 +82,6 @@ NO_PROGRESS_STEPS = 3
 SCREENSHOT_TIMEOUT_S = 5.0
 CANCELLED = "cancelled"
 EMPTY_PAGE_WAIT_S = 25.0  # потолок ожидания элементов для действия до первого вызова Jev (не дольше дедлайна)
-# То же после первого вызова: страница после действия уже дождалась готовности, пустой экран посреди работы (форма
-# после Submit — «Thanks» без элементов) — дальше решает Jev. Ждём событиями (`Tab.await_change`), не опросом.
-EMPTY_PAGE_WAIT_LATER_S = 1.0
 INTERACTIVE_KINDS = frozenset({"fill", "click", "select"})
 TEXT_ATTEMPTS = 2  # текст переспрашивается один раз (невалидный ответ, таймаут): до ввода, ничего не напечатано
 # Пороги модели — `Agent.thresholds` (`config.Thresholds`); константы ниже — алиасы значений по умолчанию (тесты, docs).
@@ -515,16 +512,24 @@ class Agent(AgentLike):
 
     def _await_interactive(self) -> None:
         """Пока в снимке нет элементов для действия (экран загрузки, логотип), Jev не зовём: ждём следующего изменения
-        страницы (`Tab.await_change`, не опрос) и переснимаем, не дольше потолка и дедлайна; отмена — сразу. Потолок —
-        `EMPTY_PAGE_WAIT_S` до первого вызова Jev в прогоне, потом `EMPTY_PAGE_WAIT_LATER_S` (прокрутили за контролы,
-        короткая перерисовка). Шаги и `model_calls` не растут, время — `wait_ms`. Потолок вышел — Jev решает по пустой
-        странице (DONE/WAIT законны)."""
+        страницы (`Tab.await_change`, не опрос) и переснимаем, не дольше `EMPTY_PAGE_WAIT_S` и дедлайна; отмена — сразу.
+        После первого вызова Jev (прокрутили за контролы, форма после Submit — «Thanks» без элементов) страница после
+        действия уже дождалась готовности: одно ожидание следующего изменения (событие; нет — предохранитель) и свежий
+        снимок, без потолка по времени. Шаги и `model_calls` не растут, время — `wait_ms`. Элементов нет и тогда — Jev
+        решает по пустой странице (DONE/WAIT законны)."""
         tab = self._require_tab()
         page = self._page
         if page is None or interactive(page):
             self._empty_since = None
             return
-        ceiling = EMPTY_PAGE_WAIT_S if self._jev_calls == 0 else EMPTY_PAGE_WAIT_LATER_S
+        if self._jev_calls:
+            self._check_cancel()
+            self._remaining()
+            log.debug("Нет элементов для действия посреди работы — жду изменения страницы")
+            tab.await_change()
+            self._page = tab.observe()  # StalePage — наружу, в _tick: переснимет
+            return
+        ceiling = EMPTY_PAGE_WAIT_S
         if self._empty_since is None:
             self._empty_since = time.monotonic()
             log.info("Нет элементов для действия, жду до %g с (%s)", ceiling, url_host(page.get("url") or self.url))
