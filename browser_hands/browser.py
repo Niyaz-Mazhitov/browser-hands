@@ -59,7 +59,10 @@ MUTATION_ATTRIBUTES = (
 # не ловят нового класса работы, а только добавляют кадр задержки: всё, что дольше кадра (таймеры, сеть, переходы),
 # закрывают сигналы сети, анимаций и aria-busy, а не счёт кадров.
 QUIET_FRAMES = 2
-WAIT_DEADLINE_MARGIN_S = 0.5  # предохранитель ≤ остаток дедлайна минус это: ответ успевает до дедлайна CDP-вызова
+# Предохранитель ≤ остаток дедлайна минус это: промис страницы кончается раньше дедлайна прогона. Таймаут самого
+# CDP-вызова ожидания — остаток дедлайна (`_budget`): занятый главный поток (долгая задача) запускает промис позже, и
+# ответ приходит позже предохранителя. Нет ответа и тогда — исход ожидания `fuse`, не ошибка: действие уже исполнено.
+WAIT_DEADLINE_MARGIN_S = 0.5
 # Сеть (учёт запросов вкладки, §2 п. 2) во вкладке пользователя — только после замера WhatsApp (§0.2, §8): поток
 # WS-кадров и буфер ответов Chrome в чужой вкладке. До него — сеть только в своей вкладке (`owned`), у пользователя —
 # DOM-сигналы (кадры, readyState, шрифты, анимации, aria-busy).
@@ -487,7 +490,8 @@ class Tab:
 
     def _await_load(self, timeout: float) -> bool:
         """`LOAD` в документе после commit: True — readyState complete. Документ сменился (редирект) — ждать его
-        запросы (`_wait_network`) и повторить, не больше STALE_RETRIES раз; отмена, дедлайн и `timeout` — False."""
+        запросы (`_wait_network`) и повторить, не больше STALE_RETRIES раз; отмена, дедлайн, `timeout` и документ, не
+        ответивший до дедлайна (CDPTimeout), — False."""
         limit = timeout
         if self.deadline is not None:
             limit = min(limit, self.deadline - time.monotonic() - WAIT_DEADLINE_MARGIN_S)
@@ -503,8 +507,11 @@ class Tab:
                         "Runtime.evaluate",
                         {"expression": expression, "awaitPromise": True, "returnByValue": True},
                         session_id=self.session_id,
-                        timeout=left + WAIT_DEADLINE_MARGIN_S,
+                        timeout=self._budget(),
                     )
+                except CDPTimeout as exc:  # главный поток занят до дедлайна: как предохранитель навигации
+                    log.debug("загрузка: документ не ответил: %s", exc)
+                    return False
                 except CDPError as exc:
                     response = {"exceptionDetails": {"text": str(exc)}}
                 if not response.get("exceptionDetails"):
@@ -572,8 +579,8 @@ class Tab:
         return self.cancel is not None and self.cancel.is_set()
 
     def _fuse(self) -> float:
-        """Потолок одного ожидания: `fuse_s`, но не дальше `deadline − WAIT_DEADLINE_MARGIN_S` (иначе CDPTimeout уронил
-        бы прогон раньше дедлайна). ≤ 0 — не ждать."""
+        """Потолок одного ожидания: `fuse_s`, но не дальше `deadline − WAIT_DEADLINE_MARGIN_S` (промис страницы
+        кончается раньше дедлайна прогона; таймаут CDP-вызова — сам дедлайн). ≤ 0 — не ждать."""
         fuse = self.fuse_s
         if self.deadline is not None:
             fuse = min(fuse, self.deadline - time.monotonic() - WAIT_DEADLINE_MARGIN_S)
@@ -686,7 +693,8 @@ class Tab:
         return result
 
     def _ready_pass(self, action: dict[str, Any], left: float) -> dict[str, Any] | None:
-        """Один проход `READY` (не дольше `left` с). None — документ сменился; {} — ответ без итога."""
+        """Один проход `READY` (предохранитель в странице — `left` с). None — документ сменился; {} — ответ без итога;
+        страница не ответила до дедлайна прогона (главный поток занят) — `{"reason": "fuse"}`."""
         params = {
             "action": {k: action[k] for k in ("kind", "node") if k in action},  # метка и значение в страницу не уходят
             "fuse_ms": max(1, round(left * 1000)),
@@ -698,8 +706,13 @@ class Tab:
                 "Runtime.evaluate",
                 {"expression": READY + json.dumps(params) + ")", "awaitPromise": True, "returnByValue": True},
                 session_id=self.session_id,
-                timeout=left + WAIT_DEADLINE_MARGIN_S,
+                timeout=self._budget(),
             )
+        except CDPTimeout as exc:
+            # Действие уже исполнено: молчание страницы — исход ожидания, а не ошибка прогона (иначе `failed`, и
+            # вызывающий повторит действие). Промис в странице снимет себя сам по своему предохранителю.
+            log.debug("await_ready: страница не ответила: %s", exc)
+            return {"reason": "fuse"}
         except CDPError as exc:
             log.debug("await_ready: проход прерван: %s", exc)
             return None
@@ -716,7 +729,8 @@ class Tab:
         завершение любого запроса вкладки или WS-кадр (подсказка «сейчас что-то изменится»), смена документа. Каждое
         из двух ожиданий — не дольше предохранителя; изменения не было — `fuse`, без `await_ready`. Итог — как у
         `await_ready`, плюс `change` (что разбудило) и `ready` (чем кончилась готовность); `wait_reason` — `change`,
-        если изменение было и страница затем готова, иначе `fuse`. Пусто — не ждали (отмена, нет места до дедлайна)."""
+        если изменение было и страница затем готова, иначе `fuse` (и когда страница не ответила до дедлайна прогона).
+        Пусто — не ждали (отмена, нет места до дедлайна)."""
         self.after_input = None
         self.last_settle = None
         if self._cancelled():
@@ -739,9 +753,12 @@ class Tab:
                     "Runtime.evaluate",
                     {"expression": CHANGE + json.dumps(params) + ")", "awaitPromise": True, "returnByValue": True},
                     session_id=self.session_id,
-                    timeout=fuse + WAIT_DEADLINE_MARGIN_S,
+                    timeout=self._budget(),
                     stop=moved,
                 )
+            except CDPTimeout as exc:  # главный поток занят до дедлайна: изменения не дождались — как предохранитель
+                log.debug("await_change: страница не ответила: %s", exc)
+                response = {"result": {"value": {"reason": "fuse"}}}
             except CDPError as exc:
                 response = {"exceptionDetails": {"text": str(exc)}}
         change: str | None

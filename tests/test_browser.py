@@ -323,6 +323,33 @@ def test_fuse_stops_short_of_the_run_deadline(monkeypatch):
     assert tab.last_settle is None
 
 
+def test_page_that_does_not_answer_a_wait_in_time_is_a_fuse_not_an_error(monkeypatch):
+    """Главный поток страницы занят (долгая задача дольше предохранителя): ответа на промис ожидания нет вовремя.
+    Действие уже исполнено — это исход `fuse`, а не CDPTimeout наружу (агент дал бы `failed`, вызывающий повторил бы
+    browse — двойная отправка). Таймаут самого вызова — до дедлайна прогона, а не предохранитель + запас."""
+    frozen_clock(monkeypatch)
+    slow = CDPTimeout("Runtime.evaluate: нет ответа за 2.0 с")
+    client = Mock(call_timeout=30.0)
+    client.call.side_effect = slow
+    client.pending_since.return_value = 1
+    tab = make_tab(client, network=True)
+    tab.deadline = 120.0
+    result = tab.await_ready({"kind": "click", "node": 20})
+    assert (result["reason"], result["wait_reason"], result["passes"]) == ("fuse", "fuse", 1)
+    client.mark_background.assert_called_once_with("S1")  # запросы в полёте — фон, как при fuse
+    assert client.call.call_args.kwargs["timeout"] == pytest.approx(20.0)  # остаток дедлайна, не 1,5 + 0,5 с
+
+    quiet = make_tab(Mock(call_timeout=30.0))
+    quiet.client.call_until.side_effect = slow
+    assert quiet.await_change()["wait_reason"] == "fuse"
+    assert quiet.client.call_until.call_args.kwargs["timeout"] is None  # дедлайна нет — таймаут клиента по умолчанию
+    quiet.client.call.assert_not_called()  # изменения не было — готовность не ждём
+
+    quiet.client.call.side_effect = [{"frameId": "F"}, slow]
+    quiet.navigate("https://example.test/")  # документ не ответил на LOAD — дальше без ожидания готовности
+    assert ready_calls(quiet.client) == []
+
+
 def test_waits_are_skipped_after_cancel():
     client = Mock()
     tab = make_tab(client)
@@ -1369,6 +1396,54 @@ def test_ready_in_headless_chrome_frames_not_milliseconds(tmp_path):
         result = tab.await_ready({"kind": "click", "node": 1})  # значимая мутация каждый кадр — предохранитель
         assert result["reason"] == "fuse" and 1500 <= result["ms"] <= 1500 + 300, result
         assert tab.take_timing().browser_ms < 500  # почти всё — wait_ms
+
+
+# Страница считает свои MutationObserver (обёртка — её код, не наш): сколько наблюдают сейчас и промис «все сняты»;
+# busy(ms) — долгая задача главного потока.
+BUSY_PAGE = """<!doctype html><body><span id=n>0</span><script>
+let live=0, seen=0, idle=[];
+const Base=MutationObserver;
+window.MutationObserver=class extends Base {
+  observe(...a) { live++; seen++; return super.observe(...a); }
+  disconnect() { live--; if (!live) idle.splice(0).forEach(r=>r(true)); return super.disconnect(); }
+};
+window.__watchers=()=>[live, seen];
+window.__idle=()=>new Promise(r=>live ? idle.push(r) : r(true));
+window.busy=ms=>setTimeout(()=>{const t=performance.now(); while (performance.now()-t<ms) {}}, 0);
+TICKER
+</script></body>"""
+TICKER = "const f=()=>{n.textContent=String(+n.textContent+1); requestAnimationFrame(f)}; f();"
+
+
+@chrome_only
+def test_busy_page_in_headless_chrome_ends_waits_by_fuse_and_its_promise_cleans_up_after_release(tmp_path):
+    """Долгая задача 1200 мс: промис ожидания стартует после неё и отвечает позже предохранителя и запаса (зонд ревью:
+    было CDPTimeout). Ответа нет и до дедлайна — `fuse`; вкладку отпустили — промис в странице снимает observer сам."""
+    from urllib.parse import quote
+
+    with headless_chrome(tmp_path) as chrome:
+        tab = chrome.new_tab()
+        tab.navigate("data:text/html," + quote(BUSY_PAGE.replace("TICKER", TICKER)))  # меняется каждый кадр
+        tab.evaluate("busy(1200)")
+        result = tab.await_ready({"kind": "click", "node": 1})
+        assert result["reason"] == "fuse" and result["ms"] >= 1200 + 1500 - 100, result
+
+        tab.navigate("data:text/html," + quote(BUSY_PAGE.replace("TICKER", "")))  # тихая
+        tab.evaluate("busy(1200)")
+        result = tab.await_change()
+        assert result["wait_reason"] == "fuse" and result["change"] is None, result
+
+        before = tab.evaluate("__watchers()")[1]
+        tab.evaluate("busy(3000)")
+        tab.deadline = time.monotonic() + 1.2  # предохранитель 0,7 с, ответа нет и до дедлайна
+        result = tab.await_ready({"kind": "click", "node": 1})
+        assert result["reason"] == "fuse", result
+        tab.release()
+        session = chrome.client.call("Target.attachToTarget", {"targetId": tab.target_id, "flatten": True})["sessionId"]
+        check = {"expression": "__idle().then(()=>__watchers())", "awaitPromise": True, "returnByValue": True}
+        live, seen = chrome.client.call("Runtime.evaluate", check, session_id=session, timeout=10.0)["result"]["value"]
+        assert live == 0 and seen > before, (live, seen, before)  # промис отработал после release и снял observer
+        chrome.client.call("Target.detachFromTarget", {"sessionId": session})
 
 
 NETWORK_PAGE = """<!doctype html><body>

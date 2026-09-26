@@ -18,7 +18,9 @@ from browser_hands.browser import (
     MARKER,
     MEASURE,
     READ_STATE,
+    READY,
     RESOLVE_TARGET,
+    WAIT_DEADLINE_MARGIN_S,
     StalePage,
     fingerprint,
 )
@@ -820,6 +822,33 @@ def test_user_tab_end_to_end_on_fake_chrome_never_closes_navigates_or_resizes(mo
     snapshot = next(i for i in range(release, len(frames)) if frames[i]["params"].get("expression") == READ_STATE)
     waits = [f for f in frames[release:snapshot] if f["params"].get("awaitPromise")]
     assert len(waits) == 1
+
+
+def test_page_busy_past_the_wait_fuse_after_a_click_is_a_fuse_not_a_failed_run(monkeypatch, tmp_path):
+    """Долгая задача страницы после клика: ответ на промис готовности приходит позже предохранителя и его запаса. Клик
+    исполнен один раз, шаг — `fuse`, прогон продолжается (было: CDPTimeout → `failed` → вызывающий повторяет browse)."""
+    fuse = 0.2
+    monkeypatch.setattr(loop, "choose", scripted(decision("e3", "CLICK"), DONE))
+    with FakeCDPServer() as server:
+        chrome = fake_user_chrome(server, tmp_path)
+        page_js = server.on["Runtime.evaluate"]
+
+        def evaluate(frame, ws):
+            if not frame["params"]["expression"].startswith(READY):
+                return page_js(frame, ws)
+            time.sleep(fuse + WAIT_DEADLINE_MARGIN_S + 0.3)  # главный поток занят: промис ответил позже
+            value = {"reason": "fuse", "ms": round(fuse * 1000), "mutations": 12, "frames": 12}
+            reply(ws, frame, {"result": {"type": "object", "value": value}})
+
+        server.on["Runtime.evaluate"] = evaluate
+        clients = ModelClients(ModelConfig(jev_api_key="test", text_api_key="test"), http=Mock())
+        run = RunConfig(timeout_s=30.0)
+        limits = Thresholds(wait_fuse_s=fuse)
+        result = Agent(chrome, clients, "https://web.whatsapp.com", "Open the chat", run, thresholds=limits).run()
+        chrome.close()
+    assert result.status == "done", result.error
+    assert len(server.sent("Input.dispatchMouseEvent")) == 2  # один клик: нажатие и отпускание
+    assert [(s.target, s.wait_reason) for s in result.steps] == [("Go", "fuse")]
 
 
 def run_on_fake_chrome(monkeypatch, tmp_path, url, prepare, *decisions):
