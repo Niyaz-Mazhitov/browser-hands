@@ -137,6 +137,10 @@ def test_delay_flag_changes_only_pages_with_a_search_delay():
     assert stand.page_for(stand.TASKS["search"], delay=900) == "app.html?delay=900"
     assert stand.page_for(stand.TASKS["boot"], delay=900) == "app.html?boot=4000&delay=900"
     assert stand.page_for(stand.TASKS["search-remount"], delay=900) == "app.html?delay=900&remount=900&sendstatus=1500"
+    remount = stand.page_for(stand.TASKS["search-remount"], delay=None, remount=1600)
+    assert remount == "app.html?delay=700&remount=1600&sendstatus=1500"
+    assert stand.page_for(stand.TASKS["search"], delay=None, remount=1600) == "app.html?delay=700"  # remount нет
+    assert stand.parse_args(["--remount", "1600"]).remount == 1600 and stand.parse_args([]).remount is None
     assert stand.page_for(stand.TASKS["form"], delay=900) == "form.html"
     assert stand.with_params("form.html", run="x-1") == "form.html?run=x-1"
 

@@ -204,11 +204,12 @@ def with_params(page: str, **params: str) -> str:
     return urlunsplit(parts._replace(query=urlencode(query)))
 
 
-def page_for(task: Task, *, delay: int | None) -> str:
-    """Страница задачи; `--delay` меняет задержку поиска только там, где она задана."""
-    if delay is not None and "delay" in dict(parse_qsl(urlsplit(task.page).query)):
-        return with_params(task.page, delay=str(delay))
-    return task.page
+def page_for(task: Task, *, delay: int | None, remount: int | None = None) -> str:
+    """Страница задачи; `--delay` / `--remount` меняют задержку поиска / пересоздание поля только там, где заданы."""
+    query = dict(parse_qsl(urlsplit(task.page).query))
+    changes = {key: str(value) for key, value in (("delay", delay), ("remount", remount)) if value is not None}
+    changes = {key: value for key, value in changes.items() if key in query}
+    return with_params(task.page, **changes) if changes else task.page
 
 
 # --- сервер стенда -------------------------------------------------------------------------------------------------
@@ -459,7 +460,8 @@ def run_all(
             if task.url is not None:  # внешний сайт: как есть, отчёта страницы не будет
                 url = task.url
             else:
-                url = server.url(with_params(page_for(task, delay=args.delay), run=run_id))
+                page = page_for(task, delay=args.delay, remount=args.remount)
+                url = server.url(with_params(page, run=run_id))
             steps = scenarios.get(task.name)
             decisions: list[dict[str, Any]] = []
             with record_decisions(decisions):
@@ -894,6 +896,9 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=60.0, metavar="S", help="дедлайн прогона (60)")
     parser.add_argument("--max-steps", type=int, default=12, metavar="N", help="шагов на прогон (12)")
     parser.add_argument("--delay", type=int, metavar="MS", help="задержка поиска на app.html вместо заданной")
+    parser.add_argument(
+        "--remount", type=int, metavar="MS", help=f"пересоздание поля в search-remount вместо {REMOUNT_MS} мс"
+    )
     parser.add_argument("--max-cost", type=float, metavar="USD", help="не начинать новый прогон после этой суммы")
     parser.add_argument("--fixtures-only", action="store_true", help="без моделей: скриптовые действия (бесплатно)")
     args = parser.parse_args(argv)
