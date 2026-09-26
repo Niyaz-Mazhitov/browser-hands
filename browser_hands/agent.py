@@ -379,7 +379,9 @@ class Agent(AgentLike):
             self._check_cancel()
             tab = self._open_tab()
             tab.deadline, tab.cancel = self._deadline, self.cancel  # и для ожиданий после действий
-            tab.fuse_s = self.thresholds.wait_fuse_s  # предохранитель одного ожидания — из порогов этого прогона
+            # Предохранитель одного ожидания — из порогов этого прогона. `Tab.fuse_s` вводит пакет «события»
+            # (feat/waits-events); до слияния в контракте его нет — отсюда ignore.
+            tab.fuse_s = self.thresholds.wait_fuse_s  # pyright: ignore[reportAttributeAccessIssue]
             self._check_cancel()
             if tab.owned:  # во вкладке пользователя — с того, что открыто: не переходим и не перезагружаем
                 tab.navigate(self.url, timeout=min(NAVIGATE_TIMEOUT_S, max(0.0, self._deadline - time.monotonic())))
