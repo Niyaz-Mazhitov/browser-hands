@@ -35,6 +35,8 @@ def test_overrides_from_env():
         "BROWSER_HANDS_TEXT_BASE_URL": "https://text.test/v1",
         "BROWSER_HANDS_TEXT_MODEL": "some/model",
         "BROWSER_HANDS_TEXT_REASONING": "LOW",
+        "BROWSER_HANDS_JEV_TIMEOUT_S": "4",
+        "BROWSER_HANDS_TEXT_TIMEOUT_S": "2.5",
         "BROWSER_HANDS_MAX_STEPS": "7",
         "BROWSER_HANDS_TIMEOUT_S": "30",
         "BROWSER_HANDS_LOG": "debug",
@@ -55,6 +57,8 @@ def test_overrides_from_env():
     assert s.models.text_base_url == "https://text.test/v1"
     assert s.models.text_model == "some/model"
     assert s.models.text_reasoning == "low"
+    assert s.models.jev_timeout_s == 4.0
+    assert s.models.text_timeout_s == 2.5
     assert s.run.max_steps == 7
     assert s.run.timeout_s == 30.0
     assert s.run.keep_open is False
@@ -78,6 +82,10 @@ def test_booleans(value, expected):
         ("BROWSER_HANDS_TIMEOUT_S", "-1"),
         ("BROWSER_HANDS_TIMEOUT_S", "300.5"),
         ("BROWSER_HANDS_CONNECT_TIMEOUT_S", "nan"),
+        ("BROWSER_HANDS_JEV_TIMEOUT_S", "0"),
+        ("BROWSER_HANDS_JEV_TIMEOUT_S", "soon"),
+        ("BROWSER_HANDS_TEXT_TIMEOUT_S", "-8"),
+        ("BROWSER_HANDS_TEXT_TIMEOUT_S", "301"),
         ("BROWSER_HANDS_SCREENSHOT_QUALITY", "101"),
         ("BROWSER_HANDS_SCREENSHOT_SCALE", "2"),
         ("BROWSER_HANDS_HEADLESS", "maybe"),
@@ -203,6 +211,18 @@ def test_apply_overrides_none_changes_nothing_and_data_dir_follows_mode():
         apply_overrides(base, max_steps=0)
     with pytest.raises(ConfigError, match="--ws"):
         apply_overrides(base, ws_url="127.0.0.1:9222")
+
+
+def test_new_tab_is_a_run_flag_only():
+    base = Settings.from_env({"BROWSER_HANDS_NEW_TAB": "1"})  # переменной нет: параметр прогона, как keep_open
+    assert base.run.new_tab is False
+
+    s = apply_overrides(base, new_tab=True)
+    assert s.run.new_tab is True
+    assert base.run.new_tab is False  # исходные не изменились
+    assert apply_overrides(s, new_tab=None).run.new_tab is True  # None — не задан
+    assert apply_overrides(s, new_tab=False).run.new_tab is False
+    assert apply_overrides(base, keep_open=True).run.new_tab is False  # флаги независимы
 
 
 def test_run_limits_have_ceilings():

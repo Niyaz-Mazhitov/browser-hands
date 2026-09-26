@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 Status = Literal["done", "blocked", "failed", "timeout", "step_limit"]
+TabKind = Literal["user", "new"]  # user — открытая вкладка пользователя (attach), new — своя
 
 
 @dataclass(slots=True)
@@ -35,6 +36,7 @@ class Step:
     confidence: float
     timing: Timing
     cost: float | None  # usage.cost этого шага (Jev + текст), если пришёл
+    scenario_step: int | None = None  # номер шага сценария (с 1); None — режим цели
 
 
 @dataclass(slots=True)
@@ -50,6 +52,10 @@ class RunResult:
     model_calls: int
     error: str | None = None  # текст причины для failed/timeout
     tab_kept: bool = False
+    tab: TabKind | None = None  # где работал агент; None — до вкладки не дошло
+    scenario_done: int | None = None  # сколько шагов сценария выполнено; None — режим цели
+    scenario_total: int | None = None  # шагов в сценарии; None — режим цели
+    jev_calls: int = 0  # вызовы Jev; текстовая модель = model_calls − jev_calls
 
 
 class AgentLike(Protocol):

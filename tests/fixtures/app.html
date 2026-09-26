@@ -1,0 +1,346 @@
+<!doctype html>
+<!--
+  Стенд надёжности (scripts/eval.py): WhatsApp-подобная страница без сети, один файл.
+  Параметры в query: boot=<мс> — экран загрузки без элементов для действия (по умолчанию 0);
+  delay=<мс> — задержка результатов поиска (700); spinner=1 — пока ищем, список заменён строкой
+  «Searching» с точками, меняются каждые 100 мс (без него список молчит до результатов);
+  history=<символов> — объём переписки в открытом чате (3000); run=<id> — метка прогона для отчёта.
+  Отчёт: state() читает только DOM → POST /report при каждом изменении и sendBeacon на pagehide.
+  Чаты «Работа» и «Рабочий» — ниже края списка: без поиска их не видно (как в настоящем WhatsApp).
+-->
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Chats</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  body { font: 14px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif; color: #111b21; background: #eae6df; }
+  [hidden] { display: none !important; }
+  button { font: inherit; cursor: pointer; }
+
+  .boot { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px; background: #f0f2f5; color: #54656f; }
+  .boot svg { width: 72px; height: 72px; }
+  .boot-title { font-size: 20px; color: #41525d; }
+  .bar { width: 320px; height: 4px; background: #d1d7db; border-radius: 2px; overflow: hidden; }
+  .bar-fill { width: 0; height: 100%; background: #00a884; }
+  .boot-note { font-size: 12px; margin-top: 24px; }
+
+  #app { height: 100%; display: flex; }
+  #side { width: 380px; flex: none; display: flex; flex-direction: column; background: #fff;
+    border-right: 1px solid #d1d7db; }
+  .side-head { height: 60px; flex: none; display: flex; align-items: center; padding: 0 12px 0 16px; gap: 6px; }
+  .side-head h1 { flex: 1; margin: 0; font-size: 22px; font-weight: 600; }
+  .icon { width: 36px; height: 36px; border: 0; border-radius: 50%; background: none; color: #54656f;
+    font-size: 18px; }
+  .icon:hover { background: #f0f2f5; }
+  .search { position: relative; flex: none; margin: 6px 12px 10px; }
+  .editable { outline: none; white-space: pre-wrap; word-break: break-word; }
+  .editable:empty::before { content: attr(data-placeholder); color: #667781; pointer-events: none; }
+  #search { min-height: 36px; padding: 8px 40px 8px 16px; border-radius: 8px; background: #f0f2f5; }
+  #clear { position: absolute; right: 4px; top: 2px; width: 32px; height: 32px; }
+  #chats { flex: 1; overflow-y: auto; }
+  .row { height: 72px; display: flex; align-items: center; gap: 12px; padding: 0 16px; cursor: pointer; }
+  .row:hover, .row[aria-selected="true"] { background: #f0f2f5; }
+  .avatar { width: 48px; height: 48px; flex: none; border-radius: 50%; background: #dfe5e7; }
+  .row-body { flex: 1; min-width: 0; border-bottom: 1px solid #e9edef; padding: 12px 0; }
+  .row-top { display: flex; justify-content: space-between; gap: 8px; }
+  .name { font-size: 16px; }
+  .time { font-size: 12px; color: #667781; }
+  .last { display: block; color: #667781; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .section { padding: 14px 24px 8px; color: #008069; font-size: 15px; }
+  .searching, .empty { padding: 28px 24px; color: #667781; text-align: center; }
+
+  #main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  #welcome { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: #f0f2f5; color: #667781; border-bottom: 6px solid #25d366; }
+  #welcome h2 { font-weight: 300; font-size: 30px; color: #41525d; margin: 0 0 12px; }
+  #conv { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .conv-head { height: 60px; flex: none; display: flex; align-items: center; gap: 12px; padding: 0 16px;
+    background: #f0f2f5; }
+  .conv-head .avatar { width: 40px; height: 40px; }
+  #chat-title { flex: 1; font-size: 16px; }
+  #messages { flex: 1; overflow-y: auto; padding: 16px 7%; display: flex; flex-direction: column; gap: 4px; }
+  .day { align-self: center; margin: 8px 0; padding: 4px 12px; border-radius: 8px; background: #fff;
+    color: #54656f; font-size: 12px; }
+  .msg { max-width: 65%; padding: 6px 8px 8px 9px; border-radius: 8px; background: #fff;
+    box-shadow: 0 1px .5px rgba(11, 20, 26, .13); }
+  .msg.out { align-self: flex-end; background: #d9fdd3; }
+  .msg .meta { float: right; margin: 6px 0 -4px 10px; font-size: 11px; color: #667781; }
+  .conv-foot { flex: none; display: flex; align-items: center; gap: 8px; padding: 8px 16px; background: #f0f2f5; }
+  #composer { flex: 1; min-height: 42px; max-height: 120px; overflow-y: auto; padding: 10px 12px;
+    border-radius: 8px; background: #fff; }
+</style>
+</head>
+<body>
+<div id="boot" class="boot" hidden>
+  <svg viewBox="0 0 64 64" aria-hidden="true"><circle cx="32" cy="32" r="28" fill="none" stroke="#25d366"
+    stroke-width="6"/><circle cx="32" cy="32" r="10" fill="#25d366"/></svg>
+  <div class="boot-title">Chats</div>
+  <div>Loading your chats</div>
+  <div class="bar"><div class="bar-fill" id="bar"></div></div>
+  <div class="boot-note">🔒 End-to-end encrypted</div>
+</div>
+
+<div id="app" hidden>
+  <aside id="side">
+    <header class="side-head">
+      <h1>Chats</h1>
+      <button class="icon" type="button" aria-label="New chat">✎</button>
+      <button class="icon" type="button" aria-label="Menu">⋮</button>
+    </header>
+    <div class="search">
+      <div id="search" class="editable" contenteditable="true" role="textbox" aria-label="Search or start a new chat"
+        data-placeholder="Search or start a new chat"></div>
+      <button id="clear" class="icon" type="button" aria-label="Clear search" hidden>✕</button>
+    </div>
+    <div id="chats" role="list" aria-label="Chat list"></div>
+  </aside>
+  <main id="main">
+    <div id="welcome">
+      <h2>Chats for Web</h2>
+      <div>Send and receive messages without keeping your phone online.</div>
+    </div>
+    <section id="conv" hidden>
+      <header class="conv-head">
+        <div class="avatar"></div>
+        <span id="chat-title"></span>
+        <button class="icon" type="button" aria-label="Search in chat">⌕</button>
+      </header>
+      <div id="messages" role="list" aria-label="Messages"></div>
+      <footer class="conv-foot">
+        <button class="icon" type="button" aria-label="Attach">＋</button>
+        <div id="composer" class="editable" contenteditable="true" role="textbox" aria-label="Type a message"
+          data-placeholder="Type a message"></div>
+        <button id="voice" class="icon" type="button" aria-label="Voice message">🎤</button>
+        <button id="send" class="icon" type="button" aria-label="Send" hidden>➤</button>
+      </footer>
+    </section>
+  </main>
+</div>
+
+<script>
+(() => {
+  const params = new URLSearchParams(location.search);
+  const num = (key, fallback) => {
+    const value = Number(params.get(key));
+    return params.has(key) && Number.isFinite(value) && value >= 0 ? value : fallback;
+  };
+  const BOOT = num('boot', 0), DELAY = num('delay', 700), HISTORY = num('history', 3000);
+  const SPINNER = params.get('spinner') === '1', RUN = params.get('run') || '';
+  const $ = id => document.getElementById(id);
+  const el = (tag, cls, text) => {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  };
+
+  const NAMES = [
+    ['Monday', 'Standup moved to 11:30'], ['Кеша', 'привет! как дела?'], ['Мама', 'Позвони, как освободишься'],
+    ['Semester group', 'Aigerim: slides are in the drive'], ['Аня', 'Фото'], ['Бухгалтерия', 'Акт подписали'],
+    ['Alex', 'sounds good 👍'], ['Сосед', 'Машину переставишь?'], ['Спортзал', 'Абонемент продлён до 30.10'],
+    ['Dmitry', 'ok'], ['Курьер', 'Буду через 15 минут'], ['Family', 'Папа: 🎂'],
+    ['Работа', 'Созвон перенесли на пятницу'], ['Book club', 'Next: The Remains of the Day'],
+    ['Тренер', 'Завтра в 7:00'], ['Landlord', 'Rent received, thanks'], ['Рабочий', null],
+    ['Школа', 'Родительское собрание в четверг'], ['Ерлан', 'Скинь номер'], ['Design team', 'Figma updated'],
+    ['Врач', 'Запись подтверждена'], ['Monday reports', 'Weekly report is ready'], ['Такси', 'Водитель на месте'],
+    ['Ира', 'Спасибо!'],
+  ];
+  const POOL = [
+    'Коллеги, напоминаю: отчёт — до пятницы.', 'Ок, принято 👍', 'Кто заберёт ключи от переговорки?',
+    'Я могу — после обеда.', 'Скинул презентацию в общий чат, посмотрите, пожалуйста.',
+    '«Проверка связи» — это просто тест, не отвечайте.', 'Созвон в 15:00, ссылка та же.',
+    'Нужны цифры по продажам за сентябрь.', 'Готово, файл в папке «Отчёты».', 'Спасибо!',
+    'Кто-нибудь видел письмо от бухгалтерии?', 'Да, переслал тебе.', 'Можно перенести встречу на 11?',
+    'Без проблем.', 'Новый пропуск выдают на ресепшене, с паспортом.', 'Завтра в 10, не забудь отчёт',
+  ];
+  const clock = minutes => `${String(9 + Math.floor(minutes / 60) % 12).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`;
+  const history = seed => {  // детерминированная переписка на HISTORY символов
+    const messages = [];
+    let length = 0, i = seed * 5;
+    while (length < HISTORY) {
+      const text = POOL[i % POOL.length];
+      messages.push({out: i % 3 === 1, text, time: clock(i * 7 % 600), fresh: false});
+      length += text.length;
+      i++;
+    }
+    return messages;
+  };
+  const chats = NAMES.map(([name, last], index) => {
+    const messages = history(index);
+    if (last !== null && messages.length) messages[messages.length - 1] = {...messages[messages.length - 1], text: last};
+    return {name, messages, time: clock(600 - index * 23)};
+  });
+
+  const list = $('chats'), search = $('search'), clear = $('clear');
+  const composer = $('composer'), send = $('send'), voice = $('voice');
+  let current = null, shownQuery = '', searchTimer = 0, spinTimer = 0;
+
+  const textOf = box => box.innerText.replace(/ /g, ' ').trim();
+  const normalize = box => { if (!textOf(box)) box.replaceChildren(); };  // пустое поле → :empty (плейсхолдер)
+  const lastText = chat => chat.messages.length ? chat.messages[chat.messages.length - 1].text : '';
+
+  function row(chat) {
+    const item = el('div');
+    item.setAttribute('role', 'listitem');
+    const button = el('div', 'row');
+    button.setAttribute('role', 'button');
+    button.tabIndex = 0;
+    button.setAttribute('aria-selected', String(chat === current));
+    const body = el('div', 'row-body'), top = el('div', 'row-top');
+    top.append(el('span', 'name', chat.name), el('span', 'time', chat.time));
+    body.append(top, el('span', 'last', lastText(chat)));
+    button.append(el('div', 'avatar'), body);
+    button.addEventListener('click', () => openChat(chat));
+    item.append(button);
+    return item;
+  }
+
+  function renderList(query) {
+    shownQuery = query;
+    const needle = query.toLowerCase();
+    const found = chats.filter(chat => chat.name.toLowerCase().includes(needle));
+    const children = found.map(row);
+    if (query) children.unshift(el('div', 'section', 'Chats'));
+    if (query && !found.length) children.push(el('div', 'empty', 'No chats, contacts or messages found'));
+    list.replaceChildren(...children);
+  }
+
+  function stopSpinner() {
+    clearInterval(spinTimer);
+    spinTimer = 0;
+  }
+
+  function startSpinner() {
+    stopSpinner();
+    const line = el('div', 'searching', 'Searching');
+    list.replaceChildren(line);
+    let tick = 0;
+    spinTimer = setInterval(() => { line.textContent = 'Searching' + '.'.repeat(++tick % 4); }, 100);
+  }
+
+  search.addEventListener('input', () => {
+    normalize(search);
+    const query = textOf(search);
+    clear.hidden = !query;
+    clearTimeout(searchTimer);
+    stopSpinner();
+    if (!query) {
+      renderList('');
+      return;
+    }
+    if (SPINNER) startSpinner();  // без спиннера список молчит до результатов
+    searchTimer = setTimeout(() => { stopSpinner(); renderList(query); }, DELAY);
+  });
+  search.addEventListener('keydown', event => { if (event.key === 'Enter') event.preventDefault(); });
+  clear.addEventListener('click', () => {
+    search.replaceChildren();
+    clear.hidden = true;
+    clearTimeout(searchTimer);
+    stopSpinner();
+    renderList('');
+  });
+
+  function renderMessages(chat) {
+    const box = $('messages');
+    const children = [el('div', 'day', 'TODAY')];
+    for (const message of chat.messages) {
+      const bubble = el('div', message.out ? 'msg out' : 'msg');
+      bubble.setAttribute('role', 'listitem');
+      if (message.fresh) bubble.dataset.out = '1';  // только отправленные на этой странице
+      bubble.append(el('span', 'meta', message.time + (message.out ? ' ✓✓' : '')), el('span', 'text', message.text));
+      children.push(bubble);
+    }
+    box.replaceChildren(...children);
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function updateComposer() {
+    const empty = !textOf(composer);
+    send.hidden = empty;
+    voice.hidden = !empty;
+  }
+
+  function openChat(chat) {
+    current = chat;
+    for (const button of list.querySelectorAll('.row')) {
+      button.setAttribute('aria-selected', String(button.querySelector('.name')?.textContent === chat.name));
+    }
+    $('welcome').hidden = true;
+    $('conv').hidden = false;
+    $('chat-title').textContent = chat.name;
+    composer.replaceChildren();
+    updateComposer();
+    renderMessages(chat);
+  }
+
+  function sendMessage() {
+    const text = textOf(composer), chat = current;
+    if (!text || !chat) return;
+    setTimeout(() => {  // сервер «подтвердил» через 300 мс: сообщение в списке, поле очищено
+      const now = new Date();
+      chat.messages.push({out: true, fresh: true, text, time: now.toTimeString().slice(0, 5)});
+      chat.time = now.toTimeString().slice(0, 5);
+      composer.replaceChildren();
+      updateComposer();
+      if (current === chat) renderMessages(chat);
+      if (!spinTimer) renderList(shownQuery);
+    }, 300);
+  }
+
+  composer.addEventListener('input', () => { normalize(composer); updateComposer(); });
+  composer.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      sendMessage();
+    }
+  });
+  send.addEventListener('click', sendMessage);
+
+  // Отчёт стенду: только то, что видно в DOM.
+  let seq = 0, lastJson = '';
+  function state() {
+    const open = !$('conv').hidden;
+    return {
+      run: RUN,
+      ready: !$('app').hidden,
+      openChat: open ? $('chat-title').textContent : null,
+      query: textOf(search),
+      sent: [...document.querySelectorAll('#messages [data-out]')].map(e => e.querySelector('.text').textContent),
+    };
+  }
+  function report(beacon) {
+    if (!location.protocol.startsWith('http')) return;  // открыта файлом: отчитываться некому
+    const json = JSON.stringify(state());
+    if (json === lastJson && !beacon) return;
+    lastJson = json;
+    const body = JSON.stringify({...JSON.parse(json), seq: ++seq});
+    if (beacon) navigator.sendBeacon('/report', body);
+    else fetch('/report', {method: 'POST', body, keepalive: true}).catch(() => {});
+  }
+  new MutationObserver(() => report(false))
+    .observe(document.body, {subtree: true, childList: true, characterData: true, attributes: true});
+  addEventListener('pagehide', () => report(true));
+
+  function start() {
+    $('boot').hidden = true;
+    $('app').hidden = false;
+    renderList('');
+  }
+  if (BOOT > 0) {
+    $('boot').hidden = false;
+    const started = performance.now();
+    const progress = setInterval(() => {
+      $('bar').style.width = Math.min(100, (performance.now() - started) / BOOT * 100) + '%';
+    }, 200);
+    setTimeout(() => { clearInterval(progress); start(); }, BOOT);
+  } else {
+    start();
+  }
+  report(false);
+})();
+</script>
+</body>
+</html>

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import re
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -12,6 +13,10 @@ from websockets.exceptions import ConnectionClosed
 from websockets.sync.server import Server, ServerConnection, serve
 
 Handler = Callable[[dict[str, Any], ServerConnection], None]
+
+# Выражения меток вкладки пользователя (browser.Tab.claim / release) — фейк исполняет их над `windows`, как JS страницы.
+CLAIM = re.compile(r'window\.__bhOwner \?\?= (".*")')
+CLEANUP = re.compile(r'delete window\.__jevFast(?:; if \(window\.__bhOwner === (".*")\) delete window\.__bhOwner)?')
 
 
 def reply(ws: ServerConnection, frame: dict[str, Any], result: dict[str, Any] | None = None) -> None:
@@ -33,11 +38,17 @@ def event(ws: ServerConnection, method: str, params: dict[str, Any], session_id:
 
 
 class FakeCDPServer:
-    """Отвечает как browser-level endpoint Chrome; `on[method]` переопределяет поведение метода."""
+    """Отвечает как browser-level endpoint Chrome; `on[method]` переопределяет поведение метода.
+
+    `targets` — что вернёт `Target.getTargets` (TargetInfo: вкладки пользователя в attach); по умолчанию пусто.
+    `windows` — глобальные переменные страниц по targetId (метка `__bhOwner`, кэш `__jevFast`), см. `page_js`.
+    """
 
     def __init__(self) -> None:
         self.frames: list[dict[str, Any]] = []
         self.on: dict[str, Handler] = {}
+        self.targets: list[dict[str, Any]] = []
+        self.windows: dict[str, dict[str, Any]] = {}
         self.connections = 0
         self._open: list[ServerConnection] = []
         self._targets = itertools.count(1)
@@ -55,6 +66,10 @@ class FakeCDPServer:
 
     def methods(self) -> list[str]:
         return [f["method"] for f in self.frames]
+
+    def sent(self, method: str) -> list[dict[str, Any]]:
+        """Кадры одного метода (с `params` и `sessionId`), по порядку."""
+        return [f for f in self.frames if f["method"] == method]
 
     def start(self) -> FakeCDPServer:
         self._server = serve(self._handle, "127.0.0.1", 0, compression=None, ping_interval=None)
@@ -89,10 +104,34 @@ class FakeCDPServer:
         except ConnectionClosed:
             pass
 
+    def page_js(self, frame: dict[str, Any], ws: ServerConnection) -> bool:
+        """Runtime.evaluate меток вкладки пользователя: `__bhOwner ??= …` и уборка из `release()` — над
+        `windows[targetId]` (сессия `S-<targetId>`), как их исполнил бы JS страницы. True — ответили."""
+        if frame["method"] != "Runtime.evaluate":
+            return False
+        expression = frame["params"]["expression"]
+        target_id = frame.get("sessionId", "").removeprefix("S-")
+        if match := CLAIM.fullmatch(expression):
+            window = self.windows.setdefault(target_id, {})
+            if window.get("__bhOwner") is None:
+                window["__bhOwner"] = json.loads(match[1])
+            reply(ws, frame, {"result": {"type": "string", "value": window["__bhOwner"]}})
+            return True
+        if match := CLEANUP.fullmatch(expression):
+            window = self.windows.setdefault(target_id, {})
+            window.pop("__jevFast", None)
+            if match[1] is not None and window.get("__bhOwner") == json.loads(match[1]):
+                del window["__bhOwner"]
+            reply(ws, frame, {"result": {"type": "boolean", "value": True}})
+            return True
+        return False
+
     def _default(self, frame: dict[str, Any], ws: ServerConnection) -> None:
         method = frame["method"]
+        if self.page_js(frame, ws):
+            return
         if method == "Target.getTargets":
-            reply(ws, frame, {"targetInfos": []})
+            reply(ws, frame, {"targetInfos": self.targets})
         elif method == "Target.createTarget":
             reply(ws, frame, {"targetId": f"T{next(self._targets)}"})
         elif method == "Target.attachToTarget":

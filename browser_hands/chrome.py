@@ -3,6 +3,12 @@
 Одно постоянное соединение на процесс; `connect()` идемпотентен и переподключается, перечитывая DevToolsActivePort
 (порт меняется после перезапуска Chrome). Без тихого перехода attach → launch. В attach браузер пользователя не
 трогаем: `close()` закрывает только свои вкладки (targetId из своего `createTarget`) и websocket.
+
+Вкладка пользователя (только attach без ws_url): `find_user_tab(url)` находит открытую вкладку того же хоста и порта —
+любую, если в `url` задан только сайт, иначе ровно эту страницу; `attach_tab()` подключается к ней (`Tab(owned=False)`,
+в `_borrowed`, не в `owned_targets`) и ставит метку-мьютекс `window.__bhOwner`. Её не закрывает ни `close()`, ни уборка
+сирот: только `Tab.release()` — убрать свои метки, выключить focus emulation и отсоединиться. Все подходящие вкладки
+заняты или открыты в разных профилях — `UserTabUnavailable` (прогон `failed`, без своей вкладки).
 """
 
 from __future__ import annotations
@@ -11,8 +17,10 @@ import logging
 import os
 import subprocess
 import time
-from collections.abc import Callable
+import uuid
+from collections.abc import Callable, Collection
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from websockets.exceptions import InvalidHandshake, InvalidURI
 
@@ -27,6 +35,13 @@ PORT_FILE = "DevToolsActivePort"
 HINT = "включите chrome://inspect/#remote-debugging или BROWSER_HANDS_MODE=launch"
 ALIVE_TIMEOUT_S = 2.0
 CLOSE_TAB_TIMEOUT_S = 1.0  # на одну свою вкладку при закрытии и уборке сирот
+LOOKUP_TIMEOUT_S = 5.0  # Target.getTargets при поиске вкладки пользователя
+DEFAULT_PORTS = {"http": 80, "https": 443}  # вкладки пользователя: только сайты, не chrome://, about:, data:, file:
+BUSY = (
+    "вкладка {site} занята другим клиентом (DevTools, расширение или другая сессия); "
+    "закройте его или вызовите с new_tab=true"
+)
+AMBIGUOUS = "вкладки {site} открыты в нескольких профилях/окнах инкогнито — выберите одну или new_tab=true"
 TERMINATE_TIMEOUT_S = 5.0
 SECRET_ENV = "OPENROUTER_API_KEY"
 
@@ -36,6 +51,15 @@ Launcher = Callable[[BrowserConfig], subprocess.Popen]
 
 class ChromeUnavailable(RuntimeError):
     """К Chrome не подключиться: не запущен, отладка выключена, «Разрешить» не нажали или файл порта устарел."""
+
+
+class UserTabUnavailable(RuntimeError):
+    """Вкладку пользователя не взять, а своя маскировала бы проблему: все подходящие заняты или открыты в разных
+    профилях. Текст — для ответа `browse` (только хост, без пути)."""
+
+
+class TabTaken(RuntimeError):
+    """На вкладке чужая метка `window.__bhOwner`: её держит другой сервер browser-hands (мьютекс, `attach_tab`)."""
 
 
 def read_devtools_active_port(data_dir: Path) -> str:
@@ -140,6 +164,49 @@ def launch_chrome(config: BrowserConfig) -> subprocess.Popen:
     raise ChromeUnavailable(f"Chrome не открыл порт отладки за {config.connect_timeout_s:.0f} с")
 
 
+def web_origin(url: str) -> tuple[str, int] | None:
+    """(хост в нижнем регистре, эффективный порт) http(s)-адреса; без порта — 80/443 по схеме. Служебные адреса
+    (chrome://, about:, data:, devtools://) и неверный порт (`ValueError` от `.port`) — None."""
+    parts = urlsplit(url)
+    if parts.scheme not in DEFAULT_PORTS or not parts.hostname:
+        return None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    return parts.hostname, DEFAULT_PORTS[parts.scheme] if port is None else port
+
+
+def site_label(url: str) -> str:
+    """Хост (и порт, если он не по умолчанию) для INFO и текста ошибок — без пути, запроса и логина."""
+    origin = web_origin(url)
+    if origin is None:
+        return urlsplit(url).hostname or "?"
+    host, port = origin
+    host = f"[{host}]" if ":" in host else host
+    return host if port == DEFAULT_PORTS[urlsplit(url).scheme] else f"{host}:{port}"
+
+
+def site_root(url: str) -> bool:
+    """В `url` задан только сайт: путь пустой или `/`, без query (`#fragment` не в счёт)."""
+    parts = urlsplit(url)
+    return parts.path in ("", "/") and not parts.query
+
+
+def _page_key(url: str) -> tuple[str, tuple[str, int], str, str] | None:
+    origin = web_origin(url)
+    if origin is None:
+        return None
+    parts = urlsplit(url)
+    return parts.scheme, origin, parts.path or "/", parts.query
+
+
+def same_page(a: str, b: str) -> bool:
+    """Тот же http(s)-адрес без `#fragment`: схема, хост, эффективный порт, путь (пустой = `/`) и query."""
+    key = _page_key(a)
+    return key is not None and key == _page_key(b)
+
+
 def _stop_process(proc: subprocess.Popen) -> None:
     if proc.poll() is not None:
         return
@@ -164,6 +231,8 @@ class Chrome(ChromeLike):
         self.config = config
         self.owned_targets: set[str] = set()  # только id из своего createTarget, ещё не закрытые
         self._tabs: dict[str, Tab] = {}  # target → вкладка; закрытая (tab.closed), но не забытая — сирота
+        self._borrowed: dict[str, Tab] = {}  # target → вкладка пользователя; никогда не закрывается
+        self.owner_id = uuid.uuid4().hex  # метка-мьютекс window.__bhOwner во вкладках пользователя
         self._client: CDPClient | None = None
         self._proc: subprocess.Popen | None = None
         self._client_factory = client_factory
@@ -173,6 +242,11 @@ class Chrome(ChromeLike):
     def launched(self) -> bool:
         """Chrome запущен нами (launch без ws_url)."""
         return self.config.mode == "launch" and not self.config.ws_url
+
+    @property
+    def user_mode(self) -> bool:
+        """attach к Chrome пользователя (DevToolsActivePort профиля, без ws_url): только тут берём его вкладки."""
+        return self.config.mode == "attach" and not self.config.ws_url
 
     @property
     def client(self) -> CDPClient:
@@ -199,6 +273,8 @@ class Chrome(ChromeLike):
         if self._client is not None:
             self._client.close()
             self._client = None
+        # Сессии к вкладкам пользователя умерли с прошлым соединением (Chrome сам снял эмуляцию): забыть, не закрывать.
+        self._borrowed.clear()
         if self.launched and (self._proc is None or self._proc.poll() is not None):
             log.info("Запускаю Chrome (профиль %s)", self.config.launch_data_dir)
             self._proc = self._launcher(self.config)
@@ -237,9 +313,15 @@ class Chrome(ChromeLike):
         self.owned_targets.discard(target_id)
         self._tabs.pop(target_id, None)
 
+    def _forget_borrowed(self, target_id: str) -> None:
+        self._borrowed.pop(target_id, None)
+
     def _close_targets(self, client: CDPClient, target_ids: list[str]) -> None:
         """Закрыть свои вкладки по targetId (≤1 с на вкладку); ошибки — в лог. Чужие id сюда не попадают."""
         for target_id in target_ids:
+            if target_id in self._borrowed:  # вкладка пользователя: не закрывать ни при каких условиях
+                log.error("Вкладка пользователя %s среди своих — не закрываю", target_id)
+                continue
             try:
                 client.call("Target.closeTarget", {"targetId": target_id}, timeout=CLOSE_TAB_TIMEOUT_S)
             except CDPError as exc:
@@ -280,9 +362,94 @@ class Chrome(ChromeLike):
             raise
         return tab
 
+    def find_user_tab(self, url: str, *, skip: Collection[str] = ()) -> str | None:
+        """targetId открытой вкладки пользователя для `url`, иначе None (своя вкладка с переходом). Только attach без
+        ws_url.
+
+        Подходит `type == "page"` без `subtype` (prerender и т. п.), не своя, с тем же хостом и эффективным портом, что
+        `url`, и: `url` — корень сайта (путь пустой или `/`, без query) → любая страница сайта; иначе — тот же адрес без
+        `#fragment`. Занята — `attached is not False` (DevTools, расширение, другой сервер) или в `skip` (чужая метка
+        `__bhOwner`). Среди свободных: одно точное совпадение url — оно; иначе все из одного `browserContextId` —
+        первая по порядку `Target.getTargets`, из разных — `UserTabUnavailable`. Подходящие есть, но все заняты —
+        `UserTabUnavailable`. В INFO — одна строка причины, только хост."""
+        origin = web_origin(url)
+        if not self.user_mode or origin is None:
+            return None
+        site, root = site_label(url), site_root(url)
+        infos = self.client.call("Target.getTargets", timeout=LOOKUP_TIMEOUT_S).get("targetInfos") or []
+        free: list[dict[str, str]] = []
+        busy = other_pages = 0
+        for info in infos:
+            target_id, target_url = info.get("targetId"), info.get("url") or ""
+            if info.get("type") != "page" or info.get("subtype") or not target_id or web_origin(target_url) != origin:
+                continue
+            if target_id in self.owned_targets or target_id in self._borrowed:
+                continue
+            if not root and not same_page(target_url, url):
+                other_pages += 1
+                continue
+            if info.get("attached") is not False or target_id in skip:
+                busy += 1
+                continue
+            free.append({"targetId": target_id, "url": target_url, "context": info.get("browserContextId") or ""})
+        if not free:
+            if busy:
+                raise UserTabUnavailable(BUSY.format(site=site))
+            if other_pages:
+                log.info("Сайт %s открыт на другой странице — работаю в своей вкладке, с переходом", site)
+            else:
+                log.info("Вкладки %s нет — работаю в своей", site)
+            return None
+        exact = [c for c in free if same_page(c["url"], url)]
+        pool = exact or free  # одно точное совпадение — из одного контекста само по себе
+        if len({c["context"] for c in pool}) > 1:
+            raise UserTabUnavailable(AMBIGUOUS.format(site=site))
+        reason = "та же страница" if exact else "задан только сайт"
+        log.info("Вкладка пользователя %s: %s, без перехода (свободных %d, занятых %d)", site, reason, len(free), busy)
+        return pool[0]["targetId"]
+
+    def attach_tab(
+        self, target_id: str, *, screenshot_quality: int | None = None, screenshot_scale: float | None = None
+    ) -> Tab:
+        """Подключиться к вкладке пользователя: flatten-сессия, метка-мьютекс `__bhOwner`, focus emulation, замер окна.
+        Без createTarget, setDeviceMetricsOverride и навигации. Метка чужая — отсоединиться, не трогая страницу, и
+        `TabTaken`. Ошибка на любом шаге — отсоединиться (не закрыть) и бросить дальше."""
+        if not self.user_mode:
+            raise ValueError("Вкладки пользователя — только в attach без ws_url")
+        if target_id in self.owned_targets:
+            raise ValueError(f"{target_id} — своя вкладка, а не вкладка пользователя")
+        client = self.client
+        session_id = client.call("Target.attachToTarget", {"targetId": target_id, "flatten": True})["sessionId"]
+        tab = Tab(
+            client,
+            session_id,
+            target_id,
+            screenshot_quality=self.config.screenshot_quality if screenshot_quality is None else screenshot_quality,
+            screenshot_scale=self.config.screenshot_scale if screenshot_scale is None else screenshot_scale,
+            viewport=self.config.viewport,
+            on_release=self._forget_borrowed,
+            owned=False,
+        )
+        self._borrowed[target_id] = tab
+        try:
+            if not tab.claim(self.owner_id):
+                tab.release(timeout=CLOSE_TAB_TIMEOUT_S)  # только detach: чужие метку и кэш снимка не трогаем
+                raise TabTaken(f"{target_id}: метка другого сервера browser-hands")
+            tab.setup()
+            tab.measure()
+        except BaseException:
+            tab.release(timeout=CLOSE_TAB_TIMEOUT_S)  # detach, не closeTarget
+            raise
+        log.debug("Вкладка пользователя %s: %dx%d, DPR %g", target_id, *tab.viewport, tab.dpr)
+        return tab
+
     def close(self) -> None:
         """launch: закрыть ws (разблокирует recv рабочего потока) и сразу погасить процесс — вкладки умрут с ним;
-        attach/ws: закрыть свои вкладки (≤1 с на вкладку), затем websocket. Вкладки пользователя не трогаем."""
+        attach/ws: отпустить вкладки пользователя (focus emulation, detach; ≤1 с на каждую), закрыть свои (≤1 с на
+        вкладку), затем websocket. Вкладки пользователя не закрываются никогда."""
+        borrowed, self._borrowed = list(self._borrowed.values()), {}
+        for tab in borrowed:
+            tab.release(timeout=CLOSE_TAB_TIMEOUT_S)
         client, self._client = self._client, None
         if client is not None:
             if not self.launched:

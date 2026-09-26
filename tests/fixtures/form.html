@@ -1,0 +1,120 @@
+<!doctype html>
+<!--
+  Стенд надёжности (scripts/eval.py): обычная форма без сети. run=<id> — метка прогона для отчёта.
+  Submit проверяет поля (ошибка — текстом на странице), затем «Thanks, <name>» и список отправленного.
+  Отчёт: только DOM — {run, submitted: {name, email, country, agree} | null, fields: текущие значения}.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Registration</title>
+<style>
+  body { margin: 0; font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; background: #f4f5f7;
+    color: #1f2328; }
+  main { max-width: 460px; margin: 48px auto; padding: 28px 32px; background: #fff; border-radius: 10px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, .12); }
+  h1 { margin: 0 0 20px; font-size: 24px; }
+  label.field { display: block; margin: 14px 0 4px; font-weight: 600; }
+  input[type=text], input[type=email], select { width: 100%; box-sizing: border-box; padding: 8px 10px;
+    font: inherit; border: 1px solid #c9ced6; border-radius: 6px; background: #fff; }
+  .agree { display: flex; align-items: center; gap: 8px; margin: 18px 0; }
+  #error { color: #b42318; margin: 0 0 12px; }
+  button { padding: 9px 22px; font: inherit; color: #fff; background: #1f6feb; border: 0; border-radius: 6px;
+    cursor: pointer; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; }
+  dt { color: #57606a; }
+  dd { margin: 0; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <form id="form" novalidate>
+    <h1>Registration</h1>
+    <label class="field" for="name">Name</label>
+    <input id="name" name="name" type="text" autocomplete="off">
+    <label class="field" for="email">Email</label>
+    <input id="email" name="email" type="email" autocomplete="off">
+    <label class="field" for="country">Country</label>
+    <select id="country" name="country">
+      <option value="">Select a country</option>
+      <option value="ru">Russia</option>
+      <option value="kz">Kazakhstan</option>
+      <option value="uz">Uzbekistan</option>
+      <option value="kg">Kyrgyzstan</option>
+    </select>
+    <label class="agree"><input id="agree" name="agree" type="checkbox"> I agree to the terms</label>
+    <p id="error" role="alert" hidden></p>
+    <button type="submit">Submit</button>
+  </form>
+  <section id="done" hidden>
+    <h1 id="thanks"></h1>
+    <dl>
+      <dt>Name</dt><dd id="out-name"></dd>
+      <dt>Email</dt><dd id="out-email"></dd>
+      <dt>Country</dt><dd id="out-country"></dd>
+      <dt>Agreed</dt><dd id="out-agree"></dd>
+    </dl>
+  </section>
+</main>
+<script>
+(() => {
+  const RUN = new URLSearchParams(location.search).get('run') || '';
+  const $ = id => document.getElementById(id);
+  const country = () => { const s = $('country'); return s.value ? s.options[s.selectedIndex].text : ''; };
+
+  $('form').addEventListener('submit', event => {
+    event.preventDefault();
+    const name = $('name').value.trim(), email = $('email').value.trim();
+    const problems = [];
+    if (!name) problems.push('Name is required.');
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) problems.push('Enter a valid email.');
+    if (!country()) problems.push('Select a country.');
+    if (!$('agree').checked) problems.push('You must agree to the terms.');
+    $('error').textContent = problems.join(' ');
+    $('error').hidden = !problems.length;
+    if (problems.length) return;
+    $('thanks').textContent = `Thanks, ${name}`;
+    $('out-name').textContent = name;
+    $('out-email').textContent = email;
+    $('out-country').textContent = country();
+    $('out-agree').textContent = 'yes';
+    $('form').hidden = true;
+    $('done').hidden = false;
+  });
+
+  // Отчёт стенду: только то, что видно в DOM (значения полей и блок «Thanks»).
+  let seq = 0, lastJson = '';
+  function state() {
+    const done = !$('done').hidden;
+    return {
+      run: RUN,
+      submitted: done ? {
+        name: $('out-name').textContent,
+        email: $('out-email').textContent,
+        country: $('out-country').textContent,
+        agree: $('out-agree').textContent === 'yes',
+      } : null,
+      fields: {name: $('name').value, email: $('email').value, country: country(), agree: $('agree').checked},
+      error: $('error').hidden ? null : $('error').textContent,
+    };
+  }
+  function report(beacon) {
+    if (!location.protocol.startsWith('http')) return;
+    const json = JSON.stringify(state());
+    if (json === lastJson && !beacon) return;
+    lastJson = json;
+    const body = JSON.stringify({...JSON.parse(json), seq: ++seq});
+    if (beacon) navigator.sendBeacon('/report', body);
+    else fetch('/report', {method: 'POST', body, keepalive: true}).catch(() => {});
+  }
+  // Значения полей не меняют DOM: слушаем и мутации, и ввод.
+  new MutationObserver(() => report(false))
+    .observe(document.body, {subtree: true, childList: true, characterData: true, attributes: true});
+  for (const type of ['input', 'change']) document.addEventListener(type, () => report(false), true);
+  addEventListener('pagehide', () => report(true));
+  report(false);
+})();
+</script>
+</body>
+</html>

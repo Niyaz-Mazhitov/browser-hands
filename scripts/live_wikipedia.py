@@ -1,7 +1,8 @@
 """Живая проверка ядра: headless launch с временным профилем, Wikipedia, платные вызовы Jev (доли цента).
 
-Запуск из клона: uv run --frozen --env-file <путь к клону>/.env python scripts/live_wikipedia.py
+Запуск из клона: uv run --frozen --env-file <путь к клону>/.env python scripts/live_wikipedia.py [--scenario]
 Выход 0 только при status == done и открытой статье; скриншот — traces/live-<ts>.jpg. Не запускается из pytest.
+`--scenario` — режим сценариев (docs/plan-scenarios.md): шаги `SCENARIO` вместо цели, текст запроса — дословно из шага.
 """
 
 from __future__ import annotations
@@ -20,10 +21,16 @@ from browser_hands.agent import Agent
 from browser_hands.chrome import Chrome
 from browser_hands.config import BrowserConfig, ModelConfig, RunConfig
 from browser_hands.model import ModelClients
+from browser_hands.scenario import parse_steps
 
 URL = "https://en.wikipedia.org/wiki/Main_Page"
 GOAL = "Find and open the Wikipedia article about Gödel's incompleteness theorems."
 EXPECTED = "incompleteness_theorems"
+# Как задача `wiki` стенда (docs/plan-scenarios.md §5.3): do — по-английски, text — дословно.
+SCENARIO = [
+    {"do": "Type the query into the Wikipedia search box", "text": "Gödel's incompleteness theorems"},
+    {"do": "Open the matching article from the suggestions or search results"},
+]
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -35,6 +42,7 @@ def main() -> int:
     parser.add_argument("--max-steps", type=int, default=15)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--verbose", action="store_true", help="usage моделей в stderr")
+    parser.add_argument("--scenario", action="store_true", help="шаги SCENARIO вместо цели (goal пустой)")
     args = parser.parse_args()
 
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -63,10 +71,11 @@ def main() -> int:
             chrome,
             clients,
             args.url,
-            args.goal,
+            "" if args.scenario else args.goal,
             run,
             screenshot_quality=browser.screenshot_quality,
             screenshot_scale=browser.screenshot_scale,
+            steps=parse_steps(SCENARIO) if args.scenario else None,
         )
         result = agent.run()
     finally:
@@ -79,15 +88,19 @@ def main() -> int:
         typed = f' — "{step.text}"' if step.text is not None else ""
         t = step.timing
         cost = f" ${step.cost:.5f}" if step.cost is not None else ""
+        where = f" [шаг {step.scenario_step}]" if step.scenario_step is not None else ""
         print(
             f"{step.index}. {step.operation} {step.target!r}{typed} changed={step.page_changed} "
-            f"(model {t.model_ms} / text {t.text_ms} / browser {t.browser_ms} / wait {t.wait_ms} ms){cost}"
+            f"(model {t.model_ms} / text {t.text_ms} / browser {t.browser_ms} / wait {t.wait_ms} ms){cost}{where}"
         )
     t = result.timing
     print(f"status: {result.status}")
     print(f"url: {result.url}")
     print(f"title: {result.title}")
     print(f"steps: {len(result.steps)}, model_calls: {result.model_calls}")
+    print(f"jev_calls: {result.jev_calls}, text_calls: {result.model_calls - result.jev_calls}")
+    if result.scenario_total is not None:
+        print(f"scenario: {result.scenario_done}/{result.scenario_total}")
     print(f"elapsed_ms: {result.elapsed_ms}")
     print(f"timing: model {t.model_ms} / text {t.text_ms} / browser {t.browser_ms} / wait {t.wait_ms} ms")
     print(f"cost: {'$%.5f' % result.cost if result.cost is not None else 'n/a'}")
