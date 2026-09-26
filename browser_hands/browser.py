@@ -8,8 +8,9 @@ CDP-клиента. Модель никогда не выдаёт селекто
 пользователя (`owned=False`): её не закрываем, не переводим и не меняем ей размер; в конце только `release()`.
 
 Ожидания — по событиям и состояниям, не по времени (docs/plan-waits.md §2): `await_ready` (кадры без значимых мутаций,
-запросы вкладки после действия, readyState, шрифты, конечные анимации, aria-busy) и `await_change` (следующее изменение,
-затем `await_ready`). Единственный потолок одного ожидания — `min(остаток дедлайна − запас, fuse_s)`.
+запросы вкладки после действия, readyState после навигации, шрифты, конечные анимации, aria-busy) и `await_change`
+(следующее изменение, затем `await_ready`). Единственный потолок одного ожидания — `min(остаток дедлайна − запас,
+fuse_s)`.
 """
 
 from __future__ import annotations
@@ -91,12 +92,12 @@ _SIGNIFICANT = """
 """
 
 # Только чтение; выполняется после того, как действие записано, даже если его прерывает навигация (§2 п. 1, 3–6).
-# Готово, когда `p.frames` кадров подряд без значимых мутаций И документ загружен (readyState complete), шрифты
-# загружены, нет идущих конечных анимаций (бесконечные — спиннеры — не ждём) и видимых [aria-busy=true]. Комбобокс после
-# ввода с видимыми подсказками — готово сразу. Скрытая вкладка (rAF не идёт) — ходы MessageChannel вместо кадров;
-# условие не выполнено — ход ждёт мутацию, readystatechange или fonts.ready (без холостого цикла). Единственный таймер —
-# предохранитель `p.fuse_ms`. Итог — {reason, ms, mutations, frames}: quiet | options | frames (без кадров) | fuse.
-# На выходе observer отключён, таймер и слушатели сняты.
+# Готово, когда `p.frames` кадров подряд без значимых мутаций И (после навигации, `p.document`) документ загружен
+# (readyState complete), шрифты загружены, нет идущих конечных анимаций (бесконечные — спиннеры — не ждём) и видимых
+# [aria-busy=true]. Комбобокс после ввода с видимыми подсказками — готово сразу. Скрытая вкладка (rAF не идёт) — ходы
+# MessageChannel вместо кадров; условие не выполнено — ход ждёт мутацию, readystatechange или fonts.ready (без
+# холостого цикла). Единственный таймер — предохранитель `p.fuse_ms`. Итог — {reason, ms, mutations, frames}: quiet |
+# options | frames (без кадров) | fuse. На выходе observer отключён, таймер и слушатели сняты.
 READY = (
     """(p => new Promise(resolve => {
   const start=performance.now(), action=p.action||{};
@@ -135,8 +136,8 @@ READY = (
         Number.isFinite(a.effect?.getComputedTiming?.().endTime));
     } catch (e) { return false; }
   };
-  const ready=hidden=>document.readyState==='complete' && document.fonts?.status!=='loading' && !busy() &&
-    (hidden || !animating());
+  const ready=hidden=>(!p.document || document.readyState==='complete') && document.fonts?.status!=='loading' &&
+    !busy() && (hidden || !animating());
   const step=()=>{
     if (dirty) { dirty=false; quiet=0; } else quiet++;
   };
@@ -618,7 +619,9 @@ class Tab:
     def await_ready(self, action: dict[str, Any] | None = None) -> dict[str, Any]:
         """Страница готова к решению после действия (docs/plan-waits.md §2): только чтение, время — `wait_ms`.
 
-        Цикл: промис `READY` (кадры, readyState, шрифты, анимации, aria-busy, подсказки комбобокса) → запросы вкладки,
+        Цикл: промис `READY` (кадры, шрифты, анимации, aria-busy, подсказки комбобокса; readyState — только после
+        навигации: `load`, `retry` и проход в новом документе, §2 п. 3 — подресурс, который не догружается, иначе держал
+        бы каждое ожидание до предохранителя) → запросы вкладки,
         начатые после эпохи действия, завершены? нет — насос событий до их завершения → снова `READY` (ответ мог
         изменить DOM) — пока оба условия не выполнятся в одном проходе. Каждый проход кончается событием; единственный
         потолок — предохранитель `_fuse()`: истёк — `fuse`, запросы в полёте — фоновые до конца жизни сессии. Документ
@@ -631,8 +634,11 @@ class Tab:
         self.last_settle = result or None
         return result
 
-    def _ready(self, action: dict[str, Any]) -> dict[str, Any]:
+    def _ready(self, action: dict[str, Any], *, navigated: bool = False) -> dict[str, Any]:
+        """`await_ready` без записи в `last_settle`. `navigated` — документ сменился (навигация): ждать и его загрузку
+        (readyState), как после `load`/`retry`."""
         self.after_input = None  # ожидание после действия — вот оно
+        document = navigated or action.get("kind") in {"load", "retry"}
         if self._cancelled():
             log.debug("await_ready пропущен: отмена")
             return {}
@@ -653,10 +659,11 @@ class Tab:
                 if left <= 0:
                     reason = "fuse"
                     break
-                value = self._ready_pass(action, left)
+                value = self._ready_pass(action, left, document)
                 passes += 1
                 if value is None:
                     interrupted += 1
+                    document = True  # новый документ: ждать и его загрузку
                     if interrupted >= STALE_RETRIES:
                         log.debug("await_ready: документ сменяется %d раз подряд — снимок решит", interrupted)
                         return {}
@@ -696,7 +703,7 @@ class Tab:
         )
         return result
 
-    def _ready_pass(self, action: dict[str, Any], left: float) -> dict[str, Any] | None:
+    def _ready_pass(self, action: dict[str, Any], left: float, document: bool) -> dict[str, Any] | None:
         """Один проход `READY` (предохранитель в странице — `left` с). None — документ сменился; {} — ответ без итога;
         страница не ответила до дедлайна прогона (главный поток занят) — `{"reason": "fuse"}`."""
         params = {
@@ -704,6 +711,7 @@ class Tab:
             "fuse_ms": max(1, round(left * 1000)),
             "frames": QUIET_FRAMES,
             "attributes": list(MUTATION_ATTRIBUTES),
+            "document": document,
         }
         try:
             response = self.client.call(
@@ -792,7 +800,7 @@ class Tab:
             self.last_settle = result
             log.debug("await_change: изменений нет за %s мс", result["ms"])
             return result
-        ready = self._ready({"kind": "wait"})
+        ready = self._ready({"kind": "wait"}, navigated=change == "navigation")
         if not ready and (change is None or self._cancelled()):
             return {}
         ready_reason = ready.get("reason")

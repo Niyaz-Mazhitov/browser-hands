@@ -190,6 +190,7 @@ def test_ready_expression_watches_significant_mutations_with_numbers_in_params(m
         "fuse_ms": 1500,  # Thresholds.wait_fuse_s — единственное время
         "frames": 2,
         "attributes": list(browser.MUTATION_ATTRIBUTES),
+        "document": False,  # readyState ждём только после навигации
     }
     assert "style" not in params["attributes"]  # JS-анимации пишут style каждый кадр
     assert {"class", "hidden", "aria-expanded", "aria-busy", "disabled"} <= set(params["attributes"])
@@ -274,6 +275,31 @@ def test_ready_interrupted_by_navigation_runs_again_in_the_new_document(interrup
     assert tab.observe()["actions"] == p["actions"]
     assert tab.last_settle is not None and tab.last_settle["reason"] == "quiet" and tab.last_settle["passes"] == 2
     assert len(ready_calls(client)) == 2 and client.call.call_count == 3
+    # клик увёл на новую страницу: в новом документе ждём и его загрузку (readyState), в старом — нет
+    assert [params_of(c.args[1]["expression"])["document"] for c in ready_calls(client)] == [False, True]
+
+
+def test_document_readiness_is_awaited_only_after_navigation(monkeypatch):
+    """План §2 п. 3: readyState — только после навигации. Подресурс, который не догружается (картинка, счётчик), держал
+    `readyState` не complete — и каждое ожидание после клика шло до предохранителя."""
+    frozen_clock(monkeypatch)
+    client = Mock()
+    client.call.return_value = READY_DONE
+    client.call_until.return_value = {"exceptionDetails": {"text": "Execution context was destroyed"}}
+    tab = make_tab(client)
+    for kind in ("click", "fill", "select", "scroll", "wait", "load", "retry"):
+        tab.await_ready({"kind": kind, "node": 20})
+    tab.await_change()  # изменение — смена документа: готовность нового — с readyState
+    tab.after_input = {"kind": "click", "node": 20}
+    client.call.side_effect = [
+        READY_DONE,
+        {"exceptionDetails": {"text": "navigating"}},
+        READY_DONE,
+        {"result": {"value": page()}},
+    ]
+    tab.observe()  # снимок не удался — документ сменяется: повтор после его загрузки
+    flags = [params_of(c.args[1]["expression"])["document"] for c in ready_calls(client)]
+    assert flags == [False, False, False, False, False, True, True, True, False, True]
 
 
 def test_ready_without_a_value_ends_the_wait_and_the_page_is_snapshotted():
@@ -1300,16 +1326,18 @@ def test_ready_in_node_ticker_with_quiet_gaps_is_ready_between_ticks():
 
 @node_only
 @pytest.mark.parametrize(
-    ("scenario", "ms"),
+    ("scenario", "ms", "kind"),
     [
-        ("finite-animation", 304),  # анимация 300 мс: первый кадр после её finished
-        ("aria-busy", 240),  # aria-busy снят на 200 мс: мутация + два тихих кадра
-        ("fonts", 112),  # шрифты загрузились на 100 мс
-        ("loading-doc", 160),  # readyState complete на 150 мс
+        ("finite-animation", 304, "click"),  # анимация 300 мс: первый кадр после её finished
+        ("aria-busy", 240, "click"),  # aria-busy снят на 200 мс: мутация + два тихих кадра
+        ("fonts", 112, "click"),  # шрифты загрузились на 100 мс
+        ("loading-doc", 160, "load"),  # после навигации: readyState complete на 150 мс
+        ("loading-doc", 160, "retry"),  # снимок не удался, документ сменяется — то же
+        ("loading-doc", 32, "click"),  # после клика документ не ждём: подресурс мог не догрузиться вовсе
     ],
 )
-def test_ready_in_node_waits_for_animations_busy_fonts_and_the_document(scenario, ms):
-    out = ready_in_node(scenario)
+def test_ready_in_node_waits_for_animations_busy_fonts_and_the_document(scenario, ms, kind):
+    out = ready_in_node(scenario, {"kind": kind, "node": 20})
     assert out["result"]["reason"] == "quiet" and out["result"]["ms"] == ms, out["result"]
 
 
@@ -1329,8 +1357,10 @@ def test_ready_in_node_hidden_tab_without_frames_counts_message_channel_turns():
         out = ready_in_node(scenario)
         assert out["result"] == {"reason": "frames", "ms": 0, "mutations": 0, "frames": 0}, out
         assert out["taskRuns"] == 2  # два хода MessageChannel без мутаций
-    out = ready_in_node("background-loading")  # документ грузится: ход ждёт readystatechange, а не крутится
+    out = ready_in_node("background-loading", {"kind": "load"})  # документ грузится: ход ждёт readystatechange
     assert out["result"]["reason"] == "frames" and out["result"]["ms"] == 150 and out["taskRuns"] == 3
+    out = ready_in_node("background-loading")  # после клика документ не ждём
+    assert out["result"]["reason"] == "frames" and out["result"]["ms"] == 0 and out["taskRuns"] == 2
 
 
 @node_only
@@ -1468,6 +1498,11 @@ NETWORK_PAGE = """<!doctype html><body>
 <div id=out></div></body>"""
 
 
+# Картинка, которая не догружается (10 с): документ остаётся в readyState interactive.
+STUCK_PAGE = """<!doctype html><body><img src="/poll" alt="stuck"><button onclick="out.textContent='ok'">Go</button>
+<div id=out></div></body>"""
+
+
 @contextmanager
 def network_server():
     """Страница с fetch к себе: /slow отвечает через 0,7 с, /poll — через 10 с (long-poll)."""
@@ -1475,7 +1510,7 @@ def network_server():
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            pause, body = {"/slow": (0.7, b"done"), "/poll": (10.0, b"late")}.get(
+            pause, body = {"/slow": (0.7, b"done"), "/poll": (10.0, b"late"), "/stuck": (0.0, STUCK_PAGE.encode())}.get(
                 self.path, (0.0, NETWORK_PAGE.encode())
             )
             time.sleep(pause)
@@ -1540,6 +1575,22 @@ def test_requests_of_a_page_left_by_a_click_do_not_hold_waits_in_headless_chrome
         assert tab.in_flight(tab.action_epoch) == 0 and tab.in_flight(0) == 0  # запрос старого документа снят
         again = tab.await_ready({"kind": "retry"})
         assert again["wait_reason"] == "quiet" and again["ms"] < 300, again
+
+
+@chrome_only
+def test_click_on_a_page_with_a_stuck_image_is_ready_without_the_document_load_in_headless_chrome(tmp_path):
+    """План §2 п. 3: readyState — только после навигации. Было: картинка, которая не догружается, давала `fuse` на
+    каждом действии (readyState interactive)."""
+    with headless_chrome(tmp_path) as chrome, network_server() as url:
+        tab = chrome.new_tab()
+        tab.navigate(url + "stuck", timeout=1.0)  # загрузка документа не кончится: дальше без ожидания готовности
+        assert tab.evaluate("document.readyState") == "interactive"
+        state = tab.observe()
+        go = next(a for a in state["actions"] if a["label"] == "Go")
+        tab.act(go, state)
+        result = tab.await_ready(go)
+        assert result["wait_reason"] == "quiet" and result["ms"] < 500, result
+        assert "ok" in tab.observe()["text"]
 
 
 FIELDS_PAGE = """<!doctype html><body><input aria-label="Search">
