@@ -2490,14 +2490,39 @@ def epoch_tab(*texts):
 def test_jev_sees_requests_of_the_actions_since_the_last_page_change(monkeypatch):
     """delay 3000: ввод в поиск (страница сменилась, ответ в пути) → клик по полю (запросов не начал, страница та же) —
     Jev и тогда видит, что страница загружается; после смены страницы счёт — с действия, которое её сменило."""
-    tab = epoch_tab("A", "B", "B", "C")
+    tab = epoch_tab("A", "B", "B", "B", "C")
     tab.in_flight.side_effect = lambda since: 1 if since == 100 else 0  # в полёте — запрос действия 100
     agent = make_agent(tab)
     choose = scripted(*[decision("e3", "CLICK")] * 3, DONE)
     monkeypatch.setattr(loop, "choose", choose)
     assert agent.run().status == "done"
     assert [c.kwargs["loading"] for c in choose.call_args_list] == [0, 1, 1, 0]
-    assert [c.args[0] for c in tab.in_flight.call_args_list] == [None, 100, 100, 102]
+    assert [c.args[0] for c in tab.in_flight.call_args_list] == [None, 100, 100, 100, 102, 102]
+    tab.await_change.assert_called_once_with()  # перед вторым вопросом — одно ожидание запросов действия 100
+
+
+def test_page_still_loading_after_the_action_waits_once_for_the_change_before_asking_jev(monkeypatch, caplog):
+    """Ответ на действие пережил ожидание после него (предохранитель): перед вопросом Jev — ещё одно ожидание
+    изменения и свежий снимок, а не решение по недогруженной странице (5 из 12 точечных прогонов delay 3000 без
+    этого — клик по чужому чату и ложный done)."""
+    tab = epoch_tab()
+    flying = {100: 1}  # запрос действия 100 в полёте, пока не придёт ответ
+    tab.await_change.side_effect = lambda: flying.clear() or {"reason": "change", "change": "network"}
+    tab.in_flight.side_effect = lambda since: flying.get(since, 0)
+    agent = make_agent(tab)
+    seen = []
+
+    def choose(_clients, state, *_a, **k):
+        seen.append((state["text"], k["loading"]))
+        return [decision("e3", "CLICK"), DONE][len(seen) - 1]
+
+    monkeypatch.setattr(loop, "choose", Mock(side_effect=choose))
+    result, lines = info_lines(caplog, agent.run)
+    assert result.status == "done" and len(result.steps) == 1
+    tab.await_change.assert_called_once_with()
+    assert seen == [("Search 1", 0), ("Search 3", 0)]  # Jev спросили по снимку после ожидания
+    assert "страница ещё загружается (запросов действий в полёте: 1) — жду изменения" in lines
+    assert [h["kind"] for h in agent._history] == ["click"]  # не шаг и не запись истории
 
 
 def test_jev_sees_the_loading_fact_in_scenario_mode_too(monkeypatch):
@@ -2534,12 +2559,13 @@ def test_no_page_change_keeps_waiting_while_requests_of_those_actions_are_in_fli
     tab = epoch_tab("Search", "Typed")  # первое действие сменило страницу, дальше — ничего
     waits = []
     tab.await_change.side_effect = lambda: waits.append(1) or {}
-    tab.in_flight.side_effect = lambda since: 1 if since is not None and len(waits) < 2 else 0  # ответ — после 2-го
+    tab.in_flight.side_effect = lambda since: 1 if since is not None and len(waits) < 3 else 0  # ответ — после 3-го
     agent = make_agent(tab)
     monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e3", "CLICK")))
     result = agent.run()
     assert result.status == "blocked" and result.error == "No page change after 3 consecutive actions"
-    assert len(result.steps) == 1 + 3 * 3 and tab.await_change.call_count == 2
+    # ожидание перед вторым вопросом (запросы действия в полёте), потом по одному на каждую серию, пока они в полёте
+    assert len(result.steps) == 1 + 3 * 3 and tab.await_change.call_count == 3
     # чьи запросы: с действия 100, после которого страница сменилась (дальше — ни одной смены)
     assert {c.args[0] for c in tab.in_flight.call_args_list[1:]} == {100}
 
