@@ -925,6 +925,21 @@ def test_field_values_expression_in_node_by_node_then_by_label():
     assert out["withoutCache"] == ["book", "привет 👋", None, None, None, None, None, "Gödel"]  # только подпись
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="нужен node")
+def test_field_values_expression_finds_a_nameless_field_only_when_it_is_the_only_one():
+    """Код из SMS: клетки без доступного имени. Узел клетки пропал — по подписи '' её не узнать среди нескольких таких
+    полей (ревью: бралось первое поле без имени — значение чужой клетки)."""
+    script = FAKE_DOM.replace(
+        "const elements = [search, hiddenMessage, newMessage, password, readonly, nameless];",
+        "const second = new El('INPUT', {}, {type: 'text', value: '7'});\nconst elements = [search, nameless, second];",
+    ).replace("EXPRESSION", json.dumps(browser.FIELD_VALUES + "specs)"))
+    done = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=10)
+    assert done.returncode == 0, done.stderr
+    out = json.loads(done.stdout)
+    assert out["withCache"][7] is None and out["withoutCache"][7] is None  # два поля без имени — не наше
+    assert out["withCache"][0] == "book"  # поле с подписью — как раньше
+
+
 # --- ожидания на FakeCDPServer с событиями Network (docs/plan-waits.md §5.2–5.4) ----------------------------------
 
 

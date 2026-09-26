@@ -2826,3 +2826,92 @@ def test_field_left_blank_by_a_re_render_still_rolls_back(monkeypatch, left):
     result = agent.run()
     assert result.status == "done" and numbers(choose) == [1, 2, 2, 3, 4, 3, 4, 4]
     assert labels(tab).count("Send") == 1 and labels(tab).count("Type a message") == 2
+
+
+# --- поля без подписи (docs/core-notes.md, «После ревью ожиданий») ----------------------------------------------------
+
+
+def otp_tab(*, drop_first=False):
+    """Код из SMS: два поля без доступного имени (подпись в снимке — роль, ключ поля ""), узлы 10 и 11, и Verify (40).
+    `drop_first` — первый ввод в поле 10 не держится (поле его не показывает)."""
+    tab = make_tab()
+    typed = tab.typed
+    count = iter(range(1, 1000))
+
+    def otp(*_a, **_k):
+        first, second = typed.get(10, ""), typed.get(11, "")
+        state = {
+            "url": "https://bank.test/otp",
+            "title": "Code",
+            "text": f"Enter the code {next(count)}",
+            "scroll": {"y": 0},
+            "actions": [
+                {"id": "e1", "kind": "fill", "label": "textbox", "role": "textbox", "value": first, "node": 10},
+                {"id": "e2", "kind": "fill", "label": "textbox", "role": "textbox", "value": second, "node": 11},
+                {"id": "e5", "kind": "click", "label": "Verify", "role": "button", "node": 40},
+            ],
+        }
+        state["fingerprint"] = fingerprint(state)
+        return state
+
+    act = tab.act.side_effect
+    dropped = []
+
+    def act_otp(action, page_, text=None):
+        if drop_first and action["node"] == 10 and not dropped:
+            dropped.append(text)
+            return {"executed": action["id"]}
+        return act(action, page_, text=text)
+
+    tab.act.side_effect = act_otp
+    tab.observe.side_effect = otp
+    return tab
+
+
+def test_text_lost_from_one_nameless_field_is_not_typed_into_another(monkeypatch):
+    """Ревью: `_same_field` по ключу "" совпадал с любым полем без имени — текст, пропавший из первой клетки кода, без
+    текстовой модели печатался во вторую."""
+    tab = otp_tab(drop_first=True)
+    agent = make_agent(tab, goal="Enter the code 12")
+    texts = iter(["1", "2"])
+    helper = Mock(side_effect=lambda *a, **k: (next(texts), TextHelper("t", 1)))
+    monkeypatch.setattr(loop, "field_text", helper)
+    monkeypatch.setattr(loop, "choose", scripted(decision("e1"), decision("e2"), DONE))
+    result = agent.run()
+    assert result.status == "done"
+    assert [(c.args[0]["id"], c.kwargs["text"]) for c in tab.act.call_args_list] == [("e1", "1"), ("e2", "2")]
+    assert helper.call_count == 2  # во вторую клетку — свой текст
+
+
+def test_typing_into_another_nameless_field_keeps_the_first_ones_text_checked(monkeypatch):
+    tab = otp_tab()
+    agent = make_agent(tab, goal="Enter the code 12")
+    texts = iter(["1", "2", "3"])
+    monkeypatch.setattr(loop, "field_text", Mock(side_effect=lambda *a, **k: (next(texts), TextHelper("t", 1))))
+    verify = decision("e5", "CLICK")
+    choose = Mock(side_effect=[decision("e1"), decision("e2"), verify, decision("e1"), verify, DONE])
+
+    def ask(*a, **k):
+        if choose.call_count == 2:  # после ввода во вторую клетку сайт очистил первую
+            tab.typed.pop(10)
+        return choose(*a, **k)
+
+    monkeypatch.setattr(loop, "choose", Mock(side_effect=ask))
+    result = agent.run()
+    assert result.status == "done"
+    assert [c.args[0]["id"] for c in tab.act.call_args_list] == ["e1", "e2", "e1", "e5"]  # клетка 1 — заново, до Verify
+    assert [c.kwargs["text"] for c in tab.act.call_args_list][:3] == ["1", "2", "1"]
+
+
+def test_nameless_field_is_found_again_only_when_it_is_the_only_one():
+    typed = loop.Invariant(1, 10, "", "1")
+    cell = {"kind": "fill", "label": "textbox", "role": "textbox"}  # без имени: подпись — роль
+    one = {"actions": [{**cell, "id": "e2", "value": "1", "node": 12}]}
+    two = {"actions": [*one["actions"], {**cell, "id": "e3", "node": 13}]}
+    kept_node = {"actions": [*one["actions"], {**cell, "id": "e1", "node": 10}]}
+    action = {"kind": "fill", "label": "textbox", "role": "textbox", "node": 10}
+    assert [f["node"] for f in loop.typed_fields(one, action)] == [12]  # пересоздано — единственное без имени
+    assert loop.typed_fields(two, action) == []  # два поля без имени: какое наше — не узнать
+    assert loop._same_field(typed, one["actions"][0], one)
+    assert not loop._same_field(typed, two["actions"][0], two)
+    assert not loop._same_field(typed, kept_node["actions"][0], kept_node)  # узел 10 на месте: 12 — другое поле

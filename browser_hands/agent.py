@@ -123,21 +123,29 @@ def interactive(page: dict[str, Any]) -> bool:
 
 def _field_key(action: dict[str, Any]) -> str:
     """Ключ поля без роли: подпись (имя, `<label>`, title, placeholder). У поля без имени подпись в снимке — сама роль
-    (`name || role`): ключ пустой, такие поля сравниваются между собой при любой роли."""
+    (`name || role`): ключ пустой. Такие поля ключом не различить (клетки кода из SMS): узнаём по узлу, а без узла —
+    только единственное поле без имени на странице (`_same_field`, `typed_fields`)."""
     label = str(action.get("label") or "")
     return "" if label == action.get("role") else label
+
+
+def _nameless(page: dict[str, Any]) -> list[Any]:
+    """Узлы полей ввода (`fill`) без доступного имени на снимке."""
+    return [a.get("node") for a in page.get("actions") or () if a.get("kind") == "fill" and not _field_key(a)]
 
 
 def typed_fields(page: dict[str, Any], action: dict[str, Any]) -> list[dict[str, Any]]:
     """Поле, куда печатали, на новом снимке: тот же узел, если он ещё есть; иначе — поля `fill` с тем же ключом
     (`_field_key`), роль не сравнивается: сайт перерисовал поле новым узлом, Википедия — ещё и с другой ролью
-    (searchbox → combobox). Текст сверяет вызывающий (`matches`). Пусто — поля не видно."""
+    (searchbox → combobox). Поле без имени без своего узла — только если оно на странице одно. Текст сверяет
+    вызывающий (`matches`). Пусто — поля не видно."""
     fields = [a for a in page.get("actions") or () if a.get("kind") in {"fill", "click"} and "node" in a]
     same = [a for a in fields if a["node"] == action.get("node")]
     if same:
         return same
     key = _field_key(action)
-    return [a for a in fields if a["kind"] == "fill" and _field_key(a) == key]
+    found = [a for a in fields if a["kind"] == "fill" and _field_key(a) == key]
+    return found if key or len(found) == 1 else []
 
 
 def _spaces(text: str) -> str:
@@ -179,9 +187,21 @@ def _count(value: Any) -> int:
     return value if type(value) is int and value > 0 else 0
 
 
-def _same_field(typed: Invariant, action: dict[str, Any]) -> bool:
-    """Поле действия — то, куда печатали `typed`: тот же узел или тот же ключ (`_field_key`; узел мог смениться)."""
-    return typed.node == action.get("node") or typed.label == _field_key(action)
+def _same_field(typed: Invariant, action: dict[str, Any], page: dict[str, Any]) -> bool:
+    """Поле действия (`fill` на снимке `page`) — то, куда печатали `typed`: тот же узел или тот же ключ (`_field_key`;
+    узел мог смениться). Поле без имени (ключ "") — только тот же узел, а если узла `typed` на снимке нет (поле
+    пересоздано) — когда поле действия — единственное поле без имени."""
+    if typed.node is not None and typed.node == action.get("node"):
+        return True
+    if typed.label:
+        return typed.label == _field_key(action)
+    nameless = _nameless(page)
+    return not _field_key(action) and typed.node not in nameless and nameless == [action.get("node")]
+
+
+def _same_entry(a: Invariant, b: Invariant) -> bool:
+    """Два запомненных ввода — в одно поле: тот же узел или тот же непустой ключ (поля без имени — только по узлу)."""
+    return a.node == b.node or (bool(a.label) and a.label == b.label)
 
 
 def wait_fields(result: Any) -> tuple[str | None, int]:
@@ -593,7 +613,7 @@ class Agent(AgentLike):
     def _typed_vanish(self, typed: Invariant) -> int:
         """Режим цели: текст `typed` пропал из поля (сразу после ввода или позже). Запомнить его для повторного ввода в
         то же поле; пропаж того же текста в том же поле больше `RETYPE_LIMIT` — `blocked`. Итог — сколько раз пропал."""
-        self._retype = [r for r in self._retype if r.node != typed.node and r.label != typed.label] + [typed]
+        self._retype = [r for r in self._retype if not _same_entry(r, typed)] + [typed]
         key = (typed.label, typed.text)
         self._typed_vanished[key] = count = self._typed_vanished.get(key, 0) + 1
         if count > RETYPE_LIMIT:
@@ -614,9 +634,9 @@ class Agent(AgentLike):
         self._history[-1]["note"] = TEXT_VANISHED
         self._typed_vanish(Invariant(step.index, action.get("node"), _field_key(action), text))
 
-    def _retyped(self, action: dict[str, Any]) -> str | None:
+    def _retyped(self, action: dict[str, Any], page: dict[str, Any]) -> str | None:
         """Режим цели: текст, пропавший из этого поля (`_typed_vanish`), — ввести снова его же, без текстовой модели."""
-        return next((r.text for r in reversed(self._retype) if _same_field(r, action)), None)
+        return next((r.text for r in reversed(self._retype) if _same_field(r, action, page)), None)
 
     def _anchor(self) -> int | None:
         """Эпоха действия, с которого считаются «запросы действий»: последнего действия (или ожидания), после которого
@@ -979,7 +999,7 @@ class Agent(AgentLike):
             elif current is not None and not self.goal:
                 # Текста нет ни в шаге, ни в цели: выдумывать нечего — стоп, без текстовой модели и нового вопроса Jev.
                 raise _Stop("blocked", f"{self._step_name()}: no text given for typing")
-            elif current is None and (retype := self._retyped(action)) is not None:
+            elif current is None and (retype := self._retyped(action, page)) is not None:
                 text = retype  # режим цели: текст пропал из этого поля — тот же, без текстовой модели
             else:
                 # Сценарий: история без напечатанных текстов — тексты шагов текстовой модели не уходят.
@@ -999,7 +1019,7 @@ class Agent(AgentLike):
             tab.act(action, page, text=text)
         self._pending_text = None
         if action["kind"] == "fill":
-            self._retype = [r for r in self._retype if not _same_field(r, action)]  # ввели снова — забыть
+            self._retype = [r for r in self._retype if not _same_field(r, action, page)]  # ввели снова — забыть
         if self._invariants and action["kind"] == "click" and not _is_field(page, action):
             # Клик не по полю использует напечатанное (Send, строка чата, Submit): дальше поле может опустеть законно.
             log.debug(
@@ -1009,9 +1029,7 @@ class Agent(AgentLike):
             self._typed_entries.clear()
         elif self._invariants and action["kind"] == "fill":
             # Ввод в то же поле заменяет прежний текст (selectAll + insertText) — так задумано сценарием.
-            self._invariants = [
-                i for i in self._invariants if i.node != action.get("node") and i.label != action.get("label")
-            ]
+            self._invariants = [i for i in self._invariants if not _same_field(i, action, page)]
         # Исполнение записано до наблюдения: устаревший снимок после действия не сотрёт его.
         self._history.append(
             {

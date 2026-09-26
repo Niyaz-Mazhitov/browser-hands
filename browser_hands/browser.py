@@ -257,8 +257,9 @@ def _snapshot_part(first: str, last: str) -> str:
 
 
 # Только чтение (docs/plan-waits.md §4.2): на каждый {node, label} — значение поля по узлу из кэша снимка, если узел ещё
-# в документе; иначе первого видимого редактируемого поля с той же подписью (сайт перерисовал поле — узел новый); иначе
-# null. safe/visible/name/role — из snapshot.js, «редактируемое» и значение — как там же (fill-действие и его value).
+# в документе; иначе первого видимого редактируемого поля с той же подписью (сайт перерисовал поле — узел новый), а для
+# подписи '' (поле без имени) — единственного такого поля (клетки кода из SMS друг от друга не отличить); иначе null.
+# safe/visible/name/role — из snapshot.js, «редактируемое» и значение — как там же (fill-действие и его value).
 FIELD_VALUES = (
     "(specs => {\n"
     + _snapshot_part("  const safe = e =>", "    return null;\n  };\n")
@@ -272,9 +273,12 @@ FIELD_VALUES = (
   const value=e=>'value' in e ? String(e.value) :
     e.isContentEditable || role(e)==='combobox' ? e.innerText.trim() : '';
   let fields=null;
-  const labelled=label=>(fields??=[...document.querySelectorAll(selector)].filter(e=>safe(e) && visible(e) &&
-    !e.matches(':disabled') && !e.closest('[aria-disabled="true"]') && editable(e)))
-    .find(e=>label==='' ? !name(e) : (name(e)||role(e))===label);
+  const labelled=label=>{
+    fields??=[...document.querySelectorAll(selector)].filter(e=>safe(e) && visible(e) &&
+      !e.matches(':disabled') && !e.closest('[aria-disabled="true"]') && editable(e));
+    const same=fields.filter(e=>label==='' ? !name(e) : (name(e)||role(e))===label);
+    return label==='' && same.length!==1 ? null : same[0];
+  };
   return specs.map(({node,label})=>{
     const e=node==null ? null : nodes?.get(node);
     if (e?.isConnected && safe(e)) return value(e);
@@ -813,7 +817,7 @@ class Tab:
         """Что сейчас в полях, куда печатали (`[{node, label}]` из снимка): один `Runtime.evaluate` (`FIELD_VALUES`),
         только чтение, время — `browser_ms`. На каждое — значение поля по узлу из кэша снимка, если узел ещё в
         документе; иначе первого видимого редактируемого поля с той же подписью (`label` "" — поле без имени любой
-        роли: сайт мог пересоздать его с другой ролью); иначе None. Значение — как `value` в
+        роли, если оно такое одно: сайт мог пересоздать его с другой ролью); иначе None. Значение — как `value` в
         снимке; password/file/hidden не читаются, напечатанный текст в страницу не уходит (сравнивает вызывающий).
         Документ сменяется — StalePage."""
         if not specs:
