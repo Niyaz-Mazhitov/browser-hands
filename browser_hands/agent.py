@@ -33,7 +33,11 @@ P(yes) — режим проверки: ожидание изменения, с�
 В обоих режимах CLICK/TYPE_TEXT/SELECT с уверенностью ниже `min_action_confidence` не исполняется: первый раз — как WAIT
 (ожидание изменения, свежий снимок, новый вопрос), второй подряд — `blocked` (docs/core-notes.md, «Живая проверка
 WhatsApp»). Режим цели: DONE с уверенностью ниже `done_min_confidence` — один второй взгляд, снова такой DONE —
-`unconfirmed`; напечатанный текст не виден в поле на следующем снимке — пометка в истории (Jev видит).
+`unconfirmed`; напечатанный текст не виден в поле на следующем снимке — пометка в истории (Jev видит). Виден — он
+инвариант, пока его не использовали (клик не по полю, новый ввод в то же поле; docs/core-notes.md, «Медленные ответы и
+текст в режиме цели»): перед каждым решением и перед `done` — `Tab.field_values`; пропал — решение отброшено, запись
+ввода убрана из истории для Jev, повторный ввод — тем же текстом без текстовой модели; пропаж одного текста в поле
+больше `RETYPE_LIMIT` — `blocked`.
 Пороги — `Agent.thresholds` (`config.Thresholds`, docs/calibration.md); одноимённые константы модуля — алиасы
 значений по умолчанию.
 
@@ -161,6 +165,11 @@ def _count(value: Any) -> int:
     return value if type(value) is int and value > 0 else 0
 
 
+def _same_field(typed: Invariant, action: dict[str, Any]) -> bool:
+    """Поле действия — то, куда печатали `typed`: тот же узел или тот же ключ (`_field_key`; узел мог смениться)."""
+    return typed.node == action.get("node") or typed.label == _field_key(action)
+
+
 def wait_fields(result: Any) -> tuple[str | None, int]:
     """`Step.wait_reason` и `pending_requests` из итога `Tab.await_ready`/`await_change`: `wait_reason` (иначе `reason`)
     и число запросов в полёте (`pending_requests`, иначе `pending`: число или их список). Не ждали (`{}`) — None и 0."""
@@ -258,6 +267,12 @@ class Agent(AgentLike):
         # «Нет изменений после NO_PROGRESS_STEPS действий»: ожидание перед blocked уже было (снова — после действия,
         # сменившего страницу, или пока в полёте запросы, начатые этими действиями)
         self._stall_look_used = False
+        # Режим цели: запись истории исполненного TYPE_TEXT по `Step.index` (её инвариант — там же): текст пропал —
+        # запись убирается из истории для Jev; тексты, пропавшие из полей, — для повторного ввода без текстовой модели;
+        # пропажи по (ключ поля, текст)
+        self._typed_entries: dict[int, dict[str, Any]] = {}
+        self._retype: list[Invariant] = []
+        self._typed_vanished: dict[tuple[str, str], int] = {}
         self._model_calls = 0
         self._jev_calls = 0
         self._scenario_no = 1  # текущий шаг сценария (с 1)
@@ -529,16 +544,79 @@ class Agent(AgentLike):
         self._scenario_no += 1
 
     def _invariants_hold(self, invariants: list[Invariant]) -> bool:
-        """Тексты шагов ещё в полях: один `Tab.field_values` (по узлу, иначе по подписи), `matches`. Пропал — откат к
-        самому раннему такому шагу (`_roll_back`) и False. Документ сменяется — `StalePage` наружу."""
+        """Напечатанные тексты ещё в полях: один `Tab.field_values` (по узлу, иначе по подписи), `matches`. Пропал —
+        сценарий: откат к самому раннему такому шагу (`_roll_back`); режим цели: ввод отброшен (`_roll_back_typed`);
+        итог False. Документ сменяется — `StalePage` наружу."""
         values = self._require_tab().field_values([{"node": i.node, "label": i.label} for i in invariants])
         if not isinstance(values, list) or len(values) != len(invariants):
             raise StalePage("Document is navigating")
         broken = [i for i, value in zip(invariants, values, strict=True) if not matches(value, i.text)]
         if not broken:
             return True
-        self._roll_back(min(broken, key=lambda i: i.step))
+        if self.scenario is None:
+            self._roll_back_typed(broken)
+        else:
+            self._roll_back(min(broken, key=lambda i: i.step))
         return False
+
+    def _roll_back_typed(self, broken: list[Invariant]) -> None:
+        """Режим цели: напечатанный текст пропал из поля до использования (сайт пересоздал поле). Решение отброшено,
+        запись этого TYPE_TEXT убрана из истории для Jev — он напечатает снова, тем же текстом (`_retype`, без текстовой
+        модели). Пропажа — в счёт (ключ поля, текст) вместе с пропажей сразу после ввода; больше `RETYPE_LIMIT` —
+        `blocked`."""
+        gone = [self._typed_entries.pop(i.step) for i in broken if i.step in self._typed_entries]
+        self._history = [h for h in self._history if not any(h is entry for entry in gone)]
+        self._invariants = [i for i in self._invariants if i not in broken]
+        self._second_chance_used = self._done_look_used = self._stall_look_used = False
+        self._uncertain = 0
+        for typed in broken:
+            count = self._typed_vanish(typed)
+            label = short_label(typed.label)
+            log.info("текст пропал из поля %r — ввод отброшен, Jev напечатает снова (%d-й раз)", label, count)
+
+    def _typed_vanish(self, typed: Invariant) -> int:
+        """Режим цели: текст `typed` пропал из поля (сразу после ввода или позже). Запомнить его для повторного ввода в
+        то же поле; пропаж того же текста в том же поле больше `RETYPE_LIMIT` — `blocked`. Итог — сколько раз пропал."""
+        self._retype = [r for r in self._retype if r.node != typed.node and r.label != typed.label] + [typed]
+        key = (typed.label, typed.text)
+        self._typed_vanished[key] = count = self._typed_vanished.get(key, 0) + 1
+        if count > RETYPE_LIMIT:
+            raise _Stop("blocked", f"typed text does not stay in the field {short_label(typed.label)!r}")
+        return count
+
+    def _typed_goal(self, action: dict[str, Any], text: str, new_page: dict[str, Any], step: Step) -> None:
+        """Режим цели, TYPE_TEXT исполнен: поле показывает текст — он инвариант, пока его не использовали (клик не по
+        полю, новый ввод в то же поле): перед каждым решением и перед `done` — `_invariants_hold`. Не показывает —
+        пометка `TEXT_VANISHED` для Jev (решает он), текст — для повторного ввода, пропажа — в счёт."""
+        field = self._shown(new_page, action, text)
+        if field is not None:
+            key = _field_key(field if field.get("label") else action)  # без имени — "": найдётся при любой роли
+            self._invariants.append(Invariant(step.index, field.get("node"), key, text))
+            self._typed_entries[step.index] = self._history[-1]
+            return
+        log.info("step %d: текста нет в поле после ввода — пометка в истории", step.index)
+        self._history[-1]["note"] = TEXT_VANISHED
+        self._typed_vanish(Invariant(step.index, action.get("node"), _field_key(action), text))
+
+    def _retyped(self, action: dict[str, Any]) -> str | None:
+        """Режим цели: текст, пропавший из этого поля (`_typed_vanish`), — ввести снова его же, без текстовой модели."""
+        return next((r.text for r in reversed(self._retype) if _same_field(r, action)), None)
+
+    def _stalled(self, page: dict[str, Any]) -> None:
+        """`NO_PROGRESS_STEPS` действий подряд без изменения страницы. Перед `blocked` — ожидание изменения и свежий
+        снимок, как второй шанс перед BLOCKED (`_look_again`, решение — в следующем тике): один раз, пока действие не
+        сменит страницу, и снова — пока в полёте запросы, начатые этими действиями или действием перед ними (фоновые
+        тоже: предохранитель их пережил, ответ ещё придёт — действия шли по недогруженной странице). Запись ожидания в
+        истории разрывает серию: следующая проверка — не раньше ещё `NO_PROGRESS_STEPS` действий без изменений (их
+        ограничивают `max_steps`, бюджет решений и `STEP_ACTIONS_LIMIT`)."""
+        start = len(self._history) - NO_PROGRESS_STEPS
+        since = self._history[max(start - 1, 0)].get("epoch")
+        in_flight = _count(self._require_tab().in_flight(since if type(since) is int else None))
+        if self._stall_look_used and not in_flight:
+            raise _Stop("blocked", f"No page change after {NO_PROGRESS_STEPS} consecutive actions")
+        self._stall_look_used = True
+        loading = f", {in_flight} requests of these actions in flight" if in_flight else ""
+        self._look_again(page, f"no page change after {NO_PROGRESS_STEPS} actions{loading}")
 
     def _roll_back(self, broken: Invariant) -> None:
         """Текст шага j пропал из поля (сайт пересоздал поле): текущим снова становится шаг j, шаги после него — не
@@ -557,22 +635,6 @@ class Agent(AgentLike):
         log.info("шаг %d/%d: текст шага %d пропал — возвращаюсь к шагу %d (%d-й раз)", was, total, j, j, count)
         if count > RETYPE_LIMIT:
             raise _Stop("blocked", f"{self._step_name()}: typed text does not stay in the field")
-
-    def _stalled(self, page: dict[str, Any]) -> None:
-        """`NO_PROGRESS_STEPS` действий подряд без изменения страницы. Перед `blocked` — ожидание изменения и свежий
-        снимок, как второй шанс перед BLOCKED (`_look_again`, решение — в следующем тике): один раз, пока действие не
-        сменит страницу, и снова — пока в полёте запросы, начатые этими действиями или действием перед ними (фоновые
-        тоже: предохранитель их пережил, ответ ещё придёт — действия шли по недогруженной странице). Запись ожидания в
-        истории разрывает серию: следующая проверка — не раньше ещё `NO_PROGRESS_STEPS` действий без изменений (их
-        ограничивают `max_steps`, бюджет решений и `STEP_ACTIONS_LIMIT`)."""
-        start = len(self._history) - NO_PROGRESS_STEPS
-        since = self._history[max(start - 1, 0)].get("epoch")
-        in_flight = _count(self._require_tab().in_flight(since if type(since) is int else None))
-        if self._stall_look_used and not in_flight:
-            raise _Stop("blocked", f"No page change after {NO_PROGRESS_STEPS} consecutive actions")
-        self._stall_look_used = True
-        loading = f", {in_flight} requests of these actions in flight" if in_flight else ""
-        self._look_again(page, f"no page change after {NO_PROGRESS_STEPS} actions{loading}")
 
     def _check_step_limit(self) -> None:
         """Сценарий: на шаге уже `STEP_ACTIONS_LIMIT` действий — `step_limit`, следующее не исполняется."""
@@ -867,6 +929,8 @@ class Agent(AgentLike):
             elif current is not None and not self.goal:
                 # Текста нет ни в шаге, ни в цели: выдумывать нечего — стоп, без текстовой модели и нового вопроса Jev.
                 raise _Stop("blocked", f"{self._step_name()}: no text given for typing")
+            elif current is None and (retype := self._retyped(action)) is not None:
+                text = retype  # режим цели: текст пропал из этого поля — тот же, без текстовой модели
             else:
                 # Сценарий: история без напечатанных текстов — тексты шагов текстовой модели не уходят.
                 context = field_context(self._text_goal(), action, page, self._history, texts=current is None)
@@ -884,12 +948,15 @@ class Agent(AgentLike):
         else:
             tab.act(action, page, text=text)
         self._pending_text = None
+        if action["kind"] == "fill":
+            self._retype = [r for r in self._retype if not _same_field(r, action)]  # ввели снова — забыть
         if self._invariants and action["kind"] == "click" and not _is_field(page, action):
             # Клик не по полю использует напечатанное (Send, строка чата, Submit): дальше поле может опустеть законно.
             log.debug(
                 "клик %r: инварианты шагов %s сняты", short_label(action["label"]), [i.step for i in self._invariants]
             )
             self._invariants.clear()
+            self._typed_entries.clear()
         elif self._invariants and action["kind"] == "fill":
             # Ввод в то же поле заменяет прежний текст (selectAll + insertText) — так задумано сценарием.
             self._invariants = [
@@ -969,15 +1036,8 @@ class Agent(AgentLike):
         log.debug("step %d text=%r url=%s", step.index, text, new_page["url"])
         if typed_step_text and text is not None:
             self._check_typed(action, text, new_page)
-        elif (
-            current is None
-            and action["kind"] == "fill"
-            and text is not None
-            and not self._shown(new_page, action, text)
-        ):
-            # Режим цели, мягкий инвариант: напечатанного не видно в поле на следующем снимке — пометка для Jev.
-            log.info("step %d: текста нет в поле после ввода — пометка в истории", step.index)
-            self._history[-1]["note"] = TEXT_VANISHED
+        elif current is None and action["kind"] == "fill" and text is not None:
+            self._typed_goal(action, text, new_page, step)  # режим цели: инвариант или пометка для Jev
         # Только действия текущего шага (в режиме цели — все): закрытые шаги с неизменной страницей не копятся.
         repeated = self._history[max(self._step_history, len(self._history) - NO_PROGRESS_STEPS) :]
         if len(repeated) == NO_PROGRESS_STEPS and all(

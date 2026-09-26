@@ -2534,3 +2534,74 @@ def test_second_chance_before_no_progress_blocked_comes_back_after_a_page_change
     monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e3", "CLICK")))
     result = agent.run()
     assert result.status == "blocked" and tab.await_change.call_count == 2  # по разу на страницу A и B
+
+
+def goal_run(monkeypatch, tab, plan):
+    """Режим цели; `plan` — по вызову Jev: (решение, пересоздать ли поля перед ответом). Текст — «hello»."""
+    agent = make_agent(tab, goal="Send hello")
+    helper = Mock(return_value=("hello", TextHelper(model="t", latency_ms=1)))
+    monkeypatch.setattr(loop, "field_text", helper)
+    seen = []
+
+    def choose(_clients, _state, _goal, history, **_k):
+        seen.append([(h["kind"], h.get("text")) for h in history])
+        chosen, remount = plan[len(seen) - 1]
+        if remount:
+            tab.remount()  # сайт пересоздал поле, пока Jev думал: решение — по снимку с текстом
+        return chosen
+
+    monkeypatch.setattr(loop, "choose", Mock(side_effect=choose))
+    return agent, agent.run(), helper, seen
+
+
+GOAL_TYPE = decision("e1")
+GOAL_SEND = decision("e3", "CLICK")
+
+
+def test_goal_text_that_vanished_before_send_is_typed_again_with_the_same_text(monkeypatch):
+    tab = make_tab()
+    agent, result, helper, seen = goal_run(
+        monkeypatch, tab, [(GOAL_TYPE, False), (GOAL_SEND, True), (GOAL_TYPE, False), (GOAL_SEND, False), (DONE, False)]
+    )
+    assert result.status == "done"
+    assert [(s.operation, s.text) for s in result.steps] == [
+        ("TYPE_TEXT", "hello"),
+        ("TYPE_TEXT", "hello"),
+        ("CLICK", None),
+    ]
+    assert helper.call_count == 1  # повторный ввод — тот же текст, без текстовой модели
+    assert labels(tab) == ["Search", "Search", "Go"]  # Send по снимку с пропавшим текстом не нажат
+    assert seen[2] == []  # запись ввода убрана из истории: Jev печатает снова
+    assert seen[3] == [("fill", "hello")]
+
+
+def test_goal_done_with_the_typed_text_gone_is_not_done(monkeypatch):
+    tab = make_tab()
+    agent, result, helper, seen = goal_run(
+        monkeypatch, tab, [(GOAL_TYPE, False), (DONE, True), (GOAL_TYPE, False), (GOAL_SEND, False), (DONE, False)]
+    )
+    assert result.status == "done" and [s.operation for s in result.steps] == ["TYPE_TEXT", "TYPE_TEXT", "CLICK"]
+    assert helper.call_count == 1
+
+
+def test_goal_text_that_never_stays_is_blocked_after_two_retypes(monkeypatch):
+    tab = make_tab()
+    plan = [(GOAL_TYPE, False), (DONE, True)] * 3
+    agent, result, helper, seen = goal_run(monkeypatch, tab, plan)
+    assert result.status == "blocked" and result.error == "typed text does not stay in the field 'Search'"
+    assert [s.operation for s in result.steps] == ["TYPE_TEXT"] * 3 and helper.call_count == 1
+
+
+def test_goal_text_used_by_a_click_may_leave_the_field(monkeypatch):
+    tab = make_tab()
+    agent, result, helper, seen = goal_run(monkeypatch, tab, [(GOAL_TYPE, False), (GOAL_SEND, False), (DONE, True)])
+    assert result.status == "done" and [s.operation for s in result.steps] == ["TYPE_TEXT", "CLICK"]
+
+
+def test_goal_text_missing_right_after_typing_is_noted_retyped_with_the_same_text_and_counted(monkeypatch):
+    tab = make_tab()
+    tab.act.side_effect = lambda action, _page, text=None: {"executed": action["id"]}  # поле текст не держит
+    agent, result, helper, seen = goal_run(monkeypatch, tab, [(GOAL_TYPE, False)] * 3)
+    assert result.status == "blocked" and "does not stay in the field" in result.error
+    assert [s.text for s in result.steps] == ["hello"] * 3 and helper.call_count == 1
+    assert seen[1] == [("fill", "hello")] and agent._history[0]["note"] == VANISHED  # Jev видит пометку
