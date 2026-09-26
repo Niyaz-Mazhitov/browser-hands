@@ -144,12 +144,25 @@ def pairs(*groups):
     return out
 
 
-def test_enough_data_and_current_outside_the_admissible_range_moves_to_theta_star():
+def test_enough_data_and_current_outside_the_admissible_range_moves_to_the_nearest_bound():
     data = pairs((0.62, False, 40), (0.67, True, 40), (0.95, True, 100))
     verdict = cal.decide("step_done_min_p", data, current=0.3)
     assert verdict.best == 0.65 and verdict.recommended == 0.65 and verdict.enough
     assert verdict.admissible == (0.65, 0.65)
-    assert "θ*" in verdict.reason
+    assert "ближайшая граница допустимых" in verdict.reason
+
+
+def test_enough_data_lowering_stops_at_the_admissible_bound_nearest_to_current():
+    """26.09: DONE закрывает шаг — допустимы 0,35–0,45, θ* = 0,35; с 0,5 — до 0,45, не до θ*."""
+    data = pairs((0.32, False, 30), (0.37, True, 8), (0.42, True, 8), (0.47, True, 8), (0.9, True, 50))
+    verdict = cal.decide("done_step_done_min_p", data, current=0.5)
+    assert verdict.enough and verdict.best == 0.35 and verdict.admissible == (0.35, 0.45)
+    assert verdict.recommended == 0.45
+
+
+def test_report_paths_have_no_directories_outside_the_repository(tmp_path):
+    assert cal._short(str(tmp_path / "eval-1.jsonl")) == "eval-1.jsonl"
+    assert cal._short(str(cal.ROOT / "traces" / "eval-2.jsonl")) == "traces/eval-2.jsonl"
 
 
 def test_enough_data_and_current_admissible_keeps_it():
@@ -232,7 +245,7 @@ def test_main_reads_traces_writes_markdown_and_prints_recommendations(tmp_path, 
     for name, value in asdict(Thresholds()).items():
         assert f"recommended: {name} = {value:g}" in printed
         assert f"`recommended: {name} = {value:g}`" in text  # мало данных — везде текущее
-    assert "| `" + str(traces) + "` | 3 |" in text
+    assert "| `eval-1.jsonl` | 3 |" in text  # файл вне репозитория — только имя
     assert "## §1." in text and "## §4." in text
 
 

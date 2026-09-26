@@ -41,13 +41,9 @@ from typing import Any
 from browser_hands.config import Thresholds
 
 ROOT = Path(__file__).resolve().parent.parent
-# свои трассы, трассы всех копий репозитория и их worktree (`.wt/<пакет>/traces`)
-DEFAULT_TRACES = (
-    "traces/*.jsonl",
-    "~/Personal/browser-hands*/traces/*.jsonl",
-    "~/Personal/browser-hands*/.wt/*/traces/*.jsonl",
-)
-DEFAULT_OBSERVE = ("traces/wa-observe-*.json", "~/Personal/browser-hands*/traces/wa-observe-*.json")
+# свои трассы и трассы worktree (`.wt/<пакет>/traces`); трассы других копий — `--traces`
+DEFAULT_TRACES = ("traces/*.jsonl", ".wt/*/traces/*.jsonl")
+DEFAULT_OBSERVE = ("traces/wa-observe-*.json",)
 STEP = 0.05
 GRID = tuple(round(i * STEP, 2) for i in range(int(round(1 / STEP)) + 1))
 C_FP = 1.0  # ложное закрытие шага / действие / DONE — прогон ($0,001 и ~7 с)
@@ -472,7 +468,8 @@ BREAK_EVEN = C_FP / (C_FP + C_FN)  # доля «да», выше которой 
 
 def decide(name: str, pairs: Sequence[Pair], current: float, *, automatic: bool = True) -> Verdict:
     """θ* — минимум стоимости (при равенстве — ближе к текущему, затем ниже); допустимые — стоимость меньше
-    стоимости θ* + C_FP. Данных хватает (у θ* не меньше `MIN_BIN` пар): текущий допустим — оставить, иначе θ*. Мало
+    стоимости θ* + C_FP (данные их не различают). Данных хватает (у θ* не меньше `MIN_BIN` пар): текущий допустим —
+    оставить, иначе ближайшая к текущему граница допустимых (наименьший сдвиг, который данные требуют). Мало
     данных — оставить текущий, кроме случая, когда он вне допустимых и корзины между ним и ближайшей допустимой
     границей однозначны по Wilson: при повышении порога верхняя граница доли «да» в них ниже `BREAK_EVEN`, при
     понижении нижняя — выше (тогда — эта граница). `automatic=False` — только кривые, текущий остаётся."""
@@ -494,8 +491,9 @@ def decide(name: str, pairs: Sequence[Pair], current: float, *, automatic: bool 
         if current_ok:
             reason = f"данных хватает ({near} пар у θ*), текущий допустим — оставить"
             return Verdict(name, current, current, best, admissible, near, True, reason)
-        reason = f"данных хватает ({near} пар у θ*), текущий вне допустимых — θ*"
-        return Verdict(name, current, best, best, admissible, near, True, reason)
+        bound = min(admissible, key=lambda theta: abs(theta - current))
+        reason = f"данных хватает ({near} пар у θ*), текущий вне допустимых — ближайшая граница допустимых"
+        return Verdict(name, current, bound, best, admissible, near, True, reason)
     total = needed(sum(p.truth for p in near_pairs), near)
     runs = {p.run for p in near_pairs}
     need_runs = math.ceil((total - near) / (near / len(runs))) if runs else None
@@ -734,8 +732,11 @@ def calibrate(
 
 
 def _short(path: str) -> str:
-    home = str(Path.home())
-    return "~" + path[len(home) :] if path.startswith(home) else path
+    """Путь в отчёте: внутри репозитория — относительный, снаружи — только имя файла (без личных каталогов)."""
+    try:
+        return str(Path(path).resolve().relative_to(ROOT))
+    except ValueError:
+        return Path(path).name
 
 
 def main(argv: Sequence[str] | None = None) -> int:

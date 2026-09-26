@@ -271,7 +271,7 @@ FIELD_VALUES = (
   let fields=null;
   const labelled=label=>(fields??=[...document.querySelectorAll(selector)].filter(e=>safe(e) && visible(e) &&
     !e.matches(':disabled') && !e.closest('[aria-disabled="true"]') && editable(e)))
-    .find(e=>(name(e)||role(e))===label);
+    .find(e=>label==='' ? !name(e) : (name(e)||role(e))===label);
   return specs.map(({node,label})=>{
     const e=node==null ? null : nodes?.get(node);
     if (e?.isConnected && safe(e)) return value(e);
@@ -785,7 +785,8 @@ class Tab:
     def field_values(self, specs: list[dict[str, Any]]) -> list[str | None]:
         """Что сейчас в полях, куда печатали (`[{node, label}]` из снимка): один `Runtime.evaluate` (`FIELD_VALUES`),
         только чтение, время — `browser_ms`. На каждое — значение поля по узлу из кэша снимка, если узел ещё в
-        документе; иначе первого видимого редактируемого поля с той же подписью; иначе None. Значение — как `value` в
+        документе; иначе первого видимого редактируемого поля с той же подписью (`label` "" — поле без имени любой
+        роли: сайт мог пересоздать его с другой ролью); иначе None. Значение — как `value` в
         снимке; password/file/hidden не читаются, напечатанный текст в страницу не уходит (сравнивает вызывающий).
         Документ сменяется — StalePage."""
         if not specs:

@@ -868,12 +868,14 @@ const hiddenMessage = editor('Type a message', 'чужое', {hiddenForTest: tru
 const newMessage = editor('Type a message', '  привет 👋 ');
 const password = input('Password', 'secret', {type: 'password'});
 const readonly = input('Code', '1234', {readOnly: true});
-const elements = [search, hiddenMessage, newMessage, password, readonly];
+const nameless = new El('INPUT', {role: 'combobox'}, {type: 'text', value: 'Gödel'});  // пересоздан с другой ролью
+const elements = [search, hiddenMessage, newMessage, password, readonly, nameless];
 globalThis.document = {querySelectorAll: () => elements, getElementById: () => null};
 const specs = [
   {node: 1, label: 'Search'}, {node: 2, label: 'Type a message'}, {node: 3, label: 'Password'},
   {node: null, label: 'Code'}, {node: 99, label: 'Nothing'}, {node: null, label: null},
   {node: 1, label: 'Renamed'},  // подпись сменилась, узел тот же
+  {node: 98, label: ''},  // поле без имени: любое видимое поле без имени, роль не сравнивается
 ];
 globalThis.window = {__jevFast: {nodes: new Map([[1, search], [2, oldMessage], [3, password]])}};
 const withCache = eval(EXPRESSION);
@@ -892,8 +894,8 @@ def test_field_values_expression_in_node_by_node_then_by_label():
     out = json.loads(done.stdout)
     # узел в документе — его значение; узел пересоздан — первое видимое редактируемое поле с той же подписью;
     # password не читается ни по узлу, ни по подписи; readonly — не поле ввода; нет ни узла, ни подписи — null
-    assert out["withCache"] == ["book", "привет 👋", None, None, None, None, "book"]
-    assert out["withoutCache"] == ["book", "привет 👋", None, None, None, None, None]  # узел не найти — только подпись
+    assert out["withCache"] == ["book", "привет 👋", None, None, None, None, "book", "Gödel"]
+    assert out["withoutCache"] == ["book", "привет 👋", None, None, None, None, None, "Gödel"]  # только подпись
 
 
 # --- ожидания на FakeCDPServer с событиями Network (docs/plan-waits.md §5.2–5.4) ----------------------------------

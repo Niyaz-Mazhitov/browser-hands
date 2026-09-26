@@ -1272,8 +1272,8 @@ def test_text_model_is_retried_over_real_http_and_both_calls_are_counted(monkeyp
 TWO = [ScenarioStep("Open the search"), ScenarioStep("Open the result")]
 CHAT = "Рабочий"
 MESSAGE = "это я через агента, проверка 👋"
-# DONE в режиме шага закрывает шаг только с подтверждением step_done ≥ 0.5 в том же ответе; 0.6 < 0.7 — закрывает
-# именно DONE, а не порог step_done.
+# DONE в режиме шага закрывает шаг только с подтверждением step_done ≥ DONE_STEP_DONE_MIN_P в том же ответе;
+# 0.6 < STEP_DONE_MIN_P — закрывает именно DONE, а не порог step_done.
 DONE_STEP = decision("DONE", "DONE", step_done=0.6)
 
 
@@ -1300,7 +1300,7 @@ def test_scenario_steps_close_on_step_done_without_acting_and_on_done(monkeypatc
         decision("e3", "CLICK", step_done=0.2),  # шаг 1 не выполнен — действие
         decision("e3", "CLICK", step_done=0.9),  # шаг 1 выполнен — CLICK не исполняется
         decision("e3", "CLICK", step_done=0.1),
-        DONE_STEP,  # DONE в режиме шага, step_done ≥ 0.5 — шаг 2 выполнен
+        DONE_STEP,  # DONE в режиме шага, step_done ≥ DONE_STEP_DONE_MIN_P — шаг 2 выполнен
     )
     monkeypatch.setattr(loop, "choose", choose)
     result = agent.run()
@@ -1380,9 +1380,10 @@ def test_scenario_step_without_text_asks_the_text_model_with_the_current_step(mo
     assert result.model_calls == result.jev_calls + 1 == 4  # текст шага без `text` — от текстовой модели
 
 
-@pytest.mark.parametrize(("p", "closed"), [(0.69, False), (0.7, True)])
+@pytest.mark.parametrize(
+    ("p", "closed"), [(round(loop.STEP_DONE_MIN_P - 0.01, 2), False), (loop.STEP_DONE_MIN_P, True)]
+)
 def test_scenario_step_done_threshold(monkeypatch, p, closed):
-    assert loop.STEP_DONE_MIN_P == 0.7
     tab = make_tab()
     agent = make_agent(tab, steps=TWO, goal="")
     choose = scripted(decision("e3", "CLICK", step_done=p), DONE_STEP, DONE_STEP)
@@ -1655,7 +1656,10 @@ def test_scenario_text_end_to_end_reaches_the_page_only_through_insert_text_afte
 # --- сценарий после ревью (docs/core-notes.md, «Сценарии» → «После ревью») ------------------------------------------
 
 
-@pytest.mark.parametrize(("p", "closed"), [(0.0, False), (0.49, False), (0.5, True)])
+@pytest.mark.parametrize(
+    ("p", "closed"),
+    [(0.0, False), (round(loop.DONE_STEP_DONE_MIN_P - 0.01, 2), False), (loop.DONE_STEP_DONE_MIN_P, True)],
+)
 def test_scenario_done_closes_the_step_only_when_step_done_confirms_it(monkeypatch, p, closed):
     tab = make_tab()
     agent = make_agent(tab, steps=TWO, goal="")
@@ -1667,7 +1671,6 @@ def test_scenario_done_closes_the_step_only_when_step_done_confirms_it(monkeypat
     tab.act.assert_not_called()
     assert result.steps == []  # отклонённый DONE — не действие; дальше — проверка: только запись ожидания
     assert [h["kind"] for h in agent._history] == ([] if closed else ["wait"])
-    assert loop.DONE_STEP_DONE_MIN_P == 0.5
 
 
 def test_scenario_repeated_unconfirmed_done_is_unconfirmed_after_one_check(monkeypatch, caplog):
@@ -1989,15 +1992,34 @@ def verifies(choose):
     return [c.kwargs.get("verify", False) for c in choose.call_args_list]
 
 
-def test_whatsapp_send_step_ends_unconfirmed_without_an_extra_click(monkeypatch):
-    """26.09: CLICK Send → DONE p=0.36 → DONE p=0.47 → раньше CLICK «00:31 Sent» (conf 0.25) и step_limit."""
+def test_whatsapp_send_step_closes_on_the_second_done_without_an_extra_click(monkeypatch):
+    """26.09: CLICK Send → DONE p=0.36 → DONE p=0.47 → раньше CLICK «00:31 Sent» (conf 0.25) и step_limit. С порогом
+    DONE по калибровке (0,45, docs/calibration.md §1) второй DONE на свежей странице закрывает шаг."""
+    assert 0.36 < loop.DONE_STEP_DONE_MIN_P <= 0.47
+    tab = make_tab()
+    agent = make_agent(tab, steps=[ScenarioStep("Send the message")], goal="")
+    choose = scripted(
+        decision("e3", "CLICK", step_done=0.1, confidence=0.99),
+        decision("DONE", "DONE", step_done=0.36),
+        decision("DONE", "DONE", step_done=0.47),
+        decision("e3", "CLICK", step_done=0.2, confidence=0.25),  # лишний клик в чужом месте
+    )
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "done" and result.error is None and result.scenario_done == 1
+    assert tab.act.call_count == 1 and [s.operation for s in result.steps] == ["CLICK"]
+    assert choose.call_count == 3 and verifies(choose) == [False, False, True]
+
+
+def test_send_step_ends_unconfirmed_without_an_extra_click(monkeypatch):
+    """Как выше, но второй DONE ниже порога: `unconfirmed`, лишнего клика нет."""
     tab = make_tab()
     tab.observe.side_effect = numbered_pages()
     agent = make_agent(tab, steps=[ScenarioStep("Send the message")], goal="")
     choose = scripted(
         decision("e3", "CLICK", step_done=0.1, confidence=0.99),
         decision("DONE", "DONE", step_done=0.36),
-        decision("DONE", "DONE", step_done=0.47),
+        decision("DONE", "DONE", step_done=round(loop.DONE_STEP_DONE_MIN_P - 0.01, 2)),
         decision("e3", "CLICK", step_done=0.2, confidence=0.25),  # лишний клик в чужом месте
     )
     monkeypatch.setattr(loop, "choose", choose)
@@ -2021,7 +2043,7 @@ WAIT_CHECK = decision("wait", "WAIT", step_done=0.1)
     [
         ([decision("DONE", "DONE", step_done=0.5)], "done", 1),
         ([WAIT_CHECK, decision("DONE", "DONE", step_done=0.6)], "done", 2),
-        ([decision("wait", "WAIT", step_done=0.8)], "done", 1),  # P(yes) ≥ 0.7 закрывает шаг и в проверке
+        ([decision("wait", "WAIT", step_done=0.8)], "done", 1),  # P(yes) ≥ STEP_DONE_MIN_P закрывает шаг и в проверке
         ([decision("DONE", "DONE", step_done=0.2)], "unconfirmed", 1),
         ([WAIT_CHECK, WAIT_CHECK], "unconfirmed", 2),
         ([WAIT_CHECK, decision("DONE", "DONE", step_done=0.1)], "unconfirmed", 2),
@@ -2046,7 +2068,7 @@ def test_done_on_a_text_step_before_typing_is_ignored_not_checked(monkeypatch):
     agent = make_agent(tab, steps=[ScenarioStep("Type the query into the search box", text="Gödel")], goal="")
     choose = scripted(
         decision("DONE", "DONE", step_done=0.36),  # Википедия 26.09: DONE до ввода текста шага
-        decision("DONE", "DONE", step_done=0.6),  # и даже с p ≥ 0.5 DONE не закрывает шаг с текстом
+        decision("DONE", "DONE", step_done=0.6),  # и даже с p ≥ DONE_STEP_DONE_MIN_P DONE не закрывает шаг с текстом
         decision("e1", "TYPE_TEXT", step_done=0.1),
     )
     monkeypatch.setattr(loop, "choose", choose)

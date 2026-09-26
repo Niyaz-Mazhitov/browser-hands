@@ -72,8 +72,8 @@ class Thresholds:
     """Пороги модели и предохранитель одного ожидания (docs/plan-waits.md §4.1). Меняет их расчёт
     (`scripts/calibrate.py` → docs/calibration.md), не оператор: env `BROWSER_HANDS_*` для них нет (§12)."""
 
-    step_done_min_p: float = 0.7  # значение — docs/calibration.md §1; P(yes) `step_done`, с которой шаг выполнен
-    done_step_done_min_p: float = 0.5  # значение — docs/calibration.md §1; DONE закрывает шаг при P(yes) не ниже
+    step_done_min_p: float = 0.75  # значение — docs/calibration.md §1; P(yes) `step_done`, с которой шаг выполнен
+    done_step_done_min_p: float = 0.45  # значение — docs/calibration.md §1; DONE закрывает шаг при P(yes) не ниже
     min_action_confidence: float = 0.3  # значение — docs/calibration.md §2; CLICK/TYPE_TEXT/SELECT ниже — не исполнять
     done_min_confidence: float = 0.5  # значение — docs/calibration.md §3; DONE цели ниже — второй взгляд (заглушка)
     wait_fuse_s: float = 1.5  # значение — docs/calibration.md §4; потолок одного ожидания (пока = потолок успокоения)

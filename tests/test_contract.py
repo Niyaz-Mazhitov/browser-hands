@@ -161,8 +161,8 @@ def test_unconfirmed_is_a_status_and_the_fake_carries_it():
 def test_thresholds_are_settings_without_env():
     t = Settings().thresholds
     assert t == Thresholds(
-        step_done_min_p=0.7,
-        done_step_done_min_p=0.5,
+        step_done_min_p=0.75,
+        done_step_done_min_p=0.45,
         min_action_confidence=0.3,
         done_min_confidence=0.5,
         wait_fuse_s=1.5,

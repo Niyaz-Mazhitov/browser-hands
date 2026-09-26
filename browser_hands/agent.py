@@ -168,7 +168,7 @@ def wait_fields(result: Any) -> tuple[str | None, int]:
 @dataclass(frozen=True, slots=True)
 class Invariant:
     """Текст шага сценария, закрытого кодом, должен оставаться в поле, пока его не использовали (docs/plan-waits.md
-    §6.1): узел и подпись поля — для `Tab.field_values`, текст — для `matches`."""
+    §6.1): узел и ключ поля (`_field_key`, "" — поле без имени) — для `Tab.field_values`, текст — для `matches`."""
 
     step: int
     node: Any
@@ -381,7 +381,7 @@ class Agent(AgentLike):
             tab.deadline, tab.cancel = self._deadline, self.cancel  # и для ожиданий после действий
             # Предохранитель одного ожидания — из порогов этого прогона. `Tab.fuse_s` вводит пакет «события»
             # (feat/waits-events); до слияния в контракте его нет — отсюда ignore.
-            tab.fuse_s = self.thresholds.wait_fuse_s  # pyright: ignore[reportAttributeAccessIssue]
+            tab.fuse_s = self.thresholds.wait_fuse_s
             self._check_cancel()
             if tab.owned:  # во вкладке пользователя — с того, что открыто: не переходим и не перезагружаем
                 tab.navigate(self.url, timeout=min(NAVIGATE_TIMEOUT_S, max(0.0, self._deadline - time.monotonic())))
@@ -631,7 +631,8 @@ class Agent(AgentLike):
     def _close_typed(self, field: dict[str, Any], action: dict[str, Any], text: str) -> None:
         """Шаг закрыт кодом: его текст — инвариант. Последний шаг — перед `done` дождаться готовности страницы (сеть
         после ввода: подсказки, автосохранение) и проверить все живые инварианты вместе с этим; пропал — откат."""
-        invariant = Invariant(self._scenario_no, field.get("node"), str(field.get("label") or action["label"]), text)
+        key = _field_key(field if field.get("label") else action)  # без имени — "": найдётся при любой роли
+        invariant = Invariant(self._scenario_no, field.get("node"), key, text)
         if self._scenario_no == len(self.scenario or ()):
             self._require_tab().await_ready()
             if not self._invariants_hold([*self._invariants, invariant]):
