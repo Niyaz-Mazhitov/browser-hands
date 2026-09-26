@@ -2411,8 +2411,24 @@ def test_text_seen_only_after_the_next_page_change_closes_the_step(monkeypatch, 
         ("+7 (777) 123-45-67 доб. 9", "77771234567", False),  # запасное — равенство, не префикс
         ("", CHAT, False),
         (None, CHAT, False),
+        ("ABC", "abc", True),  # регистр — не содержимое
+        ("John Smith", "john", True),
     ],
-    ids=["phone", "card", "date", "emoji-img", "spaces", "tail", "middle", "part", "mask-extra", "empty", "none"],
+    ids=[
+        "phone",
+        "card",
+        "date",
+        "emoji-img",
+        "spaces",
+        "tail",
+        "middle",
+        "part",
+        "mask-extra",
+        "empty",
+        "none",
+        "upper",
+        "capital",
+    ],
 )
 def test_field_value_matches_typed_text_by_prefix_or_by_letters_and_digits(value, text, shown):
     assert loop.matches(value, text) is shown
@@ -2677,3 +2693,136 @@ def test_goal_text_missing_right_after_typing_is_noted_retyped_with_the_same_tex
     assert result.status == "blocked" and "does not stay in the field" in result.error
     assert [s.text for s in result.steps] == ["hello"] * 3 and helper.call_count == 1
     assert seen[1] == [("fill", "hello")] and agent._history[0]["note"] == VANISHED  # Jev видит пометку
+
+
+# --- поле, которое форматирует значение (docs/core-notes.md, «После ревью ожиданий») ---------------------------------
+
+FORMATTED = [
+    ("1000", "1,000.00"),  # сумма при потере фокуса
+    ("abc", "ABC"),  # верхний регистр
+    ("2.1.2024", "02.01.2024"),  # дата
+    ("john", "John"),  # заглавная буква
+    ("87771234567", "+7 (777) 123-45-67"),  # маска телефона
+]
+FORMATTED_IDS = ["amount", "upper", "date", "capital", "phone"]
+
+
+def form_tab(typed_value, formatted, *, when="blur"):
+    """Форма: поле суммы (узел 10), примечание (30), Submit (40). Сайт переписывает значение суммы по-своему: `blur` —
+    при следующем действии не в это поле, `typing` — сразу при вводе."""
+    tab = make_tab()
+    typed = tab.typed
+    count = iter(range(1, 1000))
+
+    def form(*_a, **_k):
+        amount, note = typed.get(10, ""), typed.get(30, "")
+        state = {
+            "url": "https://shop.test/",
+            "title": "Pay",
+            "text": f"Pay {next(count)}",
+            "scroll": {"y": 0},
+            "actions": [
+                {"id": "e1", "kind": "fill", "label": "Amount", "role": "textbox", "value": amount, "node": 10},
+                {"id": "e4", "kind": "fill", "label": "Note", "role": "textbox", "value": note, "node": 30},
+                {"id": "e5", "kind": "click", "label": "Submit", "role": "button", "node": 40},
+            ],
+        }
+        state["fingerprint"] = fingerprint(state)
+        return state
+
+    act = tab.act.side_effect
+
+    def act_and_format(action, page_, text=None):
+        if when == "blur" and action["node"] != 10 and typed.get(10) == typed_value:
+            typed[10] = formatted  # поле суммы потеряло фокус
+        done = act(action, page_, text=text)
+        if when == "typing" and action["node"] == 10:
+            typed[10] = formatted
+        return done
+
+    tab.act.side_effect = act_and_format
+    tab.observe.side_effect = form
+    return tab
+
+
+FORM_PLAN = {1: decision("e1", "TYPE_TEXT", step_done=0.0), 2: decision("e4", "TYPE_TEXT", step_done=0.0)}
+
+
+def by_step(plan, last):
+    """choose: решение по номеру текущего шага; на последнем — по очереди из `last`."""
+    queue = list(last)
+    return Mock(side_effect=lambda *_a, **k: plan[k["step"].number] if k["step"].number in plan else queue.pop(0))
+
+
+@pytest.mark.parametrize(("typed_value", "formatted"), FORMATTED, ids=FORMATTED_IDS)
+def test_field_that_formats_its_value_keeps_the_scenario_going(monkeypatch, typed_value, formatted):
+    """Ревью: 1000 → 1,000.00 при потере фокуса давало «текст шага 1 пропал» → откат → повторный ввод по кругу →
+    blocked. Непустое изменённое значение — нормализация сайтом; пропал — только пустое поле или поля нет."""
+    tab = form_tab(typed_value, formatted)
+    steps = [ScenarioStep("Type the amount", typed_value), ScenarioStep("Type the note", "hi"), ScenarioStep("Pay")]
+    agent = make_agent(tab, steps=steps, goal="")
+    choose = by_step(FORM_PLAN, [decision("e5", "CLICK", step_done=0.0), CONFIRM])
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "done" and result.scenario_done == 3, result.error
+    assert labels(tab) == ["Amount", "Note", "Submit"]  # без повторного ввода, Submit — раз
+    assert not any("note" in h for h in agent._history)
+
+
+@pytest.mark.parametrize(("typed_value", "formatted"), FORMATTED, ids=FORMATTED_IDS)
+def test_goal_mode_field_that_formats_its_value_is_not_typed_again(monkeypatch, typed_value, formatted):
+    tab = form_tab(typed_value, formatted)
+    agent = make_agent(tab, goal="Pay")
+    texts = iter([typed_value, "hi"])
+    monkeypatch.setattr(loop, "field_text", Mock(side_effect=lambda *a, **k: (next(texts), TextHelper("t", 1))))
+    choose = scripted(decision("e1"), decision("e4"), decision("e5", "CLICK"), DONE)
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "done", result.error
+    assert labels(tab) == ["Amount", "Note", "Submit"]
+
+
+@pytest.mark.parametrize(("typed_value", "formatted"), FORMATTED[1:4:2], ids=["upper", "capital"])
+def test_case_changed_while_typing_still_closes_the_text_step_by_code(monkeypatch, typed_value, formatted):
+    """abc → ABC, john → John сразу при вводе: шаг закрывает код (регистр — не содержимое), без вопроса Jev."""
+    tab = form_tab(typed_value, formatted, when="typing")
+    steps = [ScenarioStep("Type the amount", typed_value), ScenarioStep("Pay")]
+    agent = make_agent(tab, steps=steps, goal="")
+    choose = by_step({1: FORM_PLAN[1]}, [decision("e5", "CLICK", step_done=0.0), CONFIRM])
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "done" and numbers(choose) == [1, 2, 2] and "note" not in agent._history[0]
+
+
+def test_mask_that_changes_digits_while_typing_is_left_to_jev_and_does_not_loop(monkeypatch):
+    """87771234567 → +7 (777) 123-45-67 сразу при вводе: по буквам и цифрам не совпадает — код шаг не закрывает
+    (строго: ложное закрытие пропустило бы шаг), пометка для Jev, а его «шаг выполнен» закрывает шаг без повтора."""
+    tab = form_tab("87771234567", "+7 (777) 123-45-67", when="typing")
+    steps = [ScenarioStep("Type the phone", "87771234567"), ScenarioStep("Pay")]
+    agent = make_agent(tab, steps=steps, goal="")
+    answers = [FORM_PLAN[1], decision("e5", "CLICK", step_done=0.9), decision("e5", "CLICK", step_done=0.0), CONFIRM]
+    choose = scripted(*answers)
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "done" and labels(tab) == ["Amount", "Submit"]
+    assert agent._history[0]["note"] == VANISHED  # Jev видит, что код текста не узнал
+
+
+@pytest.mark.parametrize("left", ["", "\n", " ​ "], ids=["empty", "newline", "zero-width"])
+def test_field_left_blank_by_a_re_render_still_rolls_back(monkeypatch, left):
+    """WhatsApp (стенд search-remount): поле пересоздано пустым — откат к шагу и повторный ввод, как раньше."""
+    tab = chat_tab()
+    remount = tab.remount
+
+    def blank():
+        remount()
+        tab.typed[30] = left
+
+    tab.remount = blank
+    agent = make_agent(tab, steps=CHAT_STEPS, goal="")
+    answers = [TYPE_CHAT, OPEN_CHAT, CONFIRM, TYPE_MSG, SEND, TYPE_MSG, SEND, CONFIRM]
+    choose = remounting(tab, answers, before={5})
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "done" and numbers(choose) == [1, 2, 2, 3, 4, 3, 4, 4]
+    assert labels(tab).count("Send") == 1 and labels(tab).count("Type a message") == 2
