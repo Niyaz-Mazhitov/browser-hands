@@ -3,14 +3,25 @@
     uv run --env-file .env python scripts/eval.py --runs 10 --label before
     uv run --env-file .env python scripts/eval.py --mode scenario --tasks all --runs 10 --label scenario
     uv run --frozen python scripts/eval.py --fixtures-only        # бесплатно: настоящий Chrome, без моделей
+    uv run --env-file .env python scripts/eval.py --sweep axes --runs 5 --mode goal,scenario --max-cost 0.25
+    uv run --frozen python scripts/eval.py --fixtures-only --sweep axes   # бесплатно: каждая ячейка скриптом
 
 `--mode goal` (по умолчанию) — агент получает цель задачи, `--mode scenario` — её сценарий `{do, text?}` без цели
-(docs/plan-scenarios.md §5.3). Страница сама отчитывается стенду (`POST /report`, только то, что видно в DOM), поэтому
-`verified` не зависит от статуса агента. Исключение — `wiki` (внешняя сеть, только в `--tasks all` или по имени):
-проверка по итоговому `url`. Chrome всегда свой: launch + headless + временный профиль (выбора браузера нет; `--mode`
-— режим прогона). Итог — строка на прогон, сводка по задаче (verified/done k/N, медиана и p95 elapsed/wait, вызовы Jev
-и текстовой модели, стоимость, причины неудач) и JSONL в `traces/eval-<ts>.jsonl` (строки прогонов + `summary`).
-Выход 0, только если все прогоны verified. Платно, кроме `--fixtures-only`; в pytest не запускается (там — `FakeCore`).
+(docs/plan-scenarios.md §5.3). Страница сама отчитывается стенду (`POST /report`, только то, что видно в DOM, и
+разобранные параметры), поэтому `verified` не зависит от статуса агента. Исключение — `wiki` (внешняя сеть, только в
+`--tasks all` или по имени): проверка по итоговому `url`. Chrome всегда свой: launch + headless + временный профиль
+(выбора браузера нет; `--mode` — режим прогона). Итог — строка на прогон, сводка по задаче (verified/done k/N, медиана
+и p95 elapsed/wait, вызовы Jev и текстовой модели, стоимость, причины неудач) и JSONL в `traces/eval-<ts>.jsonl`
+(строки прогонов + `summary`). В строке — история отчётов страницы и запросов к `/api/*` с `t_ms` от того же старта,
+что `t_ms` решений Jev. Выход 0, только если все прогоны verified. Платно, кроме `--fixtures-only`; в pytest не
+запускается (там — `FakeCore`).
+
+Задержки страниц (docs/plan-waits.md §0.6): `net=1` (по умолчанию) — поиск и подтверждение Send — настоящие запросы к
+этому серверу (`/api/search`, `/api/send`, пауза на сервере), `net=0` — таймеры; пересоздание поля (`remount`, список)
+— всегда таймер. `--sweep axes|grid` (§0.7, §7.3) — развёртка параметров app.html: ячейка = параметры в `start_url` и в
+строке (`cell`, `params`, `axes`), прогоны по кругу (круг — все ячейки × режимы), `--mode goal,scenario` — оба режима
+вперемешку под одним `--max-cost`. Отчёт по осям — `scripts/sweep_report.py`; выход развёртки 0, если сделаны все
+прогоны (успехи — данные, не ошибка).
 """
 
 from __future__ import annotations
@@ -18,6 +29,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import functools
+import itertools
 import json
 import os
 import re
@@ -66,6 +78,8 @@ FORM_EXPECTED: dict[str, Any] = {
     "agree": True,
 }
 SEARCH_LABEL = "Search or start a new chat"
+SEARCH_DELAY_MS = 700  # задержка результатов поиска в задачах (в app.html по умолчанию — столько же)
+SEND_DELAY_MS = 300  # app.html без sendstatus: подтверждение Send (`senddelay`)
 SEARCH_QUERY = "Раб"  # --fixtures-only: совпадает с «Рабочий» и отвлекающим «Работа»
 # search-remount: поле сообщения пересоздаётся через REMOUNT_MS после открытия чата (текст пропадает, как в WhatsApp
 # 26.09), после Send — «Sending…» ещё SEND_STATUS_MS, у исходящих кнопки «HH:MM Sent» — есть куда кликнуть лишний раз
@@ -74,6 +88,7 @@ SEND_STATUS_MS = 1500
 COMPOSER_TO = f"Type a message to {CHAT}"  # подпись поля при remount, как в WhatsApp
 STATUS_SENT = re.compile(r"\d\d:\d\d Sent")
 STATUS_SENDING = re.compile(r"\d\d:\d\d Sending…")
+API_MAX_DELAY_MS = 30_000  # пауза `/api/*` не дольше: опечатка в параметре не вешает поток сервера
 WIKI_URL = "https://en.wikipedia.org/wiki/Main_Page"
 WIKI_GOAL = "Find and open the Wikipedia article about Gödel's incompleteness theorems."  # как bench/live_wikipedia
 WIKI_QUERY = "Gödel's incompleteness theorems"
@@ -179,12 +194,18 @@ class Task:
 TASKS: dict[str, Task] = {
     task.name: task
     for task in (
-        Task("search", "app.html?delay=700", CHAT_GOAL, chat_problem, CHAT_SCENARIO),
-        Task("search-spinner", "app.html?delay=700&spinner=1", CHAT_GOAL, chat_problem, CHAT_SCENARIO),
-        Task("boot", "app.html?boot=4000&delay=700", CHAT_GOAL, chat_problem, CHAT_SCENARIO),
+        Task("search", f"app.html?delay={SEARCH_DELAY_MS}&net=1", CHAT_GOAL, chat_problem, CHAT_SCENARIO),
+        Task(
+            "search-spinner",
+            f"app.html?delay={SEARCH_DELAY_MS}&spinner=1&net=1",
+            CHAT_GOAL,
+            chat_problem,
+            CHAT_SCENARIO,
+        ),
+        Task("boot", f"app.html?boot=4000&delay={SEARCH_DELAY_MS}&net=1", CHAT_GOAL, chat_problem, CHAT_SCENARIO),
         Task(
             "search-remount",
-            f"app.html?delay=700&remount={REMOUNT_MS}&sendstatus={SEND_STATUS_MS}",
+            f"app.html?delay={SEARCH_DELAY_MS}&remount={REMOUNT_MS}&sendstatus={SEND_STATUS_MS}&net=1",
             CHAT_GOAL,
             chat_problem,
             CHAT_SCENARIO,
@@ -197,31 +218,234 @@ DEFAULT_TASKS = [name for name, task in TASKS.items() if not task.network]  # б
 
 
 def with_params(page: str, **params: str) -> str:
-    """`page` с добавленными/заменёнными параметрами query (порядок прежних сохраняется)."""
+    """`page` с добавленными/заменёнными параметрами query (порядок прежних сохраняется; запятая списка — как есть)."""
     parts = urlsplit(page)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     query.update(params)
-    return urlunsplit(parts._replace(query=urlencode(query)))
+    return urlunsplit(parts._replace(query=urlencode(query, safe=",")))
 
 
-def page_for(task: Task, *, delay: int | None, remount: int | None = None) -> str:
-    """Страница задачи; `--delay` / `--remount` меняют задержку поиска / пересоздание поля только там, где заданы."""
+def page_for(
+    task: Task,
+    *,
+    delay: int | None,
+    remount: int | str | None = None,
+    sendstatus: int | None = None,
+    net: int | None = None,
+) -> str:
+    """Страница задачи; `--delay` / `--remount` / `--sendstatus` / `--net` меняют параметр только там, где он задан
+    (`remount` — мс или список «800,1600»)."""
     query = dict(parse_qsl(urlsplit(task.page).query))
-    changes = {key: str(value) for key, value in (("delay", delay), ("remount", remount)) if value is not None}
-    changes = {key: value for key, value in changes.items() if key in query}
+    values = {"delay": delay, "remount": remount, "sendstatus": sendstatus, "net": net}
+    changes = {key: str(value) for key, value in values.items() if value is not None and key in query}
     return with_params(task.page, **changes) if changes else task.page
+
+
+@dataclass(frozen=True)
+class PageParams:
+    """Параметры app.html из адреса страницы — с теми же значениями по умолчанию и разбором, что в самой странице:
+    тайминги скриптовых проверок и сверка с `params` из её отчёта."""
+
+    delay: int = SEARCH_DELAY_MS
+    remount: tuple[int, ...] = ()
+    sendstatus: int = 0
+    senddelay: int = SEND_DELAY_MS
+    net: bool = True
+    spinner: bool = False
+    boot: int = 0
+
+    @classmethod
+    def of(cls, page: str) -> PageParams:
+        query = dict(parse_qsl(urlsplit(page).query, keep_blank_values=True))
+
+        def num(key: str, fallback: int) -> int:
+            try:
+                value = float(query[key])
+            except (KeyError, ValueError):
+                return fallback
+            return int(value) if value >= 0 and value != float("inf") else fallback
+
+        remount = []
+        for part in query.get("remount", "").split(","):
+            with contextlib.suppress(ValueError):
+                if float(part or 0) > 0 and float(part) != float("inf"):
+                    remount.append(int(float(part)))
+        return cls(
+            delay=num("delay", SEARCH_DELAY_MS),
+            remount=tuple(sorted(remount)),
+            sendstatus=num("sendstatus", 0),
+            senddelay=num("senddelay", SEND_DELAY_MS),
+            net=num("net", 1) > 0,
+            spinner=query.get("spinner") == "1",
+            boot=num("boot", 0),
+        )
+
+    def as_report(self) -> dict[str, Any]:
+        """Как `params` в отчёте app.html (`PARAMS` в странице)."""
+        return {
+            "delay": self.delay,
+            "remount": list(self.remount),
+            "sendstatus": self.sendstatus,
+            "senddelay": self.senddelay,
+            "net": int(self.net),
+            "spinner": int(self.spinner),
+            "boot": self.boot,
+        }
+
+
+def params_problem(page: str, report: Mapping[str, Any] | None) -> str | None:
+    """None — страница поняла параметры так же, как стенд (или отчёта с `params` нет: не app.html / не открылась);
+    иначе — чем расходятся (ячейка развёртки была бы не той, что в строке)."""
+    got = report.get("params") if report else None
+    if not isinstance(got, Mapping):
+        return None
+    wrong = [
+        f"{key}={got.get(key)!r}, ждали {value!r}"
+        for key, value in PageParams.of(page).as_report().items()
+        if got.get(key) != value
+    ]
+    return f"стенд: страница поняла параметры иначе ({'; '.join(wrong)})" if wrong else None
+
+
+# --- развёртка (§7.3) ----------------------------------------------------------------------------------------------
+
+SWEEP_KINDS = ("axes", "grid")
+SWEEP_TASKS = ["search-remount"]  # развёртка по умолчанию — чат, похожий на WhatsApp
+SWEEP_DELAYS = "0,500,1500,3000"  # × net 0,1 — 8 ячеек; вместе с осями remount и sendstatus — 18
+SWEEP_REMOUNTS = "0:3000:500"
+SWEEP_SENDSTATUS = "0,1500"
+SWEEP_NETS = "0,1"
+SWEEP_BASE: dict[str, int] = {"delay": SEARCH_DELAY_MS, "remount": 0, "sendstatus": 0, "net": 1}
+
+
+def parse_values(text: str, *, name: str = "значения") -> list[int]:
+    """«a:b:step» — от a до b включительно с шагом step; «v1,v2,…» — список. Целые ≥ 0, по возрастанию, без повторов.
+    ValueError — с причиной по-русски."""
+    text = text.strip()
+    try:
+        if ":" in text:
+            start, stop, step = (int(part) for part in text.split(":"))
+            if step <= 0 or stop < start:
+                raise ValueError
+            values = list(range(start, stop + 1, step))
+        else:
+            values = [int(part) for part in text.split(",") if part.strip()]
+    except ValueError:
+        raise ValueError(f"{name}: «{text}» — ожидается a:b:step (a ≤ b, step > 0) или список через запятую") from None
+    if not values or min(values) < 0:
+        raise ValueError(f"{name}: «{text}» — нужны целые ≥ 0")
+    return sorted(set(values))
+
+
+@dataclass(frozen=True)
+class Cell:
+    """Ячейка развёртки: параметры app.html и оси, на которых она лежит (`(ось, значение)`; одна ячейка может быть
+    на двух осях — тогда её прогоны считаются в обеих)."""
+
+    params: Mapping[str, int]
+    axes: tuple[tuple[str, int], ...]
+
+    @property
+    def id(self) -> str:
+        p = self.params
+        return f"d{p['delay']}-r{p['remount']}-s{p['sendstatus']}-n{p['net']}"
+
+    def query(self) -> dict[str, str]:
+        return {key: str(value) for key, value in self.params.items()}
+
+
+def sweep_cells(
+    kind: str,
+    *,
+    delays: Sequence[int],
+    remounts: Sequence[int],
+    sendstatuses: Sequence[int],
+    nets: Sequence[int],
+) -> list[Cell]:
+    """Ячейки развёртки (docs/plan-waits.md §0.7, §7.3).
+
+    `axes`: delay-ось при remount 0, sendstatus 0 — отдельно для каждого `net` («delay net=1», «delay net=0»);
+    remount-ось при delay 700, sendstatus SEND_STATUS_MS, net 1 (как `search-remount`); sendstatus × remount {0,
+    REMOUNT_MS} при delay 700, net 1. Совпавшие ячейки объединяются (оси — обе). `grid` — полное произведение,
+    ось ячейки — каждый её параметр.
+    """
+    found: dict[str, tuple[dict[str, int], list[tuple[str, int]]]] = {}
+
+    def add(axis: str, value: int, **params: int) -> None:
+        full = {**SWEEP_BASE, **params}
+        cell = Cell(full, ())
+        found.setdefault(cell.id, (full, []))[1].append((axis, value))
+
+    if kind == "grid":
+        for delay, remount, sendstatus, net in itertools.product(delays, remounts, sendstatuses, nets):
+            params = {"delay": delay, "remount": remount, "sendstatus": sendstatus, "net": net}
+            for axis, value in params.items():
+                add(axis, value, **params)
+    elif kind == "axes":
+        for net in sorted(nets, reverse=True):
+            for delay in delays:
+                add(f"delay net={net}", delay, delay=delay, remount=0, sendstatus=0, net=net)
+        for remount in remounts:
+            add("remount", remount, remount=remount, sendstatus=SEND_STATUS_MS)
+        for remount in (0, REMOUNT_MS):
+            for sendstatus in sendstatuses:
+                add(f"sendstatus remount={remount}", sendstatus, remount=remount, sendstatus=sendstatus)
+    else:
+        raise ValueError(f"развёртка: {kind!r}, есть {', '.join(SWEEP_KINDS)}")
+    return [Cell(params, tuple(axes)) for params, axes in found.values()]
+
+
+def sweep_of(args: argparse.Namespace) -> list[Cell]:
+    return sweep_cells(
+        args.sweep, delays=args.delays, remounts=args.remounts, sendstatuses=args.sendstatuses, nets=args.nets
+    )
+
+
+@dataclass(frozen=True)
+class Job:
+    """Что прогнать в одном круге: задача, режим, страница стенда с параметрами (без `run`; внешний сайт — "")."""
+
+    task: Task
+    mode: str
+    page: str
+    cell: Cell | None = None
+
+
+def plan_jobs(tasks: Sequence[Task], args: argparse.Namespace) -> list[Job]:
+    """Круг прогонов. Без `--sweep` — задачи по порядку со своими страницами (и `--delay`/`--remount`/…); с
+    `--sweep` — ячейка × режим × задача (параметры ячейки поверх страницы задачи)."""
+    if args.sweep:
+        return [
+            Job(task, mode, with_params(task.page, **cell.query()), cell)
+            for cell in sweep_of(args)
+            for mode in args.modes
+            for task in tasks
+        ]
+    return [Job(task, args.mode, "" if task.network else page_for(task, **overrides(args))) for task in tasks]
+
+
+def overrides(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "delay": args.delay,
+        "remount": args.remount,
+        "sendstatus": getattr(args, "sendstatus", None),
+        "net": getattr(args, "net", None),
+    }
 
 
 # --- сервер стенда -------------------------------------------------------------------------------------------------
 
 
 class ReportStore:
-    """Последний отчёт страницы по `run` (отчёт с меньшим `seq` пришёл позже — не затирает) и время изменения."""
+    """По `run`: последний отчёт страницы (отчёт с меньшим `seq` пришёл позже — не затирает), время изменения, история
+    отчётов `(monotonic, отчёт)` и журнал запросов страницы к `/api/*`."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._reports: dict[str, dict[str, Any]] = {}
         self._changed: dict[str, float] = {}
+        self._history: dict[str, list[tuple[float, dict[str, Any]]]] = {}
+        self._calls: dict[str, list[dict[str, Any]]] = {}
 
     def put(self, report: dict[str, Any]) -> None:
         run = report.get("run")
@@ -231,8 +455,10 @@ class ReportStore:
             old = self._reports.get(run)
             if old is not None and _seq(old) > _seq(report):
                 return
+            now = time.monotonic()
             self._reports[run] = report
-            self._changed[run] = time.monotonic()
+            self._changed[run] = now
+            self._history.setdefault(run, []).append((now, report))
 
     def get(self, run: str) -> dict[str, Any] | None:
         with self._lock:
@@ -242,29 +468,65 @@ class ReportStore:
         with self._lock:
             return self._changed.get(run)
 
+    def history(self, run: str) -> list[tuple[float, dict[str, Any]]]:
+        with self._lock:
+            return list(self._history.get(run, ()))
+
+    def call(self, run: str, entry: dict[str, Any]) -> None:
+        if not run:
+            return
+        with self._lock:
+            self._calls.setdefault(run, []).append(entry)
+
+    def calls(self, run: str) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._calls.get(run, ()))
+
 
 def _seq(report: Mapping[str, Any]) -> int:
     seq = report.get("seq")
     return seq if isinstance(seq, int) else -1
 
 
+def api_delay(value: str | None) -> int:
+    """Пауза `/api/*` из параметра `delay` (мс): не число — 0, не больше API_MAX_DELAY_MS."""
+    try:
+        ms = int(float(value or 0))
+    except (ValueError, OverflowError):
+        return 0
+    return min(max(ms, 0), API_MAX_DELAY_MS)
+
+
 class _Handler(SimpleHTTPRequestHandler):
-    """GET — файлы `tests/fixtures/`; POST /report — отчёт страницы в `ReportStore`. Без логов в stderr."""
+    """GET — файлы `tests/fixtures/`; POST /report — отчёт страницы в `ReportStore`; GET /api/search и POST /api/send —
+    «сервер приложения» app.html (`net=1`): пауза `delay` мс здесь, ответ JSON, запись в журнал `run`. Без логов."""
 
     def __init__(self, *args: Any, store: ReportStore, **kwargs: Any) -> None:
         self.store = store  # до super().__init__: он сразу обрабатывает запрос
         super().__init__(*args, **kwargs)
 
+    def do_GET(self) -> None:
+        parts = urlsplit(self.path)
+        if parts.path == "/api/search":
+            self._api("search", parts.query)
+            return
+        super().do_GET()
+
     def do_POST(self) -> None:
-        if urlsplit(self.path).path != "/report":
+        parts = urlsplit(self.path)
+        if parts.path not in ("/report", "/api/send"):
             self.send_error(404)
             return
         length = int(self.headers.get("Content-Length") or 0)
         if length > MAX_REPORT_BYTES:
             self.send_error(413)
             return
+        body = self.rfile.read(length)
+        if parts.path == "/api/send":
+            self._api("send", parts.query)
+            return
         try:
-            report = json.loads(self.rfile.read(length) or b"null")
+            report = json.loads(body or b"null")
         except ValueError:
             self.send_error(400)
             return
@@ -272,6 +534,21 @@ class _Handler(SimpleHTTPRequestHandler):
             self.store.put(report)
         self.send_response(204)
         self.end_headers()
+
+    def _api(self, name: str, query: str) -> None:
+        params = dict(parse_qsl(query))
+        delay = api_delay(params.get("delay"))
+        started = time.monotonic()
+        time.sleep(delay / 1000)  # поток запроса: ThreadingHTTPServer, другие запросы не ждут
+        entry = {"api": name, "q": params.get("q"), "delay_ms": delay, "t0": started, "t1": time.monotonic()}
+        self.store.call(params.get("run", ""), entry)  # до ответа: страница увидит ответ после записи
+        body = json.dumps({"ok": True, "api": name, "q": params.get("q")}, ensure_ascii=False).encode()
+        with contextlib.suppress(OSError):  # страница прервала запрос (новый ввод, закрытая вкладка)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
     def end_headers(self) -> None:
         self.send_header("Cache-Control", "no-store")
@@ -310,6 +587,12 @@ class FixtureServer:
     def report(self, run: str) -> dict[str, Any] | None:
         return self.store.get(run)
 
+    def history(self, run: str) -> list[tuple[float, dict[str, Any]]]:
+        return self.store.history(run)
+
+    def calls(self, run: str, api: str | None = None) -> list[dict[str, Any]]:
+        return [call for call in self.store.calls(run) if api is None or call["api"] == api]
+
     def wait_report(
         self,
         run: str,
@@ -335,6 +618,29 @@ class FixtureServer:
                 break
             time.sleep(0.02)
         return self.store.get(run)
+
+
+def report_timeline(history: Sequence[tuple[float, Mapping[str, Any]]], started: float) -> list[dict[str, Any]]:
+    """История отчётов для строки прогона: `t_ms` от `started` (как у решений Jev) и поля отчёта без служебных
+    (`run`, `seq`, `params` — они в `start_url`/`params` строки)."""
+    return [
+        {"t_ms": _since(started, at), **{k: v for k, v in report.items() if k not in ("run", "seq", "params")}}
+        for at, report in history
+    ]
+
+
+def call_timeline(calls: Sequence[Mapping[str, Any]], started: float) -> list[dict[str, Any]]:
+    """Запросы страницы к `/api/*`: когда пришёл (`t_ms` от `started`), пауза сервера и сколько отвечали (`ms`)."""
+    return [
+        {
+            "api": call["api"],
+            "q": call.get("q"),
+            "delay_ms": call["delay_ms"],
+            "t_ms": _since(started, call["t0"]),
+            "ms": round((call["t1"] - call["t0"]) * 1000),
+        }
+        for call in calls
+    ]
 
 
 # --- что видел Jev -------------------------------------------------------------------------------------------------
@@ -376,15 +682,15 @@ def step_number(step: Any) -> dict[str, Any]:
 
 
 @contextlib.contextmanager
-def record_decisions(sink: list[dict[str, Any]]) -> Iterator[None]:
+def record_decisions(sink: list[dict[str, Any]], *, started: float | None = None) -> Iterator[None]:
     """На время прогона оборачивает `browser_hands.agent.choose`: на каждое решение Jev — что было на странице
-    (видимый текст, элементы), под какой шаг сценария, что выбрано и `t_ms` — когда пришёл ответ (мс от входа в
-    контекст, ≈ начало прогона). Ядро не меняется; нет такой функции — ничего не пишет."""
+    (видимый текст, элементы), под какой шаг сценария, что выбрано и `t_ms` — когда пришёл ответ (мс от `started`,
+    по умолчанию — от входа в контекст, ≈ начало прогона). Ядро не меняется; нет такой функции — ничего не пишет."""
     original = getattr(agent_module, "choose", None)
     if original is None:
         yield
         return
-    started = time.monotonic()
+    started = time.monotonic() if started is None else started
 
     def recording(clients: Any, state: dict[str, Any], goal: str, history: Any, *args: Any, **kwargs: Any) -> Any:
         where = {**seen(state), **step_number(kwargs.get("step"))}
@@ -403,8 +709,8 @@ def record_decisions(sink: list[dict[str, Any]]) -> Iterator[None]:
         setattr(agent_module, "choose", original)
 
 
-def _since(started: float) -> int:
-    return round((time.monotonic() - started) * 1000)
+def _since(started: float, at: float | None = None) -> int:
+    return round(((time.monotonic() if at is None else at) - started) * 1000)
 
 
 def trail(decisions: Sequence[Mapping[str, Any]]) -> str:
@@ -438,42 +744,42 @@ class Evaluation:
 def run_all(
     service: BrowseService,
     server: FixtureServer,
-    tasks: Sequence[Task],
+    jobs: Sequence[Job],
     args: argparse.Namespace,
     trace: TextIO,
     *,
     head: str | None,
 ) -> Evaluation:
-    """По кругу: прогон 1 всех задач, потом 2 и т. д. — медленная минута сети не достаётся одной задаче.
+    """По кругу: прогон 1 всего круга (`plan_jobs`: задачи; при `--sweep` — ячейки × режимы × задачи), потом 2 и т. д. —
+    медленная минута сети не достаётся одной задаче, обрыв по бюджету оставляет ячейки поровну.
 
-    `--mode scenario` — вместо цели сценарий задачи (`browse(url, "", steps=…)`), цель агенту не даётся.
+    Режим `scenario` — вместо цели сценарий задачи (`browse(url, "", steps=…)`), цель агенту не даётся.
     """
     evaluation = Evaluation()
-    scenarios = {task.name: task.steps() for task in tasks} if args.mode == "scenario" else {}
-    print(table_header(), flush=True)
+    sweep = any(job.cell is not None for job in jobs)
+    print(table_header(sweep=sweep), flush=True)
     for index in range(1, args.runs + 1):
-        for task in tasks:
+        for job in jobs:
             if args.max_cost is not None and evaluation.cost >= args.max_cost:
                 evaluation.stopped = f"бюджет ${args.max_cost:g} исчерпан (${evaluation.cost:.4f})"
                 return evaluation
+            task = job.task
             run_id = f"{task.name}-{index}-{uuid.uuid4().hex[:6]}"
-            if task.url is not None:  # внешний сайт: как есть, отчёта страницы не будет
-                url = task.url
-            else:
-                page = page_for(task, delay=args.delay, remount=args.remount)
-                url = server.url(with_params(page, run=run_id))
-            steps = scenarios.get(task.name)
+            # внешний сайт — как есть, отчёта страницы не будет
+            url = task.url if task.url is not None else server.url(with_params(job.page, run=run_id))
+            steps = task.steps() if job.mode == "scenario" else None
             decisions: list[dict[str, Any]] = []
-            with record_decisions(decisions):
+            started = time.monotonic()  # общий ноль для t_ms решений, отчётов и запросов страницы
+            with record_decisions(decisions, started=started):
                 if steps is None:
                     result = service.browse(url, task.goal, max_steps=args.max_steps, timeout_s=args.timeout)
                 else:
                     result = service.browse(url, "", steps=steps, max_steps=args.max_steps, timeout_s=args.timeout)
             report = None if task.network else server.wait_report(run_id)
-            problem = task.verify(result, report)
-            row = {
+            problem = (None if task.network else params_problem(job.page, report)) or task.verify(result, report)
+            row: dict[str, Any] = {
                 "task": task.name,
-                "mode": args.mode,
+                "mode": job.mode,
                 "run": index,
                 "run_id": run_id,
                 "start_url": url,
@@ -486,10 +792,15 @@ def run_all(
                 **result_to_json(result, scenario=steps),
                 "text_calls": text_calls(result),
             }
+            if not task.network:
+                row["reports"] = report_timeline(server.history(run_id), started)
+                row["api_calls"] = call_timeline(server.calls(run_id), started)
+            if job.cell is not None:
+                row.update(cell=job.cell.id, params=dict(job.cell.params), axes=[list(a) for a in job.cell.axes])
             evaluation.rows.append(row)
             trace.write(json.dumps(row, ensure_ascii=False) + "\n")
             trace.flush()
-            print(format_row(row), flush=True)
+            print(format_line(row), flush=True)
             if not row["verified"]:
                 why = f"     → {problem}" + (f"; {row['error']}" if row.get("error") else "")
                 print(why, flush=True)
@@ -516,11 +827,18 @@ def scenario_progress(row: Mapping[str, Any]) -> str | None:
     return None if total is None else f"{row.get('scenario_done') or 0}/{total}"
 
 
-def table_header() -> str:
-    return (
+def table_header(*, sweep: bool = False) -> str:
+    head = f"{'cell':<22}{'mode':<9}" if sweep else ""
+    return head + (
         f"{'task':<15}{'#':>3}  {'status':<10} {'ok':<4}{'steps':>5}  {'elapsed':>7} {'model':>6} {'text':>6} "
         f"{'browser':>7} {'wait':>6} {'calls':>5} {'jev':>4} {'txt':>4} {'scn':>5}  {'cost $':>7}"
     )
+
+
+def format_line(row: Mapping[str, Any]) -> str:
+    """Строка прогона; у развёртки — с ячейкой и режимом впереди."""
+    line = format_row(row)
+    return f"{row['cell']:<22}{row['mode']:<9}{line}" if "cell" in row else line
 
 
 def format_row(row: Mapping[str, Any]) -> str:
@@ -592,6 +910,63 @@ def summarize(
         "stopped": evaluation.stopped,
         "tasks": per_task,
     }
+
+
+def summarize_sweep(
+    evaluation: Evaluation, jobs: Sequence[Job], *, label: str, head: str | None, kind: str
+) -> dict[str, Any]:
+    """Сводка развёртки: по ячейке × режиму × задаче — k/N, медиана и p95 elapsed/wait, стоимость, причины неудач."""
+    cells = []
+    for job in jobs:
+        assert job.cell is not None
+        rows = [
+            row
+            for row in evaluation.rows
+            if row.get("cell") == job.cell.id and row["mode"] == job.mode and row["task"] == job.task.name
+        ]
+        if not rows:
+            continue
+        costs = [row["cost"] for row in rows if row.get("cost") is not None]
+        cells.append(
+            {
+                "cell": job.cell.id,
+                "mode": job.mode,
+                "task": job.task.name,
+                "params": dict(job.cell.params),
+                "axes": [list(a) for a in job.cell.axes],
+                "runs": len(rows),
+                "verified": sum(bool(row["verified"]) for row in rows),
+                "elapsed_ms": _stats([row["elapsed_ms"] for row in rows]),
+                "wait_ms": _stats([row["timing"]["wait_ms"] for row in rows]),
+                "cost_total": round(sum(costs), 6) if costs else None,
+                "failures": dict(Counter(failure_reason(row) for row in rows if not row["verified"]).most_common()),
+            }
+        )
+    return {
+        "label": label,
+        "sweep": kind,
+        "modes": sorted({job.mode for job in jobs}),
+        "head": head,
+        "runs": len(evaluation.rows),
+        "verified": sum(bool(row["verified"]) for row in evaluation.rows),
+        "cost_total": round(evaluation.cost, 6),
+        "stopped": evaluation.stopped,
+        "cells": cells,
+    }
+
+
+def format_sweep(summary: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> str:
+    """Итог развёртки: таблицы по осям (`sweep_report.format_report`) и строка «итого»."""
+    from sweep_report import format_report  # рядом, только stdlib
+
+    lines = [format_report([(summary.get("label") or "sweep", list(rows))])]
+    lines.append(
+        f"итого (развёртка {summary['sweep']}, {', '.join(summary['modes'])}): ячеек {len(summary['cells'])}, "
+        f"verified {summary['verified']}/{summary['runs']}; cost ${summary['cost_total']:.4f}"
+    )
+    if summary.get("stopped"):
+        lines.append(f"остановлено: {summary['stopped']}")
+    return "\n".join(lines)
 
 
 def _calls(value: float | None) -> str:
@@ -717,103 +1092,179 @@ def has_chat(page: Mapping[str, Any]) -> bool:
     return find_action(page, "click", prefix=CHAT) is not None
 
 
-def chat_flow(driver: Driver, server: FixtureServer, run: str, *, spinner: bool) -> str:
-    first = driver.do("fill", label=SEARCH_LABEL, text=SEARCH_QUERY)
-    typed_settle = driver.settles[-1][1]
-    need(find_action(first, "click", label="Clear search"), "после ввода нет кнопки «Clear search»")
-    if spinner:
-        need("Searching" in first["text"] or has_chat(first), "после ввода нет ни «Searching», ни результатов")
-        seen_first = "Searching" if "Searching" in first["text"] else f"уже «{CHAT}»"
-    else:
-        need(not has_chat(first), f"«{CHAT}» виден сразу после ввода: задержка поиска не работает")
-        seen_first = f"без «{CHAT}»"
-    time.sleep(1.0)
-    second = driver.observe()
-    need(has_chat(second), f"через 1 с после ввода «{CHAT}» нет в списке")
-    need(find_action(second, "click", prefix="Работа "), "нет отвлекающего чата «Работа»")
-    driver.do("click", prefix=CHAT)
-    driver.do("fill", label="Type a message", text=MESSAGE)
-    driver.do("click", label="Send")
-    time.sleep(0.5)
-    problem = chat_problem(server.wait_report(run))
-    need(problem is None, f"отчёт страницы: {problem}")
-    return f"снимок после ввода «{SEARCH_QUERY}»: {seen_first} (settle {typed_settle}); через 1 с: есть; отправлено"
-
-
-def check_search(driver: Driver, server: FixtureServer, run: str) -> str:
-    driver.open(server.url(with_params(TASKS["search"].page, run=run)))
-    return chat_flow(driver, server, run, spinner=False)
-
-
-def check_spinner(driver: Driver, server: FixtureServer, run: str) -> str:
-    driver.open(server.url(with_params(TASKS["search-spinner"].page, run=run)))
-    return chat_flow(driver, server, run, spinner=True)
-
-
-def check_boot(driver: Driver, server: FixtureServer, run: str) -> str:
-    first = driver.open(server.url(with_params("app.html?boot=2000&delay=700", run=run)))
-    need(not interactive(first), "boot=2000: в первом снимке уже есть элементы для действия")
-    time.sleep(2.5)
-    need(interactive(driver.observe()), "boot=2000: через 2,5 с элементов для действия нет")
-    return "первый снимок без элементов, через 2,5 с есть; " + chat_flow(driver, server, run, spinner=False)
-
-
 def labels(page: Mapping[str, Any], pattern: re.Pattern[str]) -> list[str]:
     """Подписи кнопок-статусов сообщений в снимке («HH:MM Sent» / «HH:MM Sending…»)."""
     return [str(a.get("label")) for a in page.get("actions") or () if pattern.fullmatch(str(a.get("label") or ""))]
 
 
-def check_remount(driver: Driver, server: FixtureServer, run: str) -> str:
-    """Поле сообщения пересоздаётся через REMOUNT_MS после открытия чата (новый узел, текст пропал, Send спрятан);
-    повторный ввод остаётся; после Send — «Sending…», через SEND_STATUS_MS — «Sent»; клик по «HH:MM Sent» открывает
-    «Message info», отчёт при этом прежний."""
-    driver.open(server.url(with_params(TASKS["search-remount"].page, run=run)))
-    driver.do("fill", label=SEARCH_LABEL, text=SEARCH_QUERY)
-    time.sleep(1.0)
-    need(has_chat(driver.observe()), f"через 1 с после ввода «{CHAT}» нет в списке")
-    clicked = time.monotonic()
-    driver.do("click", prefix=CHAT)
-    typed = driver.do("fill", label=COMPOSER_TO, text=MESSAGE)
-    typed_ms = round((time.monotonic() - clicked) * 1000)
-    before = find_action(typed, "fill", label=COMPOSER_TO)
-    need(before and before.get("value") == MESSAGE, f"ввод через {typed_ms} мс после клика: текста в поле нет")
-    need(find_action(typed, "click", label="Send"), "после ввода нет Send")
-    assert before is not None
-    time.sleep(max(0.0, REMOUNT_MS / 1000 - (time.monotonic() - clicked)) + 0.4)
-    wiped = driver.observe()
-    after = find_action(wiped, "fill", label=COMPOSER_TO)
-    need(after, f"после пересоздания нет поля «{COMPOSER_TO}»")
-    assert after is not None
-    need(after["node"] != before["node"], "поле не пересоздано: тот же узел")
-    need(not after.get("value"), f"текст пережил пересоздание: {after.get('value')!r}")
-    need(not find_action(wiped, "click", label="Send"), "Send виден при пустом поле")
-    need(find_action(wiped, "click", label="Voice message"), "при пустом поле нет «Voice message»")
-    past = labels(wiped, STATUS_SENT)
-    need(past, "у прошлых сообщений нет кнопок «HH:MM Sent»")
-    driver.do("fill", label=COMPOSER_TO, text=MESSAGE)
-    time.sleep(1.0)
+# Тайминги проверок — от параметров страницы (PageParams) плюс запасы ниже, не литералы задач.
+CHECK_MARGIN_S = 0.4  # запас после ожидаемого момента (результаты, пересоздание, статус) до снимка
+TYPE_ROOM_S = 0.45  # столько нужно до пересоздания, чтобы успеть напечатать (действие + снимок)
+NO_RESULTS_MIN_MS = 500  # net=0: «результатов сразу после ввода нет» проверяем при задержке не короче
+KEEP_S = 0.5  # повторный ввод после последнего пересоздания держится столько
+
+
+def wait_until(deadline: float) -> None:
+    time.sleep(max(0.0, deadline - time.monotonic()))
+
+
+def search_part(driver: Driver, p: PageParams) -> str:
+    typed_at = time.monotonic()
+    first = driver.do("fill", label=SEARCH_LABEL, text=SEARCH_QUERY)
+    typed_settle = driver.settles[-1][1]
+    need(find_action(first, "click", label="Clear search"), "после ввода нет кнопки «Clear search»")
+    if p.spinner:
+        need("Searching" in first["text"] or has_chat(first), "после ввода нет ни «Searching», ни результатов")
+        seen_first = "Searching" if "Searching" in first["text"] else f"уже «{CHAT}»"
+    elif not p.net and p.delay >= NO_RESULTS_MIN_MS:  # таймер ожидание ядра не держит: результатов ещё нет
+        need(not has_chat(first), f"«{CHAT}» виден сразу после ввода: задержка поиска не работает")
+        seen_first = f"без «{CHAT}»"
+    else:  # net=1: ядро вправе дождаться ответа /api/search — честны оба исхода
+        seen_first = f"уже «{CHAT}»" if has_chat(first) else f"без «{CHAT}»"
+    after = p.delay / 1000 + CHECK_MARGIN_S
+    wait_until(typed_at + after)
+    second = driver.observe()
+    need(has_chat(second), f"через {after:.1f} с после ввода «{CHAT}» нет в списке")
+    need(find_action(second, "click", prefix="Работа "), "нет отвлекающего чата «Работа»")
+    return f"снимок после ввода «{SEARCH_QUERY}»: {seen_first} (settle {typed_settle}); через {after:.1f} с: есть"
+
+
+def type_message(driver: Driver, label: str) -> dict[str, Any]:
+    page = driver.do("fill", label=label, text=MESSAGE)
+    field = find_action(page, "fill", label=label)
+    need(field and field.get("value") == MESSAGE, f"после ввода в «{label}» текста в поле нет")
+    need(find_action(page, "click", label="Send"), "после ввода нет Send")
+    assert field is not None
+    return field
+
+
+def remount_part(driver: Driver, p: PageParams, clicked: float, opened: Mapping[str, Any]) -> str:
+    """Каждое пересоздание из `remount` (мс от клика по чату): узел поля новый, пустой, Send спрятан, есть «Voice
+    message»; напечатанное до пересоздания пропадает (печатаем, если до него успеть); после последнего повторный ввод
+    остаётся."""
+    field = find_action(opened, "fill", label=COMPOSER_TO)
+    need(field, f"после открытия чата нет поля «{COMPOSER_TO}»")
+    assert field is not None
+    node, looked, typed = field["node"], time.monotonic(), False
+    notes: list[str] = []
+    if clicked + p.remount[0] / 1000 - time.monotonic() > TYPE_ROOM_S:
+        node, typed = type_message(driver, COMPOSER_TO)["node"], True
+        looked = time.monotonic()
+        notes.append(f"ввод через {_since(clicked)} мс после клика — текст есть")
+    else:
+        notes.append(f"до {p.remount[0]} мс напечатать не успеть")
+    for i, at in enumerate(p.remount):
+        due = clicked + at / 1000
+        following = p.remount[i + 1] if i + 1 < len(p.remount) else None
+        margin = CHECK_MARGIN_S if following is None else min(CHECK_MARGIN_S, (following - at) / 4000)
+        if looked >= due:  # пересоздание было раньше, чем мы увидели поле: сравнить не с чем
+            notes.append(f"{at} мс: раньше снимка, не проверено")
+            continue
+        wait_until(due + margin)
+        page = driver.observe()
+        after = find_action(page, "fill", label=COMPOSER_TO)
+        need(after, f"через {at} мс после клика нет поля «{COMPOSER_TO}»")
+        assert after is not None
+        need(after["node"] != node, f"через {at} мс поле не пересоздано: тот же узел")
+        need(not after.get("value"), f"через {at} мс текст пережил пересоздание: {after.get('value')!r}")
+        need(not find_action(page, "click", label="Send"), f"через {at} мс Send виден при пустом поле")
+        need(find_action(page, "click", label="Voice message"), f"через {at} мс при пустом поле нет «Voice message»")
+        notes.append(f"{at} мс: узел новый, {'текст пропал' if typed else 'пустой'}")
+        node, looked, typed = after["node"], time.monotonic(), False
+        if following is not None and clicked + following / 1000 - time.monotonic() > TYPE_ROOM_S:
+            node, typed = type_message(driver, COMPOSER_TO)["node"], True
+            looked = time.monotonic()
+    type_message(driver, COMPOSER_TO)
+    time.sleep(KEEP_S)
     kept = find_action(driver.observe(), "fill", label=COMPOSER_TO)
-    need(kept and kept.get("value") == MESSAGE, "повторный ввод пропал: пересоздание не одно")
-    sending = labels(driver.do("click", label="Send"), STATUS_SENDING)
-    need(len(sending) == 1, f"сразу после Send кнопок «HH:MM Sending…»: {len(sending)}, ожидалась 1")
+    need(kept and kept.get("value") == MESSAGE, "повторный ввод пропал: пересозданий больше, чем в remount")
+    return f"пересоздания ×{len(p.remount)}: " + "; ".join(notes) + "; повторный ввод остался"
+
+
+def send_part(driver: Driver, server: FixtureServer, run: str, p: PageParams) -> str:
+    sent_at = time.monotonic()
+    page = driver.do("click", label="Send")
+    looked = time.monotonic() - sent_at  # снимок после Send — не позже этого
+    if not p.sendstatus:
+        wait_until(sent_at + p.senddelay / 1000 + CHECK_MARGIN_S)
+        problem = chat_problem(server.wait_report(run))
+        need(problem is None, f"отчёт страницы через {p.senddelay} мс после Send: {problem}")
+        return f"отправлено (подтверждение {p.senddelay} мс)"
+    sending = labels(page, STATUS_SENDING)
+    if looked < p.sendstatus / 1000:
+        need(len(sending) == 1, f"сразу после Send кнопок «HH:MM Sending…»: {len(sending)}, ожидалась 1")
+        first = f"«{sending[0]}»"
+    else:  # ядро ждало ответ /api/send дольше статуса: «Sending…» мог смениться до снимка
+        need(len(sending) <= 1, f"после Send кнопок «HH:MM Sending…»: {len(sending)}")
+        first = f"снимок через {round(looked * 1000)} мс"
     problem = chat_problem(server.wait_report(run))
     need(problem is None, f"отчёт страницы сразу после Send: {problem}")
-    time.sleep(SEND_STATUS_MS / 1000 + 0.3)
+    wait_until(sent_at + p.sendstatus / 1000 + CHECK_MARGIN_S)
     done = driver.observe()
-    need(not labels(done, STATUS_SENDING), f"через {SEND_STATUS_MS} мс статус всё ещё «Sending…»")
-    info = driver.do("click", label=labels(done, STATUS_SENT)[-1])
+    need(not labels(done, STATUS_SENDING), f"через {p.sendstatus} мс статус всё ещё «Sending…»")
+    statuses = labels(done, STATUS_SENT)
+    need(statuses, "у исходящих нет кнопок «HH:MM Sent»")
+    info = driver.do("click", label=statuses[-1])
     need("Message info" in info["text"], "клик по «HH:MM Sent» не открыл «Message info»")
     problem = chat_problem(server.wait_report(run))
     need(problem is None, f"отчёт страницы после «Message info»: {problem}")
     return (
-        f"ввод через {typed_ms} мс после клика — текст есть; через {REMOUNT_MS} мс поле новое, пустое, без Send; "
-        f"повторный ввод остался; «{sending[0]}» → «Sent»; прошлых «HH:MM Sent» в снимке {len(past)}; "
+        f"{first} → «Sent» через {p.sendstatus} мс; кнопок «HH:MM Sent» {len(statuses)}; "
         "клик по статусу — «Message info»"
     )
 
 
-def check_form(driver: Driver, server: FixtureServer, run: str) -> str:
-    driver.open(server.url(with_params(TASKS["form"].page, run=run)))
+def net_part(server: FixtureServer, run: str, p: PageParams) -> str:
+    """net=1 — поиск и подтверждение Send прошли через сервер стенда с паузой из параметров; net=0 — сети нет."""
+    calls = server.calls(run)
+    if not p.net:
+        need(not calls, f"net=0, а страница ходила в /api: {[call['api'] for call in calls]}")
+        return "сеть: нет (таймеры)"
+    searches = [call for call in calls if call["api"] == "search" and call.get("q") == SEARCH_QUERY]
+    need(searches, f"net=1, а запроса /api/search?q={SEARCH_QUERY} не было")
+    need(all(call["delay_ms"] == p.delay for call in searches), f"/api/search: пауза не {p.delay} мс")
+    sends = [call for call in calls if call["api"] == "send"]
+    confirm = p.sendstatus or p.senddelay
+    need(len(sends) == 1, f"/api/send: запросов {len(sends)}, ждали 1")
+    need(sends[0]["delay_ms"] == confirm, f"/api/send: пауза {sends[0]['delay_ms']} мс, ждали {confirm}")
+    short = [call for call in searches + sends if (call["t1"] - call["t0"]) * 1000 < call["delay_ms"] - 2]
+    need(not short, f"сервер ответил раньше паузы: {short}")
+    return f"сеть: /api/search {p.delay} мс ×{len(searches)}, /api/send {confirm} мс"
+
+
+def check_chat(driver: Driver, server: FixtureServer, run: str, page: str) -> str:
+    """Чат на app.html с любыми параметрами: загрузка (boot), поиск с задержкой (net — запрос или таймер), открытие
+    чата, пересоздания поля (remount), отправка и статусы (sendstatus); сверка отчётов и журнала /api."""
+    p = PageParams.of(page)
+    parts = []
+    opened = time.monotonic()
+    first = driver.open(server.url(with_params(page, run=run)))
+    if p.boot:
+        need(not interactive(first), f"boot={p.boot}: в первом снимке уже есть элементы для действия")
+        after = p.boot / 1000 + CHECK_MARGIN_S
+        wait_until(opened + after)
+        need(interactive(driver.observe()), f"boot={p.boot}: через {after:.1f} с элементов для действия нет")
+        parts.append(f"первый снимок без элементов, через {after:.1f} с есть")
+    parts.append(search_part(driver, p))
+    clicked = time.monotonic()
+    chat = driver.do("click", prefix=CHAT)
+    if p.remount:
+        parts.append(remount_part(driver, p, clicked, chat))
+    else:
+        type_message(driver, "Type a message")
+    parts.append(send_part(driver, server, run, p))
+    parts.append(net_part(server, run, p))
+    history = server.history(run)
+    need(len(history) >= 3, f"отчётов страницы {len(history)}, ждали ≥ 3")
+    need(any(report.get("composer") == MESSAGE for _, report in history), "в отчётах нет поля с напечатанным")
+    mismatch = params_problem(page, server.report(run))
+    need(mismatch is None, str(mismatch))
+    parts.append(f"отчётов {len(history)}")
+    return "; ".join(parts)
+
+
+def check_form(driver: Driver, server: FixtureServer, run: str, page: str) -> str:
+    driver.open(server.url(with_params(page, run=run)))
     driver.do("fill", label="Name", text=FORM_EXPECTED["name"])
     driver.do("fill", label="Email", text=FORM_EXPECTED["email"])
     driver.do("select", label=f"Country → {FORM_EXPECTED['country']}")
@@ -825,13 +1276,39 @@ def check_form(driver: Driver, server: FixtureServer, run: str) -> str:
 
 
 # скриптовые проверки страниц (`--fixtures-only`); не путать со сценариями задач (`--mode scenario`)
-FIXTURE_CHECKS: dict[str, Callable[[Driver, FixtureServer, str], str]] = {
-    "search": check_search,
-    "search-spinner": check_spinner,
-    "boot": check_boot,
-    "search-remount": check_remount,
+FIXTURE_CHECKS: dict[str, Callable[[Driver, FixtureServer, str, str], str]] = {
+    "search": check_chat,
+    "search-spinner": check_chat,
+    "boot": check_chat,
+    "search-remount": check_chat,
     "form": check_form,
 }
+# кроме страницы задачи — варианты параметров (поверх неё); boot — 2 с вместо 4: то же поведение, короче
+FIXTURE_VARIANTS: dict[str, tuple[dict[str, str], ...]] = {
+    "search": ({}, {"net": "0"}),
+    "boot": ({"boot": "2000"},),
+    "search-remount": ({}, {"remount": "800,1600"}, {"net": "0"}),
+}
+
+
+def variant_label(base: str, page: str) -> str:
+    """Чем страница отличается от страницы задачи: «net=0», «remount=800,1600»; ничем — ""."""
+    before = dict(parse_qsl(urlsplit(base).query))
+    return ",".join(f"{key}={value}" for key, value in parse_qsl(urlsplit(page).query) if before.get(key) != value)
+
+
+def fixture_pages(task: Task, args: argparse.Namespace) -> list[tuple[str, str]]:
+    """`(метка, страница)` для скриптовой проверки задачи: с `--sweep` — каждая ячейка развёртки; с `--delay` /
+    `--remount` / `--sendstatus` / `--net` — одна страница с ними; иначе — страница задачи и FIXTURE_VARIANTS."""
+    if args.sweep:
+        return [(cell.id, with_params(task.page, **cell.query())) for cell in sweep_of(args)]
+    if any(value is not None for value in overrides(args).values()):
+        pages = [page_for(task, **overrides(args))]
+    else:
+        pages = [
+            with_params(task.page, **extra) if extra else task.page for extra in FIXTURE_VARIANTS.get(task.name, ({},))
+        ]
+    return [(variant_label(task.page, page), page) for page in pages]
 
 
 def fixtures_only(args: argparse.Namespace, env: Mapping[str, str]) -> int:
@@ -856,25 +1333,34 @@ def fixtures_only(args: argparse.Namespace, env: Mapping[str, str]) -> int:
                     if name not in FIXTURE_CHECKS:  # wiki: внешний сайт, страниц стенда нет
                         print(f"skip  {name}: внешняя сеть — страниц стенда нет", flush=True)
                         continue
-                    tab = chrome.new_tab()
-                    driver = Driver(tab)
-                    run = f"fixtures-{name}-{uuid.uuid4().hex[:6]}"
-                    try:
-                        detail = FIXTURE_CHECKS[name](driver, server, run)
-                        print(f"ok    {name}: {detail}", flush=True)
-                    except Exception as exc:  # любой сбой проверки печатаем и идём дальше
-                        failures += 1
-                        print(f"FAIL  {name}: {type(exc).__name__}: {exc}", flush=True)
-                    finally:
-                        tab.close()
-                    if any(how != "—" for _, how in driver.settles):
-                        steps = "; ".join(f"{what} → {how}" for what, how in driver.settles)
-                        print(f"      settle: {steps}", flush=True)
-                    elif driver.settles:
-                        print("      settle: у ядра нет Tab.last_settle (до §4.1 плана надёжности)", flush=True)
+                    for label, page in fixture_pages(TASKS[name], args):
+                        failures += not fixture_check(chrome, server, name, label, page)
         finally:
             chrome.close()
     return 0 if failures == 0 else 1
+
+
+def fixture_check(chrome: Chrome, server: FixtureServer, name: str, label: str, page: str) -> bool:
+    """Одна скриптовая проверка в новой вкладке: строка `ok`/`FAIL` и успокоения ядра по действиям."""
+    title = f"{name} [{label}]" if label else name
+    tab = chrome.new_tab()
+    driver = Driver(tab)
+    run = f"fixtures-{name}-{uuid.uuid4().hex[:6]}"
+    passed = True
+    try:
+        detail = FIXTURE_CHECKS[name](driver, server, run, page)
+        print(f"ok    {title}: {detail}", flush=True)
+    except Exception as exc:  # любой сбой проверки печатаем и идём дальше
+        passed = False
+        print(f"FAIL  {title}: {type(exc).__name__}: {exc}", flush=True)
+    finally:
+        tab.close()
+    if any(how != "—" for _, how in driver.settles):
+        steps = "; ".join(f"{what} → {how}" for what, how in driver.settles)
+        print(f"      settle: {steps}", flush=True)
+    elif driver.settles:
+        print("      settle: у ядра нет Tab.last_settle (до §4.1 плана надёжности)", flush=True)
+    return passed
 
 
 # --- вход ----------------------------------------------------------------------------------------------------------
@@ -882,14 +1368,17 @@ def fixtures_only(args: argparse.Namespace, env: Mapping[str, str]) -> int:
 
 def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Стенд надёжности browser-hands: локальные страницы, проверка по DOM.")
-    parser.add_argument("--runs", type=int, default=5, metavar="N", help="прогонов на задачу (по умолчанию 5)")
+    parser.add_argument("--runs", type=int, default=5, metavar="N", help="прогонов на задачу (ячейку) (по умолчанию 5)")
     parser.add_argument(
-        "--mode", choices=MODES, default="goal", help="goal — цель задачи (по умолчанию), scenario — её сценарий steps"
+        "--mode",
+        default="goal",
+        metavar="MODE",
+        help="goal — цель задачи (по умолчанию), scenario — её сценарий steps; с --sweep — можно оба: goal,scenario",
     )
     parser.add_argument(
         "--tasks",
-        default=",".join(DEFAULT_TASKS),
-        help=f"через запятую из: {', '.join(TASKS)}; all — все (wiki — внешняя сеть, по умолчанию не входит)",
+        help=f"через запятую из: {', '.join(TASKS)}; all — все (wiki — внешняя сеть, по умолчанию не входит); "
+        f"с --sweep по умолчанию {','.join(SWEEP_TASKS)}",
     )
     parser.add_argument("--label", default="", help="метка замера в JSONL (before, after, …)")
     parser.add_argument("--out-dir", type=Path, default=ROOT / "traces", help="куда писать eval-<ts>.jsonl")
@@ -897,20 +1386,76 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=12, metavar="N", help="шагов на прогон (12)")
     parser.add_argument("--delay", type=int, metavar="MS", help="задержка поиска на app.html вместо заданной")
     parser.add_argument(
-        "--remount", type=int, metavar="MS", help=f"пересоздание поля в search-remount вместо {REMOUNT_MS} мс"
+        "--remount",
+        metavar="MS[,MS…]",
+        help=f"пересоздания поля в search-remount вместо {REMOUNT_MS} мс; список — несколько (800,1600)",
+    )
+    parser.add_argument(
+        "--sendstatus",
+        metavar="MS",
+        help=f"«Sending…» в search-remount вместо {SEND_STATUS_MS} мс; с --sweep — значения оси ({SWEEP_SENDSTATUS})",
+    )
+    parser.add_argument(
+        "--net",
+        metavar="0|1",
+        help=f"1 — задержки страниц запросами к стенду (по умолчанию), 0 — таймерами; с --sweep — значения на "
+        f"delay-оси ({SWEEP_NETS})",
+    )
+    parser.add_argument(
+        "--sweep", choices=SWEEP_KINDS, help="развёртка параметров app.html: axes — по осям, grid — полная сетка"
+    )
+    parser.add_argument(
+        "--delay-range", default=SWEEP_DELAYS, metavar="A:B:STEP|V,…", help=f"--sweep: delay ({SWEEP_DELAYS})"
+    )
+    parser.add_argument(
+        "--remount-range", default=SWEEP_REMOUNTS, metavar="A:B:STEP|V,…", help=f"--sweep: remount ({SWEEP_REMOUNTS})"
     )
     parser.add_argument("--max-cost", type=float, metavar="USD", help="не начинать новый прогон после этой суммы")
     parser.add_argument("--fixtures-only", action="store_true", help="без моделей: скриптовые действия (бесплатно)")
     args = parser.parse_args(argv)
     if args.runs < 1:
         parser.error("--runs: ожидается ≥ 1")
-    names = [name.strip() for name in args.tasks.split(",") if name.strip()]
+    modes = list(dict.fromkeys(mode.strip() for mode in args.mode.split(",") if mode.strip()))
+    bad = [mode for mode in modes if mode not in MODES]
+    if not modes or bad:
+        parser.error(f"--mode: неизвестные {', '.join(bad) or '(пусто)'}; есть {', '.join(MODES)}")
+    if len(modes) > 1 and not args.sweep:
+        parser.error("--mode: несколько режимов — только с --sweep")
+    args.modes, args.mode = modes, ",".join(modes)
+    default_tasks = SWEEP_TASKS if args.sweep else DEFAULT_TASKS
+    names = [name.strip() for name in (args.tasks or ",".join(default_tasks)).split(",") if name.strip()]
     if names == ["all"]:
         names = list(TASKS)
     unknown = [name for name in names if name not in TASKS]
     if not names or unknown:
         parser.error(f"--tasks: неизвестные {', '.join(unknown) or '(пусто)'}; есть {', '.join(TASKS)}")
     args.tasks = list(dict.fromkeys(names))
+    try:
+        remount = None if args.remount is None else parse_values(args.remount, name="--remount")
+        sendstatus = args.sendstatus or (SWEEP_SENDSTATUS if args.sweep else None)
+        sendstatuses = None if sendstatus is None else parse_values(sendstatus, name="--sendstatus")
+        net = args.net or (SWEEP_NETS if args.sweep else None)
+        nets = None if net is None else parse_values(net, name="--net")
+        args.delays = parse_values(args.delay_range, name="--delay-range")
+        args.remounts = parse_values(args.remount_range, name="--remount-range")
+    except ValueError as exc:
+        parser.error(str(exc))
+    if nets is not None and not set(nets) <= {0, 1}:
+        parser.error("--net: только 0 и 1")
+    if args.sweep:
+        if args.delay is not None or remount is not None:
+            parser.error("--sweep: вместо --delay / --remount — --delay-range / --remount-range")
+        outside = [name for name in args.tasks if not TASKS[name].page.startswith("app.html")]
+        if outside:
+            parser.error(f"--sweep: только задачи чата (app.html), не {', '.join(outside)}")
+        args.sendstatuses, args.nets, args.sendstatus, args.net = sendstatuses, nets, None, None
+        return args
+    if len(sendstatuses or ()) > 1 or len(nets or ()) > 1:
+        parser.error("--sendstatus / --net: список значений — только с --sweep")
+    args.remount = None if remount is None else ",".join(map(str, remount))
+    args.sendstatus = sendstatuses[0] if sendstatuses else None
+    args.net = nets[0] if nets else None
+    args.sendstatuses = args.nets = None
     return args
 
 
@@ -925,6 +1470,7 @@ def main(
     if args.fixtures_only:
         return fixtures_only(args, env)
     tasks = [TASKS[name] for name in args.tasks]
+    jobs = plan_jobs(tasks, args)
     with fresh_profile(True) as profile:
         try:
             settings = eval_settings(env, profile, args)
@@ -938,14 +1484,19 @@ def main(
         service = BrowseService(settings, **(factories or {}))  # один Chrome и одни клиенты на все прогоны
         try:
             with FixtureServer() as server, out.open("w", encoding="utf-8") as trace:
-                evaluation = run_all(service, server, tasks, args, trace, head=head)
-                summary = summarize(evaluation, tasks, label=args.label, head=head, mode=args.mode)
+                evaluation = run_all(service, server, jobs, args, trace, head=head)
+                if args.sweep:
+                    summary = summarize_sweep(evaluation, jobs, label=args.label, head=head, kind=args.sweep)
+                else:
+                    summary = summarize(evaluation, tasks, label=args.label, head=head, mode=args.mode)
                 trace.write(json.dumps({"summary": summary}, ensure_ascii=False) + "\n")
         finally:
             service.close()
-    print(format_summary(summary))
+    print(format_sweep(summary, evaluation.rows) if args.sweep else format_summary(summary))
     print(f"trace: {out}")
-    complete = not evaluation.stopped and summary["runs"] == args.runs * len(tasks)
+    complete = not evaluation.stopped and summary["runs"] == args.runs * len(jobs)
+    if args.sweep:  # развёртка — замер: неудачи в ней — данные, выход 1 — только недобор прогонов
+        return 0 if complete else 1
     return 0 if complete and summary["verified"] == summary["runs"] else 1
 
 
