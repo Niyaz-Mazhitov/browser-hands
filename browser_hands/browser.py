@@ -738,7 +738,9 @@ class Tab:
         """Дождаться следующего изменения страницы, затем `await_ready` (WAIT Jev, WAIT в проверке, второй взгляд; §2).
 
         Изменение — первое из: значимая мутация или конец CSS-анимации/перехода (промис `CHANGE`), с учётом сети — ещё
-        завершение любого запроса вкладки или WS-кадр (подсказка «сейчас что-то изменится»), смена документа. Каждое
+        завершение запроса, начатого после эпохи последнего действия или навигации (фонового тоже: предохранитель его
+        пережил, а ответ на действие — вот он), смена документа. WS-кадр и запросы страницы, начатые раньше
+        (long-poll, аналитика), не будят: у WhatsApp кадры идут постоянно. Каждое
         из двух ожиданий — не дольше предохранителя; изменения не было — `fuse`, без `await_ready`. Итог — как у
         `await_ready`, плюс `change` (что разбудило) и `ready` (чем кончилась готовность); `wait_reason` — `change`,
         если изменение было и страница затем готова, иначе `fuse` (и когда страница не ответила до дедлайна прогона).
@@ -753,10 +755,13 @@ class Tab:
             log.debug("await_change пропущен: до дедлайна меньше %g с", WAIT_DEADLINE_MARGIN_S)
             return {}
         started = time.monotonic()
-        marks = self.client.network_marks(self.session_id) if self.network else (0, 0)
+        epoch = self._epoch  # ответ на запрос последнего действия (или навигации) — будит; фон страницы — нет
+        mark = self.client.finished_mark(self.session_id) if self.network else 0
 
         def moved() -> bool:
-            return self._cancelled() or (self.network and self.client.network_marks(self.session_id) != marks)
+            return self._cancelled() or bool(
+                self.network and self.client.finished_since(self.session_id, mark, epoch) > 0
+            )
 
         params = {"fuse_ms": max(1, round(fuse * 1000)), "attributes": list(MUTATION_ATTRIBUTES)}
         with self._timed(wait=True):
@@ -778,8 +783,7 @@ class Tab:
             if self._cancelled():
                 log.debug("await_change прерван: отмена")
                 return {}
-            finished, _ws = self.client.network_marks(self.session_id)
-            change = "network" if finished != marks[0] else "websocket"
+            change = "network"
         elif response.get("exceptionDetails"):
             change = "navigation"
         else:
@@ -911,9 +915,12 @@ class Tab:
     def act(self, action: dict[str, Any], page: dict[str, Any], text: str | None = None) -> dict[str, Any]:
         if not self.fresh(page, action):
             raise StalePage("Page changed since this decision. Observe again.")
-        self._epoch = self.client.seq  # WAIT и SELECT (его change — внутри evaluate); у ввода — уточняется в _act
+        acting = action["kind"] != "wait"  # WAIT запросов не начинает: эпоха — того действия, которого ждём
+        if acting:
+            self._epoch = self.client.seq  # SELECT (его change — внутри evaluate); у ввода — уточняется в _act
         result = self._act(action, text)
-        self.action_epoch = self._epoch  # действие исполнено: его запросы — «начатые последним действием»
+        if acting:
+            self.action_epoch = self._epoch  # действие исполнено: его запросы — «начатые последним действием»
         self.after_input = action  # следующий observe() подождёт: WAIT — изменения, остальное — готовности
         return result
 

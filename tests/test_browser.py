@@ -1094,6 +1094,72 @@ def test_await_change_is_woken_by_a_finished_request_then_waits_for_readiness(fa
     assert [f["params"]["expression"][:20] for f in server.sent("Runtime.evaluate")] == [CHANGE[:20], READY[:20]]
 
 
+def change_times_out(fuse_s, *send):
+    """Обработчик Runtime.evaluate: CHANGE — события `send`, затем ответ `fuse` по истечении предохранителя (как промис
+    страницы без мутаций); READY — сразу."""
+
+    def evaluate(frame, ws):
+        if not frame["params"]["expression"].startswith(CHANGE):
+            return reply(ws, frame, ready_value())
+        for s in send:
+            s(ws)
+        time.sleep(fuse_s)
+        reply(ws, frame, {"result": {"type": "object", "value": {"reason": "fuse", "ms": round(fuse_s * 1000)}}})
+
+    return evaluate
+
+
+def test_websocket_frames_alone_do_not_end_a_wait_for_change(fake_tab):
+    """Ревью: WS-кадр будил `await_change` (WhatsApp шлёт их постоянно — WAIT и второй взгляд не ждали ничего)."""
+    fake_tab.fuse_s = 0.3
+    fake_tab._epoch = fake_tab.client.seq
+    frame = {"requestId": "ws", "response": {"payloadData": "x"}}
+    fake_tab.server.on["Runtime.evaluate"] = change_times_out(
+        0.3, lambda ws: event(ws, "Network.webSocketFrameReceived", frame, "S1")
+    )
+    result = fake_tab.await_change()
+    assert (result["wait_reason"], result["change"]) == ("fuse", None)
+    assert evaluations(fake_tab.server) == []  # готовность после «изменения» не ждали
+
+
+def test_page_background_request_finishing_does_not_end_a_wait_for_change(fake_tab):
+    """Запрос страницы, начатый до последнего действия (long-poll, аналитика), завершился — это не ответ на действие."""
+    server = fake_tab.server
+    server.on["Target.getTargets"] = lambda f, ws: (
+        net(ws, "Network.requestWillBeSent", "poll", type="XHR"),
+        reply(ws, f),
+    )
+    fake_tab.client.call("Target.getTargets")
+    fake_tab._epoch = fake_tab.client.seq  # действие — после запроса страницы
+    fake_tab.fuse_s = 0.3
+    server.on["Runtime.evaluate"] = change_times_out(0.3, lambda ws: net(ws, "Network.loadingFinished", "poll"))
+    result = fake_tab.await_change()
+    assert (result["wait_reason"], result["change"]) == ("fuse", None)
+
+
+def test_wait_action_keeps_the_epoch_of_the_action_it_waits_for(fake_tab):
+    """WAIT запросов не начинает: ожидание изменения после него будит ответ на запрос прошлого действия."""
+    fake_tab.fuse_s = 0.3
+    assert clicked_with_a_slow_request(fake_tab)["wait_reason"] == "fuse"
+    epoch = fake_tab._epoch
+    p = page()
+    fake_tab.fresh = Mock(return_value=True)
+    fake_tab.act(p["actions"][3], p)  # WAIT
+    assert (fake_tab._epoch, fake_tab.action_epoch) == (epoch, epoch)
+    fake_tab.fuse_s = 5.0
+
+    def evaluate(frame, ws):
+        if frame["params"]["expression"].startswith(CHANGE):
+            net(ws, "Network.loadingFinished", "search")
+            return
+        reply(ws, frame, ready_value(mutations=2))
+
+    fake_tab.server.on["Runtime.evaluate"] = evaluate
+    started = time.monotonic()
+    result = fake_tab.await_change()  # то, что сделает observe() после WAIT
+    assert (result["change"], result["wait_reason"]) == ("network", "change") and time.monotonic() - started < 2.0
+
+
 def test_navigate_on_fake_cdp_waits_for_the_document_then_its_requests(fake_tab):
     server = fake_tab.server
 

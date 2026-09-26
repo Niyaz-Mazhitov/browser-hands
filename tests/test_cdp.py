@@ -222,7 +222,8 @@ def test_only_requests_the_page_waits_for_are_pending(server, client):
     client.call("Runtime.evaluate", {"expression": "1"}, session_id="S1")
     assert sorted(client.network["S1"].pending) == ["fetch", "script"]
     assert client.pending_since("S1", epoch) == 2
-    assert client.network_marks("S1") == (3, 0)  # event-stream, loadingFailed, requestServedFromCache
+    assert client.finished_mark("S1") == 3  # event-stream, loadingFailed, requestServedFromCache
+    assert client.finished_since("S1", 0, epoch) == 3 and client.finished_since("S1", 1, epoch) == 2
 
 
 def test_requests_started_before_the_epoch_are_background(server, client):
@@ -268,7 +269,8 @@ def test_wait_events_pumps_until_the_predicate_holds(server, client):
     started = time.monotonic()
     assert client.wait_events("S1", lambda: client.pending_since("S1", epoch) == 0, timeout=2.0) is True
     assert 0.1 <= time.monotonic() - started < 1.0
-    assert client.network_marks("S1") == (1, 1)
+    assert client.finished_mark("S1") == 1  # WS-кадр — не завершение
+    assert client.finished_since("S1", 0, epoch) == 1 and client.finished_since("S1", 0, client.seq) == 0
     assert client.wait_events("S1", lambda: True, timeout=0.0) is True  # предикат проверяется до чтения
 
 
@@ -328,9 +330,9 @@ def test_call_until_stops_on_an_event_and_its_reply_is_skipped_later(server, cli
 
     server.on["Target.getTargets"] = lambda f, ws: (request(ws, "r"), reply(ws, f))
     client.call("Target.getTargets")
-    marks = client.network_marks("S1")
+    mark = client.finished_mark("S1")
     server.on["Runtime.evaluate"] = handler
-    stop = lambda: client.network_marks("S1") != marks  # noqa: E731
+    stop = lambda: client.finished_since("S1", mark, 0) > 0  # noqa: E731
     assert client.call_until("Runtime.evaluate", {"expression": "p"}, session_id="S1", stop=stop) is None
     server.on["Target.getTargets"] = lambda f, ws: reply(ws, f, {"fresh": True})
     assert client.call("Target.getTargets") == {"fresh": True}  # поздний ответ не выдан за этот

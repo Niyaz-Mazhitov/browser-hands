@@ -65,8 +65,8 @@ class TabGone(CDPException):
 @dataclass
 class NetworkState:
     """Сеть одной сессии: незавершённые запросы (requestId → `seq` события `requestWillBeSent`), фоновые среди них
-    (пережили предохранитель ожидания) и счётчики завершений и WS-кадров — подсказки «что-то пришло» для ожидания
-    изменения.
+    (пережили предохранитель ожидания), счётчик завершений и эпохи начала последних завершённых — «пришёл ответ на
+    действие» для ожидания изменения (`finished_since`). WS-кадры не считаются: у WhatsApp они идут постоянно.
 
     Смена документа главного фрейма: Chrome не присылает loadingFinished/Failed запросам документа, который сменился
     (зонд 26.09: fetch и уход со страницы — запрос «в полёте» навсегда). Поэтому у запроса помнится `loaderId`
@@ -78,7 +78,8 @@ class NetworkState:
     pending: dict[str, int] = field(default_factory=dict)
     background: set[str] = field(default_factory=set)
     finished: int = 0
-    ws_frames: int = 0
+    # `seq` начала последних завершённых запросов (по порядку завершения); граница памяти — как у `pending`
+    finished_starts: deque[int] = field(default_factory=lambda: deque(maxlen=NETWORK_PENDING_MAX))
     loaders: dict[str, str] = field(default_factory=dict)  # requestId → loaderId (у незавершённых, где он есть)
     documents: set[str] = field(default_factory=set)  # loaderId документов нынешнего поколения (главный и его фреймы)
     leaving: set[str] = field(default_factory=set)  # loaderId документов, которые сменяет идущая навигация
@@ -299,10 +300,19 @@ class CDPClient:
         state.background.update(state.pending)
         return len(state.pending)
 
-    def network_marks(self, session_id: str) -> tuple[int, int]:
-        """(завершений запросов, WS-кадров) сессии с начала учёта — сравнить «до» и «после»."""
+    def finished_mark(self, session_id: str) -> int:
+        """Завершений запросов сессии с начала учёта — отметка «до» для `finished_since`."""
         state = self.network.get(session_id)
-        return (0, 0) if state is None else (state.finished, state.ws_frames)
+        return 0 if state is None else state.finished
+
+    def finished_since(self, session_id: str, mark: int, epoch: int) -> int:
+        """Сколько запросов, начатых после эпохи `epoch` (фоновых тоже), завершилось после отметки `mark`
+        (`finished_mark`): ответ на действие пришёл. Запросы страницы, начатые раньше, — не в счёт."""
+        state = self.network.get(session_id)
+        if state is None or state.finished <= mark:
+            return 0
+        recent = itertools.islice(reversed(state.finished_starts), state.finished - mark)
+        return sum(1 for start in recent if start > epoch)
 
     def forget_network(self, session_id: str) -> None:
         """Сеть сессии выключена или сессия отсоединена: учёт больше не нужен."""
@@ -313,8 +323,7 @@ class CDPClient:
             return
         state = self.network.setdefault(session_id, NetworkState())
         if method in {"Network.webSocketFrameReceived", "Network.webSocketFrameSent"}:
-            state.ws_frames += 1
-            return
+            return  # кадры соединения, а не запросы: ожиданий не держат и не будят
         rid = params.get("requestId")
         if not isinstance(rid, str):
             return
@@ -386,7 +395,7 @@ class CDPClient:
     @staticmethod
     def _finish_request(state: NetworkState, rid: str) -> None:
         if rid in state.pending:
-            del state.pending[rid]
+            state.finished_starts.append(state.pending.pop(rid))
             state.background.discard(rid)
             state.loaders.pop(rid, None)
             state.finished += 1
