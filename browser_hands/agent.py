@@ -112,15 +112,23 @@ def interactive(page: dict[str, Any]) -> bool:
     return any(a.get("kind") in INTERACTIVE_KINDS for a in page.get("actions") or ())
 
 
+def _field_key(action: dict[str, Any]) -> str:
+    """Ключ поля без роли: подпись (имя, `<label>`, title, placeholder). У поля без имени подпись в снимке — сама роль
+    (`name || role`): ключ пустой, такие поля сравниваются между собой при любой роли."""
+    label = str(action.get("label") or "")
+    return "" if label == action.get("role") else label
+
+
 def typed_fields(page: dict[str, Any], action: dict[str, Any]) -> list[dict[str, Any]]:
-    """Поле, куда печатали, на новом снимке: тот же узел, если он ещё есть; иначе — поля `fill` с той же подписью, роль
-    не важна (сайт перерисовал поле новым узлом, Википедия — ещё и с другой ролью: searchbox → combobox). Пусто —
-    поля не видно."""
+    """Поле, куда печатали, на новом снимке: тот же узел, если он ещё есть; иначе — поля `fill` с тем же ключом
+    (`_field_key`), роль не сравнивается: сайт перерисовал поле новым узлом, Википедия — ещё и с другой ролью
+    (searchbox → combobox). Текст сверяет вызывающий (`matches`). Пусто — поля не видно."""
     fields = [a for a in page.get("actions") or () if a.get("kind") in {"fill", "click"} and "node" in a]
     same = [a for a in fields if a["node"] == action.get("node")]
     if same:
         return same
-    return [a for a in fields if a["kind"] == "fill" and a.get("label") == action.get("label")]
+    key = _field_key(action)
+    return [a for a in fields if a["kind"] == "fill" and _field_key(a) == key]
 
 
 def _spaces(text: str) -> str:
@@ -146,11 +154,11 @@ def matches(value: Any, text: str) -> bool:
 
 
 def wait_fields(result: Any) -> tuple[str | None, int]:
-    """`Step.wait_reason` и `pending_requests` из итога `Tab.await_ready`/`await_change`: `reason` и число запросов в
-    полёте (`pending_requests`, иначе `pending`: число или их список). Не ждали (`{}`) — None и 0."""
+    """`Step.wait_reason` и `pending_requests` из итога `Tab.await_ready`/`await_change`: `wait_reason` (иначе `reason`)
+    и число запросов в полёте (`pending_requests`, иначе `pending`: число или их список). Не ждали (`{}`) — None и 0."""
     if not isinstance(result, dict):
         return None, 0
-    reason = result.get("reason")
+    reason = result.get("wait_reason", result.get("reason"))
     pending = result.get("pending_requests", result.get("pending", 0))
     if isinstance(pending, list | tuple | set | dict):
         pending = len(pending)
@@ -370,7 +378,8 @@ class Agent(AgentLike):
         try:
             self._check_cancel()
             tab = self._open_tab()
-            tab.deadline, tab.cancel = self._deadline, self.cancel  # и для успокоения после действий
+            tab.deadline, tab.cancel = self._deadline, self.cancel  # и для ожиданий после действий
+            tab.fuse_s = self.thresholds.wait_fuse_s  # предохранитель одного ожидания — из порогов этого прогона
             self._check_cancel()
             if tab.owned:  # во вкладке пользователя — с того, что открыто: не переходим и не перезагружаем
                 tab.navigate(self.url, timeout=min(NAVIGATE_TIMEOUT_S, max(0.0, self._deadline - time.monotonic())))

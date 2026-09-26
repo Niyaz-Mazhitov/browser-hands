@@ -257,6 +257,20 @@ def test_run_hands_its_deadline_and_cancel_to_the_tab(monkeypatch):
     assert tab.deadline is None  # _finish снимает дедлайн для финального кадра
 
 
+@pytest.mark.parametrize("fuse", [None, 0.7])
+def test_run_hands_the_wait_fuse_from_its_thresholds_to_the_tab(monkeypatch, fuse):
+    tab = make_tab()
+    chrome = Mock()
+    chrome.new_tab.return_value = tab
+    chrome.find_user_tab.return_value = None
+    clients = ModelClients(ModelConfig(jev_api_key="test", text_api_key="test"), http=Mock())
+    limits = None if fuse is None else Thresholds(wait_fuse_s=fuse)
+    agent = Agent(chrome, clients, "https://example.test/", "Find a book", RunConfig(timeout_s=30.0), thresholds=limits)
+    monkeypatch.setattr(loop, "choose", scripted(DONE))
+    agent.run()
+    assert tab.fuse_s == (Thresholds().wait_fuse_s if fuse is None else fuse)  # предохранитель одного ожидания
+
+
 def test_cost_is_none_when_no_usage_cost_arrives(monkeypatch):
     agent = make_agent()
     monkeypatch.setattr(loop, "choose", scripted(decision("DONE", "DONE")))
@@ -2284,14 +2298,23 @@ def test_last_text_step_waits_for_readiness_and_checks_the_field_before_done(mon
 # --- находки ревью 2–5 и режим цели (docs/plan-waits.md §6.2) ---------------------------------------------------------
 
 
-def test_field_replaced_with_another_role_and_the_same_label_closes_the_text_step(monkeypatch):
-    """Википедия: поле поиска после ввода — новый узел с ролью combobox и той же подписью."""
+def with_role(state, role, *, nameless=False):
+    """Поле (e1/e2) с ролью `role`; `nameless` — без доступного имени: подпись в снимке — сама роль (`name || role`)."""
+    for action in state["actions"][:2]:
+        action["role"] = role
+        if nameless:
+            action["label"] = role if action["kind"] == "fill" else f"Open {role}"
+    state["fingerprint"] = fingerprint(state)
+    return state
+
+
+@pytest.mark.parametrize("nameless", [False, True], ids=["same-label", "no-name"])
+def test_field_replaced_with_another_role_closes_the_text_step(monkeypatch, nameless):
+    """Википедия: поле поиска после ввода — новый узел, searchbox → combobox, подпись та же (или её нет вовсе)."""
     tab = make_tab()
-    after = field_page(MESSAGE, node=11, text="Рабочий 1")
-    for action in after["actions"][:2]:
-        action["role"] = "combobox"
-    after["fingerprint"] = fingerprint(after)
-    tab.observe.side_effect = [field_page(""), after]
+    before = with_role(field_page(""), "searchbox", nameless=nameless)
+    after = with_role(field_page(MESSAGE, node=11, text="Рабочий 1"), "combobox", nameless=nameless)
+    tab.observe.side_effect = [before, after]
     agent = make_agent(tab, steps=TYPE_AND_SEND, goal="")
     choose = scripted(TYPE_MESSAGE, decision("e3", "CLICK", step_done=0.9))
     monkeypatch.setattr(loop, "choose", choose)
@@ -2398,8 +2421,8 @@ def test_goal_mode_notes_typed_text_missing_from_the_field_on_the_next_snapshot(
 
 def test_steps_carry_the_wait_reason_and_pending_requests_of_their_wait(monkeypatch):
     tab = make_tab()
-    tab.await_ready.side_effect = [{"reason": "fuse", "ms": 1500, "pending_requests": 2}, {}]
-    tab.await_change.return_value = {"reason": "change", "ms": 120}
+    tab.await_ready.side_effect = [{"reason": "fuse", "wait_reason": "fuse", "ms": 1500, "pending_requests": 2}, {}]
+    tab.await_change.return_value = {"reason": "change", "wait_reason": "change", "change": "mutation", "ms": 120}
     agent = make_agent(tab)
     choose = scripted(decision("e3", "CLICK"), decision("wait", "WAIT"), decision("e3", "CLICK"), DONE)
     monkeypatch.setattr(loop, "choose", choose)
