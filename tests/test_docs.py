@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from browser_hands import agent, browser, model
-from browser_hands.config import ModelConfig
+from browser_hands.config import ModelConfig, Thresholds
 from browser_hands.scenario import MAX_DO, MAX_STEPS, MAX_TEXT, ScenarioStep, parse_steps
 from browser_hands.server import BROWSE_DESCRIPTION, INSTRUCTIONS, STEPS_DESCRIPTION, URL_DESCRIPTION, format_result
 from tests.fakes import make_result
@@ -42,10 +42,10 @@ def test_readme_states_both_empty_page_ceilings():
 
 def test_readme_limitations_state_settle_and_single_retries():
     limits = flat(section(README, "## Ограничения"))
-    quiet = f"{browser.SETTLE_QUIET_MS / 1000:g}".replace(".", ",")
-    ceiling = f"{browser.SETTLE_CEILING_MS / 1000:g}".replace(".", ",")
-    assert f"агент ждёт тишины DOM {quiet} с (не дольше {ceiling} с)" in limits
-    assert f"добавляет до {ceiling} с на шаг" in limits
+    fuse = f"{Thresholds().wait_fuse_s:g}".replace(".", ",")
+    assert browser.QUIET_FRAMES == 2 and "два кадра подряд без изменений DOM" in limits
+    assert f"Предохранитель одного ожидания — {fuse} с" in limits
+    assert f"добавляет до {fuse} с на шаг" in limits
     assert "На BLOCKED переспрашивает один раз" in limits
     assert agent.TEXT_ATTEMPTS == 2 and "повторяет запрос один раз" in limits
 
