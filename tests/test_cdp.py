@@ -222,7 +222,8 @@ def test_only_requests_the_page_waits_for_are_pending(server, client):
     client.call("Runtime.evaluate", {"expression": "1"}, session_id="S1")
     assert sorted(client.network["S1"].pending) == ["fetch", "script"]
     assert client.pending_since("S1", epoch) == 2
-    assert client.network_marks("S1") == (3, 0)  # event-stream, loadingFailed, requestServedFromCache
+    assert client.finished_mark("S1") == 3  # event-stream, loadingFailed, requestServedFromCache
+    assert client.finished_since("S1", 0, epoch) == 3 and client.finished_since("S1", 1, epoch) == 2
 
 
 def test_requests_started_before_the_epoch_are_background(server, client):
@@ -268,7 +269,8 @@ def test_wait_events_pumps_until_the_predicate_holds(server, client):
     started = time.monotonic()
     assert client.wait_events("S1", lambda: client.pending_since("S1", epoch) == 0, timeout=2.0) is True
     assert 0.1 <= time.monotonic() - started < 1.0
-    assert client.network_marks("S1") == (1, 1)
+    assert client.finished_mark("S1") == 1  # WS-кадр — не завершение
+    assert client.finished_since("S1", 0, epoch) == 1 and client.finished_since("S1", 0, client.seq) == 0
     assert client.wait_events("S1", lambda: True, timeout=0.0) is True  # предикат проверяется до чтения
 
 
@@ -328,9 +330,88 @@ def test_call_until_stops_on_an_event_and_its_reply_is_skipped_later(server, cli
 
     server.on["Target.getTargets"] = lambda f, ws: (request(ws, "r"), reply(ws, f))
     client.call("Target.getTargets")
-    marks = client.network_marks("S1")
+    mark = client.finished_mark("S1")
     server.on["Runtime.evaluate"] = handler
-    stop = lambda: client.network_marks("S1") != marks  # noqa: E731
+    stop = lambda: client.finished_since("S1", mark, 0) > 0  # noqa: E731
     assert client.call_until("Runtime.evaluate", {"expression": "p"}, session_id="S1", stop=stop) is None
     server.on["Target.getTargets"] = lambda f, ws: reply(ws, f, {"fresh": True})
     assert client.call("Target.getTargets") == {"fresh": True}  # поздний ответ не выдан за этот
+
+
+# --- смена документа: запросы старого документа (docs/core-notes.md, «После ревью ожиданий») ----------------------
+
+
+def loaded(ws, rid, kind, loader, frame="T1"):
+    params = {"requestId": rid, "type": kind, "frameId": frame, "loaderId": loader, "request": {"url": rid}}
+    event(ws, "Network.requestWillBeSent", params, "S1")
+
+
+def attached(server, client):
+    """Сессия S1 вкладки T1, прицепленная через этот клиент (так делает Chrome.new_tab/attach_tab): главный фрейм
+    вкладки — T1 (у вкладки Chrome id главного фрейма = targetId, зонд 26.09)."""
+    server.on["Target.attachToTarget"] = lambda f, ws: reply(ws, f, {"sessionId": "S1"})
+    client.call("Target.attachToTarget", {"targetId": "T1", "flatten": True})
+
+
+def events(server, client, *send):
+    """Отправить события (функции от ws) внутри одного вызова: клиент их прочтёт."""
+    server.on["Target.getTargets"] = lambda f, ws: ([s(ws) for s in send], reply(ws, f))
+    client.call("Target.getTargets")
+
+
+def test_requests_of_a_replaced_document_are_dropped_when_the_new_one_commits(server, client):
+    """Chrome не присылает loadingFinished/Failed запросам документа, который сменился (зонд ревью: fetch 8 с и уход
+    со страницы — запрос «в полёте» навсегда): ожидания упирались в предохранитель, Jev всегда видел «ещё грузится»."""
+    attached(server, client)
+    epoch = client.seq
+    events(
+        server,
+        client,
+        lambda ws: loaded(ws, "api", "Fetch", "L1"),
+        lambda ws: loaded(ws, "frame-api", "XHR", "LF", frame="F2"),  # iframe старого документа
+        lambda ws: loaded(ws, "L2", "Document", "L2"),  # клик увёл на новую страницу
+        lambda ws: loaded(ws, "late", "Fetch", "L1"),  # старый документ ещё жив до commit
+    )
+    assert client.in_flight_since("S1", epoch) == 4  # пока новый документ не пришёл, старый живёт — ждём всё
+    events(server, client, lambda ws: finished(ws, "L2"))  # новый документ загружен (commit был)
+    assert client.network["S1"].pending == {} and client.in_flight_since("S1", epoch) == 0
+    events(server, client, lambda ws: loaded(ws, "after", "Fetch", "L1"))  # запрос сменившегося документа — не в счёт
+    assert client.network["S1"].pending == {}
+    events(server, client, lambda ws: loaded(ws, "img", "Image", "L2"), lambda ws: finished(ws, "api"))
+    assert list(client.network["S1"].pending) == ["img"]  # запросы нового документа — как обычно
+
+
+def test_subresource_of_the_new_document_commits_it_and_iframe_navigation_does_not(server, client):
+    attached(server, client)
+    events(
+        server,
+        client,
+        lambda ws: loaded(ws, "api", "Fetch", "L1"),
+        lambda ws: loaded(ws, "ad", "Document", "LA", frame="F2"),  # iframe сменил документ — не вкладка
+    )
+    assert sorted(client.network["S1"].pending) == ["ad", "api"]
+    events(
+        server,
+        client,
+        lambda ws: loaded(ws, "L2", "Document", "L2"),
+        lambda ws: loaded(ws, "css", "Stylesheet", "L2"),
+    )
+    assert sorted(client.network["S1"].pending) == ["L2", "css"]  # подресурс нового документа: commit уже был
+
+
+@pytest.mark.parametrize("ending", ["Network.loadingFailed"], ids=["download-or-204"])
+def test_navigation_that_never_commits_keeps_the_old_document_requests(server, client, ending):
+    """Ссылка на файл (Content-Disposition: attachment) и ответ 204: навигация кончается loadingFailed (зонд 26.09),
+    старый документ жив — его запросы остаются в учёте и завершатся сами."""
+    attached(server, client)
+    events(server, client, lambda ws: loaded(ws, "api", "Fetch", "L1"), lambda ws: loaded(ws, "L2", "Document", "L2"))
+    events(server, client, lambda ws: finished(ws, "L2", ending), lambda ws: loaded(ws, "more", "XHR", "L1"))
+    assert sorted(client.network["S1"].pending) == ["api", "more"]
+    events(server, client, lambda ws: finished(ws, "api"), lambda ws: finished(ws, "more"))
+    assert client.network["S1"].pending == {}
+
+
+def test_without_a_known_main_frame_nothing_is_dropped(server, client):
+    events(server, client, lambda ws: loaded(ws, "api", "Fetch", "L1"), lambda ws: loaded(ws, "L2", "Document", "L2"))
+    events(server, client, lambda ws: finished(ws, "L2"))
+    assert list(client.network["S1"].pending) == ["api"]  # сессия не через этот клиент: главный фрейм неизвестен

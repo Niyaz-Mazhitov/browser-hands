@@ -67,6 +67,11 @@ class RunConfig:
     new_tab: bool = False  # attach: всегда своя вкладка, даже если сайт открыт у пользователя
 
 
+# Кадр страницы при 60 Гц — запас к p99 «действие → последнее изменение страницы» в расчёте `wait_fuse_s`
+# (scripts/calibrate.py, scripts/sweep_report.py): изменение из отчёта страницы ложится в DOM к следующему кадру.
+FRAME_S = 1 / 60
+
+
 @dataclass(frozen=True, slots=True)
 class Thresholds:
     """Пороги модели и предохранитель одного ожидания (docs/plan-waits.md §4.1). Меняет их расчёт

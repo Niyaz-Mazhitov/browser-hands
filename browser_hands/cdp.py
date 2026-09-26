@@ -3,7 +3,8 @@
 Один вызов за раз (лок вокруг send/recv; ожидание лока входит в таймаут вызова), без собственных потоков-читателей.
 Сообщения без `id` (события) складываются в ограниченную очередь; отсоединение или падение нашей вкладки помечает её
 сессию мёртвой (`TabGone`). События `Network.*` в очередь не идут: по ним ведётся учёт незавершённых запросов сессии
-(`pending_since`, docs/plan-waits.md §5.1); читаются они внутри `call` и насосом `wait_events`.
+(`pending_since`, docs/plan-waits.md §5.1); читаются они внутри `call` и насосом `wait_events`. Запросы документа,
+который сменила навигация главного фрейма, из учёта снимаются: Chrome не присылает им завершения.
 """
 
 from __future__ import annotations
@@ -64,13 +65,27 @@ class TabGone(CDPException):
 @dataclass
 class NetworkState:
     """Сеть одной сессии: незавершённые запросы (requestId → `seq` события `requestWillBeSent`), фоновые среди них
-    (пережили предохранитель ожидания) и счётчики завершений и WS-кадров — подсказки «что-то пришло» для ожидания
-    изменения."""
+    (пережили предохранитель ожидания), счётчик завершений и эпохи начала последних завершённых — «пришёл ответ на
+    действие» для ожидания изменения (`finished_since`). WS-кадры не считаются: у WhatsApp они идут постоянно.
+
+    Смена документа главного фрейма: Chrome не присылает loadingFinished/Failed запросам документа, который сменился
+    (зонд 26.09: fetch и уход со страницы — запрос «в полёте» навсегда). Поэтому у запроса помнится `loaderId`
+    документа; навигация главного фрейма (запрос `Document` его фрейма) начинает новое поколение, а когда новый документ
+    точно на месте (его запрос `Document` завершён или пошёл его подресурс), запросы прежних документов снимаются, и их
+    поздние запросы не считаются. Навигация без commit (загрузка файла, 204 — `loadingFailed` запроса документа) —
+    прежний документ жив, его запросы остаются."""
 
     pending: dict[str, int] = field(default_factory=dict)
     background: set[str] = field(default_factory=set)
     finished: int = 0
-    ws_frames: int = 0
+    # `seq` начала последних завершённых запросов (по порядку завершения); граница памяти — как у `pending`
+    finished_starts: deque[int] = field(default_factory=lambda: deque(maxlen=NETWORK_PENDING_MAX))
+    loaders: dict[str, str] = field(default_factory=dict)  # requestId → loaderId (у незавершённых, где он есть)
+    documents: set[str] = field(default_factory=set)  # loaderId документов нынешнего поколения (главный и его фреймы)
+    leaving: set[str] = field(default_factory=set)  # loaderId документов, которые сменяет идущая навигация
+    gone: set[str] = field(default_factory=set)  # loaderId сменившихся документов: их запросы не считаем
+    navigation: str | None = None  # requestId запроса Document главного фрейма, пока он не завершён
+    navigation_loader: str | None = None
 
 
 class CDPClient:
@@ -285,10 +300,19 @@ class CDPClient:
         state.background.update(state.pending)
         return len(state.pending)
 
-    def network_marks(self, session_id: str) -> tuple[int, int]:
-        """(завершений запросов, WS-кадров) сессии с начала учёта — сравнить «до» и «после»."""
+    def finished_mark(self, session_id: str) -> int:
+        """Завершений запросов сессии с начала учёта — отметка «до» для `finished_since`."""
         state = self.network.get(session_id)
-        return (0, 0) if state is None else (state.finished, state.ws_frames)
+        return 0 if state is None else state.finished
+
+    def finished_since(self, session_id: str, mark: int, epoch: int) -> int:
+        """Сколько запросов, начатых после эпохи `epoch` (фоновых тоже), завершилось после отметки `mark`
+        (`finished_mark`): ответ на действие пришёл. Запросы страницы, начатые раньше, — не в счёт."""
+        state = self.network.get(session_id)
+        if state is None or state.finished <= mark:
+            return 0
+        recent = itertools.islice(reversed(state.finished_starts), state.finished - mark)
+        return sum(1 for start in recent if start > epoch)
 
     def forget_network(self, session_id: str) -> None:
         """Сеть сессии выключена или сессия отсоединена: учёт больше не нужен."""
@@ -299,33 +323,81 @@ class CDPClient:
             return
         state = self.network.setdefault(session_id, NetworkState())
         if method in {"Network.webSocketFrameReceived", "Network.webSocketFrameSent"}:
-            state.ws_frames += 1
-            return
+            return  # кадры соединения, а не запросы: ожиданий не держат и не будят
         rid = params.get("requestId")
         if not isinstance(rid, str):
             return
         if method == "Network.requestWillBeSent":
+            loader = params.get("loaderId") if isinstance(params.get("loaderId"), str) else ""
+            if loader in state.gone:
+                return  # запрос документа, который уже сменился: завершения Chrome не пришлёт
+            main = self._session_targets.get(session_id)  # у вкладки Chrome id главного фрейма = targetId
+            if params.get("type") == "Document" and loader and main and params.get("frameId") == main:
+                if loader != state.navigation_loader:
+                    self._navigation_started(state, rid, loader)
+            elif loader and loader == state.navigation_loader:
+                self._navigation_committed(state)  # подресурс нового документа: он уже на месте
             # Редирект приходит тем же requestId — это тот же запрос, эпоха прежняя.
             if params.get("type") in UNTRACKED_TYPES or rid in state.pending:
                 return
             state.pending[rid] = self.seq
+            if loader:
+                state.loaders[rid] = loader
+                if loader not in state.leaving:
+                    state.documents.add(loader)
             if len(state.pending) > NETWORK_PENDING_MAX:
                 oldest = next(iter(state.pending))
                 del state.pending[oldest]
                 state.background.discard(oldest)
+                state.loaders.pop(oldest, None)
                 log.debug("CDP: сеть %s — больше %d запросов в полёте, забыт старший", session_id, NETWORK_PENDING_MAX)
         elif method in FINISHED:
             self._finish_request(state, rid)
+            if rid == state.navigation:
+                if method == "Network.loadingFailed":
+                    self._navigation_aborted(state)
+                else:
+                    self._navigation_committed(state)
         elif method == "Network.responseReceived":
             response = params.get("response") or {}
             if params.get("type") in UNTRACKED_TYPES or response.get("mimeType") == STREAM_MIME:
                 self._finish_request(state, rid)  # поток событий: ответ не кончится, страница его не «ждёт»
 
     @staticmethod
+    def _navigation_started(state: NetworkState, rid: str, loader: str) -> None:
+        """Запрос `Document` главного фрейма: документы нынешнего поколения уходят (до commit они ещё живы)."""
+        state.leaving |= state.documents
+        state.leaving.discard(loader)
+        state.documents = {loader}
+        state.navigation, state.navigation_loader = rid, loader
+
+    @staticmethod
+    def _navigation_committed(state: NetworkState) -> None:
+        """Новый документ на месте: запросы ушедших документов снять (завершения не будет), их поздние — не считать."""
+        orphans = [r for r, loader in state.loaders.items() if loader in state.leaving]
+        for r in orphans:
+            state.pending.pop(r, None)
+            state.background.discard(r)
+            state.loaders.pop(r, None)
+        if orphans:
+            log.debug("CDP: смена документа — сняты запросы прежнего: %d", len(orphans))
+        state.gone = state.leaving
+        state.leaving = set()
+        state.navigation = state.navigation_loader = None
+
+    @staticmethod
+    def _navigation_aborted(state: NetworkState) -> None:
+        """Навигация без commit (загрузка файла, 204): прежний документ жив, его запросы — снова его."""
+        state.documents |= state.leaving
+        state.leaving = set()
+        state.navigation = state.navigation_loader = None
+
+    @staticmethod
     def _finish_request(state: NetworkState, rid: str) -> None:
         if rid in state.pending:
-            del state.pending[rid]
+            state.finished_starts.append(state.pending.pop(rid))
             state.background.discard(rid)
+            state.loaders.pop(rid, None)
             state.finished += 1
 
     def _on_event(self, message: dict[str, Any]) -> None:

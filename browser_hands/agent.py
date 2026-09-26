@@ -19,10 +19,11 @@ BLOCKED переспрашивается один раз после ожидан
 Сценарий (`steps`, docs/plan-scenarios.md §4.2): Jev ведёт текущий шаг и в том же запросе отвечает «шаг выполнен?»
 (`step_done`). Шаг закрыт — P(yes) ≥ `step_done_min_p` или DONE операции с P(yes) ≥ `done_step_done_min_p` на свежей
 странице (действие этого решения не исполняется: выбиралось под старый шаг) или TYPE_TEXT текста шага, после которого
-поле показывает этот текст (`matches`: начало значения или, по буквам и цифрам, всё значение; не видно — ещё одно
-наблюдение после изменения страницы; пропал — пометка в истории и новое решение Jev). Текст шага, закрытого кодом, —
-инвариант (docs/plan-waits.md §6.1): перед каждым решением (кроме подтверждения шага) и перед `done` одним
-`Tab.field_values` проверяется, что он ещё в поле; пропал — откат к этому шагу (решение отброшено). Инвариант снимают
+поле показывает этот текст (`matches`: начало значения или, по буквам и цифрам, всё значение, без учёта регистра; не
+видно — ещё одно наблюдение после изменения страницы; пропал — пометка в истории и новое решение Jev). Текст шага,
+закрытого кодом, — инвариант (docs/plan-waits.md §6.1): перед каждым решением (кроме подтверждения шага) и перед `done`
+одним `Tab.field_values` проверяется, что поле ещё не пусто (`kept`: другое непустое значение — сайт отформатировал
+текст); пусто или поля нет — откат к этому шагу (решение отброшено). Инвариант снимают
 подтверждение Jev более позднего шага и исполненный клик не по полю (текст использован: Send очистил поле). Пропаж
 текста шага — не больше `RETYPE_LIMIT` (сразу после ввода и позже — один счёт), дальше `blocked`. DONE без такого
 P(yes) — режим проверки: ожидание изменения, свежий снимок и вопрос только с DONE, WAIT и BLOCKED; снова DONE без
@@ -81,9 +82,6 @@ NO_PROGRESS_STEPS = 3
 SCREENSHOT_TIMEOUT_S = 5.0
 CANCELLED = "cancelled"
 EMPTY_PAGE_WAIT_S = 25.0  # потолок ожидания элементов для действия до первого вызова Jev (не дольше дедлайна)
-# То же после первого вызова: страница после действия уже дождалась готовности, пустой экран посреди работы (форма
-# после Submit — «Thanks» без элементов) — дальше решает Jev. Ждём событиями (`Tab.await_change`), не опросом.
-EMPTY_PAGE_WAIT_LATER_S = 1.0
 INTERACTIVE_KINDS = frozenset({"fill", "click", "select"})
 TEXT_ATTEMPTS = 2  # текст переспрашивается один раз (невалидный ответ, таймаут): до ввода, ничего не напечатано
 # Пороги модели — `Agent.thresholds` (`config.Thresholds`); константы ниже — алиасы значений по умолчанию (тесты, docs).
@@ -122,21 +120,29 @@ def interactive(page: dict[str, Any]) -> bool:
 
 def _field_key(action: dict[str, Any]) -> str:
     """Ключ поля без роли: подпись (имя, `<label>`, title, placeholder). У поля без имени подпись в снимке — сама роль
-    (`name || role`): ключ пустой, такие поля сравниваются между собой при любой роли."""
+    (`name || role`): ключ пустой. Такие поля ключом не различить (клетки кода из SMS): узнаём по узлу, а без узла —
+    только единственное поле без имени на странице (`_same_field`, `typed_fields`)."""
     label = str(action.get("label") or "")
     return "" if label == action.get("role") else label
+
+
+def _nameless(page: dict[str, Any]) -> list[Any]:
+    """Узлы полей ввода (`fill`) без доступного имени на снимке."""
+    return [a.get("node") for a in page.get("actions") or () if a.get("kind") == "fill" and not _field_key(a)]
 
 
 def typed_fields(page: dict[str, Any], action: dict[str, Any]) -> list[dict[str, Any]]:
     """Поле, куда печатали, на новом снимке: тот же узел, если он ещё есть; иначе — поля `fill` с тем же ключом
     (`_field_key`), роль не сравнивается: сайт перерисовал поле новым узлом, Википедия — ещё и с другой ролью
-    (searchbox → combobox). Текст сверяет вызывающий (`matches`). Пусто — поля не видно."""
+    (searchbox → combobox). Поле без имени без своего узла — только если оно на странице одно. Текст сверяет
+    вызывающий (`matches`). Пусто — поля не видно."""
     fields = [a for a in page.get("actions") or () if a.get("kind") in {"fill", "click"} and "node" in a]
     same = [a for a in fields if a["node"] == action.get("node")]
     if same:
         return same
     key = _field_key(action)
-    return [a for a in fields if a["kind"] == "fill" and _field_key(a) == key]
+    found = [a for a in fields if a["kind"] == "fill" and _field_key(a) == key]
+    return found if key or len(found) == 1 else []
 
 
 def _spaces(text: str) -> str:
@@ -149,16 +155,28 @@ def _alnum(text: str) -> str:
 
 
 def matches(value: Any, text: str) -> bool:
-    """Поле показывает напечатанный текст (docs/plan-waits.md §0.3): значение начинается с текста, пробелы нормализованы
-    (`selectAll` + `insertText` заменяет всё, inline-подсказки дописывают хвост). Запасное — буквы и цифры значения
-    равны буквам и цифрам текста (маска `+7 (777) 123-45-67`, эмодзи картинкой `<img alt>` — в `innerText` его нет),
-    если в тексте они есть. Текст в середине чужого значения — не совпадение."""
+    """Поле показывает напечатанный текст (docs/plan-waits.md §0.3) — по нему код закрывает шаг с текстом: значение
+    начинается с текста, пробелы нормализованы, регистр не важен (`selectAll` + `insertText` заменяет всё,
+    inline-подсказки дописывают хвост, поле может писать заглавными). Запасное — буквы и цифры значения равны буквам и
+    цифрам текста (маска `+7 (777) 123-45-67`, эмодзи картинкой `<img alt>` — в `innerText` его нет), если в тексте они
+    есть. Текст в середине чужого значения — не совпадение.
+
+    Строго намеренно: совпадение закрывает шаг без Jev, а ложное закрытие пропускает шаг (Send с чужим текстом).
+    Поле, которое меняет цифры при вводе (8… → +7 …), код не узнаёт — пометка, шаг закрывает `step_done` Jev."""
     if not isinstance(value, str):
         return False
-    if _spaces(value).startswith(_spaces(text)):
+    if _spaces(value).casefold().startswith(_spaces(text).casefold()):
         return True
-    bare = _alnum(text)
-    return bool(bare) and _alnum(value) == bare
+    bare = _alnum(text).casefold()
+    return bool(bare) and _alnum(value).casefold() == bare
+
+
+def kept(value: Any) -> bool:
+    """Инвариант напечатанного текста держится: поле есть и не пусто (docs/core-notes.md, «После ревью ожиданий»).
+    Непустое изменённое значение — нормализация сайтом (1000 → 1,000.00, abc → ABC, 2.1.2024 → 02.01.2024, маска
+    телефона), не пропажа; пропал — только когда поле пусто (пробелы и символы нулевой ширины не в счёт) или поля нет
+    (пересоздано без текста, как у WhatsApp)."""
+    return isinstance(value, str) and any(not c.isspace() and unicodedata.category(c) != "Cf" for c in value)
 
 
 def _count(value: Any) -> int:
@@ -166,9 +184,21 @@ def _count(value: Any) -> int:
     return value if type(value) is int and value > 0 else 0
 
 
-def _same_field(typed: Invariant, action: dict[str, Any]) -> bool:
-    """Поле действия — то, куда печатали `typed`: тот же узел или тот же ключ (`_field_key`; узел мог смениться)."""
-    return typed.node == action.get("node") or typed.label == _field_key(action)
+def _same_field(typed: Invariant, action: dict[str, Any], page: dict[str, Any]) -> bool:
+    """Поле действия (`fill` на снимке `page`) — то, куда печатали `typed`: тот же узел или тот же ключ (`_field_key`;
+    узел мог смениться). Поле без имени (ключ "") — только тот же узел, а если узла `typed` на снимке нет (поле
+    пересоздано) — когда поле действия — единственное поле без имени."""
+    if typed.node is not None and typed.node == action.get("node"):
+        return True
+    if typed.label:
+        return typed.label == _field_key(action)
+    nameless = _nameless(page)
+    return not _field_key(action) and typed.node not in nameless and nameless == [action.get("node")]
+
+
+def _same_entry(a: Invariant, b: Invariant) -> bool:
+    """Два запомненных ввода — в одно поле: тот же узел или тот же непустой ключ (поля без имени — только по узлу)."""
+    return a.node == b.node or (bool(a.label) and a.label == b.label)
 
 
 def wait_fields(result: Any) -> tuple[str | None, int]:
@@ -482,16 +512,24 @@ class Agent(AgentLike):
 
     def _await_interactive(self) -> None:
         """Пока в снимке нет элементов для действия (экран загрузки, логотип), Jev не зовём: ждём следующего изменения
-        страницы (`Tab.await_change`, не опрос) и переснимаем, не дольше потолка и дедлайна; отмена — сразу. Потолок —
-        `EMPTY_PAGE_WAIT_S` до первого вызова Jev в прогоне, потом `EMPTY_PAGE_WAIT_LATER_S` (прокрутили за контролы,
-        короткая перерисовка). Шаги и `model_calls` не растут, время — `wait_ms`. Потолок вышел — Jev решает по пустой
-        странице (DONE/WAIT законны)."""
+        страницы (`Tab.await_change`, не опрос) и переснимаем, не дольше `EMPTY_PAGE_WAIT_S` и дедлайна; отмена — сразу.
+        После первого вызова Jev (прокрутили за контролы, форма после Submit — «Thanks» без элементов) страница после
+        действия уже дождалась готовности: одно ожидание следующего изменения (событие; нет — предохранитель) и свежий
+        снимок, без потолка по времени. Шаги и `model_calls` не растут, время — `wait_ms`. Элементов нет и тогда — Jev
+        решает по пустой странице (DONE/WAIT законны)."""
         tab = self._require_tab()
         page = self._page
         if page is None or interactive(page):
             self._empty_since = None
             return
-        ceiling = EMPTY_PAGE_WAIT_S if self._jev_calls == 0 else EMPTY_PAGE_WAIT_LATER_S
+        if self._jev_calls:
+            self._check_cancel()
+            self._remaining()
+            log.debug("Нет элементов для действия посреди работы — жду изменения страницы")
+            tab.await_change()
+            self._page = tab.observe()  # StalePage — наружу, в _tick: переснимет
+            return
+        ceiling = EMPTY_PAGE_WAIT_S
         if self._empty_since is None:
             self._empty_since = time.monotonic()
             log.info("Нет элементов для действия, жду до %g с (%s)", ceiling, url_host(page.get("url") or self.url))
@@ -546,13 +584,14 @@ class Agent(AgentLike):
         self._scenario_no += 1
 
     def _invariants_hold(self, invariants: list[Invariant]) -> bool:
-        """Напечатанные тексты ещё в полях: один `Tab.field_values` (по узлу, иначе по подписи), `matches`. Пропал —
-        сценарий: откат к самому раннему такому шагу (`_roll_back`); режим цели: ввод отброшен (`_roll_back_typed`);
-        итог False. Документ сменяется — `StalePage` наружу."""
+        """Напечатанные тексты ещё в полях: один `Tab.field_values` (по узлу, иначе по подписи), `kept` — поле есть и
+        не пусто (другое непустое значение — сайт его отформатировал). Пропал — сценарий: откат к самому раннему такому
+        шагу (`_roll_back`); режим цели: ввод отброшен (`_roll_back_typed`); итог False. Документ сменяется —
+        `StalePage` наружу."""
         values = self._require_tab().field_values([{"node": i.node, "label": i.label} for i in invariants])
         if not isinstance(values, list) or len(values) != len(invariants):
             raise StalePage("Document is navigating")
-        broken = [i for i, value in zip(invariants, values, strict=True) if not matches(value, i.text)]
+        broken = [i for i, value in zip(invariants, values, strict=True) if not kept(value)]
         if not broken:
             return True
         if self.scenario is None:
@@ -579,7 +618,7 @@ class Agent(AgentLike):
     def _typed_vanish(self, typed: Invariant) -> int:
         """Режим цели: текст `typed` пропал из поля (сразу после ввода или позже). Запомнить его для повторного ввода в
         то же поле; пропаж того же текста в том же поле больше `RETYPE_LIMIT` — `blocked`. Итог — сколько раз пропал."""
-        self._retype = [r for r in self._retype if r.node != typed.node and r.label != typed.label] + [typed]
+        self._retype = [r for r in self._retype if not _same_entry(r, typed)] + [typed]
         key = (typed.label, typed.text)
         self._typed_vanished[key] = count = self._typed_vanished.get(key, 0) + 1
         if count > RETYPE_LIMIT:
@@ -600,9 +639,9 @@ class Agent(AgentLike):
         self._history[-1]["note"] = TEXT_VANISHED
         self._typed_vanish(Invariant(step.index, action.get("node"), _field_key(action), text))
 
-    def _retyped(self, action: dict[str, Any]) -> str | None:
+    def _retyped(self, action: dict[str, Any], page: dict[str, Any]) -> str | None:
         """Режим цели: текст, пропавший из этого поля (`_typed_vanish`), — ввести снова его же, без текстовой модели."""
-        return next((r.text for r in reversed(self._retype) if _same_field(r, action)), None)
+        return next((r.text for r in reversed(self._retype) if _same_field(r, action, page)), None)
 
     def _anchor(self) -> int | None:
         """Эпоха действия, с которого считаются «запросы действий»: последнего действия (или ожидания), после которого
@@ -965,7 +1004,7 @@ class Agent(AgentLike):
             elif current is not None and not self.goal:
                 # Текста нет ни в шаге, ни в цели: выдумывать нечего — стоп, без текстовой модели и нового вопроса Jev.
                 raise _Stop("blocked", f"{self._step_name()}: no text given for typing")
-            elif current is None and (retype := self._retyped(action)) is not None:
+            elif current is None and (retype := self._retyped(action, page)) is not None:
                 text = retype  # режим цели: текст пропал из этого поля — тот же, без текстовой модели
             else:
                 # Сценарий: история без напечатанных текстов — тексты шагов текстовой модели не уходят.
@@ -985,7 +1024,7 @@ class Agent(AgentLike):
             tab.act(action, page, text=text)
         self._pending_text = None
         if action["kind"] == "fill":
-            self._retype = [r for r in self._retype if not _same_field(r, action)]  # ввели снова — забыть
+            self._retype = [r for r in self._retype if not _same_field(r, action, page)]  # ввели снова — забыть
         if self._invariants and action["kind"] == "click" and not _is_field(page, action):
             # Клик не по полю использует напечатанное (Send, строка чата, Submit): дальше поле может опустеть законно.
             log.debug(
@@ -995,9 +1034,7 @@ class Agent(AgentLike):
             self._typed_entries.clear()
         elif self._invariants and action["kind"] == "fill":
             # Ввод в то же поле заменяет прежний текст (selectAll + insertText) — так задумано сценарием.
-            self._invariants = [
-                i for i in self._invariants if i.node != action.get("node") and i.label != action.get("label")
-            ]
+            self._invariants = [i for i in self._invariants if not _same_field(i, action, page)]
         # Исполнение записано до наблюдения: устаревший снимок после действия не сотрёт его.
         self._history.append(
             {

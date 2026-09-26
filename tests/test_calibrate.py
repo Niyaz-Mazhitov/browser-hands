@@ -26,6 +26,13 @@ def load():
 
 cal = load()
 
+
+def test_frame_margin_comes_from_config():
+    from browser_hands import config
+
+    assert cal.FRAME_S is config.FRAME_S
+
+
 CHAT, MESSAGE = "Рабочий", "привет"
 SCENARIO = [
     {"do": "Type the chat name", "text": CHAT},

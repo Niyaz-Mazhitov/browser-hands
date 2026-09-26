@@ -18,7 +18,9 @@ from browser_hands.browser import (
     MARKER,
     MEASURE,
     READ_STATE,
+    READY,
     RESOLVE_TARGET,
+    WAIT_DEADLINE_MARGIN_S,
     StalePage,
     fingerprint,
 )
@@ -822,6 +824,33 @@ def test_user_tab_end_to_end_on_fake_chrome_never_closes_navigates_or_resizes(mo
     assert len(waits) == 1
 
 
+def test_page_busy_past_the_wait_fuse_after_a_click_is_a_fuse_not_a_failed_run(monkeypatch, tmp_path):
+    """Долгая задача страницы после клика: ответ на промис готовности приходит позже предохранителя и его запаса. Клик
+    исполнен один раз, шаг — `fuse`, прогон продолжается (было: CDPTimeout → `failed` → вызывающий повторяет browse)."""
+    fuse = 0.2
+    monkeypatch.setattr(loop, "choose", scripted(decision("e3", "CLICK"), DONE))
+    with FakeCDPServer() as server:
+        chrome = fake_user_chrome(server, tmp_path)
+        page_js = server.on["Runtime.evaluate"]
+
+        def evaluate(frame, ws):
+            if not frame["params"]["expression"].startswith(READY):
+                return page_js(frame, ws)
+            time.sleep(fuse + WAIT_DEADLINE_MARGIN_S + 0.3)  # главный поток занят: промис ответил позже
+            value = {"reason": "fuse", "ms": round(fuse * 1000), "mutations": 12, "frames": 12}
+            reply(ws, frame, {"result": {"type": "object", "value": value}})
+
+        server.on["Runtime.evaluate"] = evaluate
+        clients = ModelClients(ModelConfig(jev_api_key="test", text_api_key="test"), http=Mock())
+        run = RunConfig(timeout_s=30.0)
+        limits = Thresholds(wait_fuse_s=fuse)
+        result = Agent(chrome, clients, "https://web.whatsapp.com", "Open the chat", run, thresholds=limits).run()
+        chrome.close()
+    assert result.status == "done", result.error
+    assert len(server.sent("Input.dispatchMouseEvent")) == 2  # один клик: нажатие и отпускание
+    assert [(s.target, s.wait_reason) for s in result.steps] == [("Go", "fuse")]
+
+
 def run_on_fake_chrome(monkeypatch, tmp_path, url, prepare, *decisions):
     """Прогон Agent в attach на фейковом Chrome (`fake_user_chrome`); `prepare(server)` — вкладки и метки."""
     choose = scripted(*decisions)
@@ -969,7 +998,6 @@ def test_no_interactive_elements_delays_the_model_until_they_appear(monkeypatch,
     assert len(seen) == 1 and seen[0][1] == []
     assert any(a["kind"] == "click" for a in seen[0][0]["actions"])  # Jev увидел уже готовую страницу
     assert tab.await_change.call_count == 3 and all(c.args == () for c in tab.await_change.call_args_list)
-    tab.pause.assert_not_called()  # ждём изменения страницы, а не опрашиваем по таймеру
     waiting = [r.getMessage() for r in caplog.records if "Нет элементов" in r.getMessage()]
     # одна строка на ожидание (запись может прийти дважды: handler на логгере и корень), только хост, без токена
     assert set(waiting) == {"Нет элементов для действия, жду до 25 с (example.test)"}
@@ -1036,11 +1064,15 @@ def test_empty_page_wait_stops_on_cancel(monkeypatch, owned):
         never_closed(tab)
 
 
-def test_empty_page_mid_run_waits_only_briefly_then_asks_the_model(monkeypatch):
+@pytest.mark.parametrize("step_s", [0.25, 1.5], ids=["change-soon", "fuse"])
+def test_empty_page_mid_run_waits_for_one_change_then_asks_the_model(monkeypatch, step_s):
+    """После первого вызова Jev (форма после Submit — «Thanks» без элементов, прокрутили за контролы) страница уже
+    дождалась готовности после действия: одно ожидание следующего изменения (событие или предохранитель), потом решает
+    Jev. Потолка по времени нет (было `EMPTY_PAGE_WAIT_LATER_S` = 1 с — число на глаз)."""
     tab = make_tab()
     pages = [page(), empty_page("middle of a long article, no controls on screen")]
     tab.observe.side_effect = lambda *_a, **_k: pages.pop(0) if len(pages) > 1 else pages[0]
-    clock = fake_clock(monkeypatch, tab, step_s=0.25)
+    clock = fake_clock(monkeypatch, tab, step_s=step_s)
     asked = []
 
     def choose(*_a, **_k):
@@ -1050,10 +1082,9 @@ def test_empty_page_mid_run_waits_only_briefly_then_asks_the_model(monkeypatch):
     monkeypatch.setattr(loop, "choose", Mock(side_effect=choose))
     result = make_agent(tab, timeout_s=90).run()
     assert result.status == "done" and result.model_calls == 2
-    assert loop.EMPTY_PAGE_WAIT_LATER_S == 1.0  # после действия страница уже успокоилась: форма после Submit — не ждать
-    # не 25 с: после первого вызова Jev — 1 с (ожидание по событиям; каждое здесь — 0,25 «с»); ожидание после клика
-    # (await_ready) часы не двигает
-    assert tab.await_change.call_count == 4 and asked[1] - asked[0] == 1.0
+    assert not hasattr(loop, "EMPTY_PAGE_WAIT_LATER_S")
+    # одно ожидание изменения; ожидание после клика (await_ready) часы не двигает
+    assert tab.await_change.call_count == 1 and asked[1] - asked[0] == step_s
 
 
 def test_empty_page_mid_run_wait_respects_the_deadline(monkeypatch):
@@ -1063,8 +1094,8 @@ def test_empty_page_mid_run_wait_respects_the_deadline(monkeypatch):
     fake_clock(monkeypatch, tab, step_s=0.25)
     choose = scripted(decision("e3", "CLICK"))
     monkeypatch.setattr(loop, "choose", choose)
-    result = make_agent(tab, timeout_s=0.5).run()  # дедлайн раньше потолка 1 с
-    assert result.status == "timeout" and choose.call_count == 1 and tab.await_change.call_count == 2
+    result = make_agent(tab, timeout_s=0.2).run()  # дедлайн вышел во время ожидания изменения
+    assert result.status == "timeout" and choose.call_count == 1 and tab.await_change.call_count == 1
 
 
 def test_second_chance_end_to_end_on_fake_chrome_waits_once_then_reads_the_page(monkeypatch, tmp_path):
@@ -2382,8 +2413,24 @@ def test_text_seen_only_after_the_next_page_change_closes_the_step(monkeypatch, 
         ("+7 (777) 123-45-67 доб. 9", "77771234567", False),  # запасное — равенство, не префикс
         ("", CHAT, False),
         (None, CHAT, False),
+        ("ABC", "abc", True),  # регистр — не содержимое
+        ("John Smith", "john", True),
     ],
-    ids=["phone", "card", "date", "emoji-img", "spaces", "tail", "middle", "part", "mask-extra", "empty", "none"],
+    ids=[
+        "phone",
+        "card",
+        "date",
+        "emoji-img",
+        "spaces",
+        "tail",
+        "middle",
+        "part",
+        "mask-extra",
+        "empty",
+        "none",
+        "upper",
+        "capital",
+    ],
 )
 def test_field_value_matches_typed_text_by_prefix_or_by_letters_and_digits(value, text, shown):
     assert loop.matches(value, text) is shown
@@ -2648,3 +2695,225 @@ def test_goal_text_missing_right_after_typing_is_noted_retyped_with_the_same_tex
     assert result.status == "blocked" and "does not stay in the field" in result.error
     assert [s.text for s in result.steps] == ["hello"] * 3 and helper.call_count == 1
     assert seen[1] == [("fill", "hello")] and agent._history[0]["note"] == VANISHED  # Jev видит пометку
+
+
+# --- поле, которое форматирует значение (docs/core-notes.md, «После ревью ожиданий») ---------------------------------
+
+FORMATTED = [
+    ("1000", "1,000.00"),  # сумма при потере фокуса
+    ("abc", "ABC"),  # верхний регистр
+    ("2.1.2024", "02.01.2024"),  # дата
+    ("john", "John"),  # заглавная буква
+    ("87771234567", "+7 (777) 123-45-67"),  # маска телефона
+]
+FORMATTED_IDS = ["amount", "upper", "date", "capital", "phone"]
+
+
+def form_tab(typed_value, formatted, *, when="blur"):
+    """Форма: поле суммы (узел 10), примечание (30), Submit (40). Сайт переписывает значение суммы по-своему: `blur` —
+    при следующем действии не в это поле, `typing` — сразу при вводе."""
+    tab = make_tab()
+    typed = tab.typed
+    count = iter(range(1, 1000))
+
+    def form(*_a, **_k):
+        amount, note = typed.get(10, ""), typed.get(30, "")
+        state = {
+            "url": "https://shop.test/",
+            "title": "Pay",
+            "text": f"Pay {next(count)}",
+            "scroll": {"y": 0},
+            "actions": [
+                {"id": "e1", "kind": "fill", "label": "Amount", "role": "textbox", "value": amount, "node": 10},
+                {"id": "e4", "kind": "fill", "label": "Note", "role": "textbox", "value": note, "node": 30},
+                {"id": "e5", "kind": "click", "label": "Submit", "role": "button", "node": 40},
+            ],
+        }
+        state["fingerprint"] = fingerprint(state)
+        return state
+
+    act = tab.act.side_effect
+
+    def act_and_format(action, page_, text=None):
+        if when == "blur" and action["node"] != 10 and typed.get(10) == typed_value:
+            typed[10] = formatted  # поле суммы потеряло фокус
+        done = act(action, page_, text=text)
+        if when == "typing" and action["node"] == 10:
+            typed[10] = formatted
+        return done
+
+    tab.act.side_effect = act_and_format
+    tab.observe.side_effect = form
+    return tab
+
+
+FORM_PLAN = {1: decision("e1", "TYPE_TEXT", step_done=0.0), 2: decision("e4", "TYPE_TEXT", step_done=0.0)}
+
+
+def by_step(plan, last):
+    """choose: решение по номеру текущего шага; на последнем — по очереди из `last`."""
+    queue = list(last)
+    return Mock(side_effect=lambda *_a, **k: plan[k["step"].number] if k["step"].number in plan else queue.pop(0))
+
+
+@pytest.mark.parametrize(("typed_value", "formatted"), FORMATTED, ids=FORMATTED_IDS)
+def test_field_that_formats_its_value_keeps_the_scenario_going(monkeypatch, typed_value, formatted):
+    """Ревью: 1000 → 1,000.00 при потере фокуса давало «текст шага 1 пропал» → откат → повторный ввод по кругу →
+    blocked. Непустое изменённое значение — нормализация сайтом; пропал — только пустое поле или поля нет."""
+    tab = form_tab(typed_value, formatted)
+    steps = [ScenarioStep("Type the amount", typed_value), ScenarioStep("Type the note", "hi"), ScenarioStep("Pay")]
+    agent = make_agent(tab, steps=steps, goal="")
+    choose = by_step(FORM_PLAN, [decision("e5", "CLICK", step_done=0.0), CONFIRM])
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "done" and result.scenario_done == 3, result.error
+    assert labels(tab) == ["Amount", "Note", "Submit"]  # без повторного ввода, Submit — раз
+    assert not any("note" in h for h in agent._history)
+
+
+@pytest.mark.parametrize(("typed_value", "formatted"), FORMATTED, ids=FORMATTED_IDS)
+def test_goal_mode_field_that_formats_its_value_is_not_typed_again(monkeypatch, typed_value, formatted):
+    tab = form_tab(typed_value, formatted)
+    agent = make_agent(tab, goal="Pay")
+    texts = iter([typed_value, "hi"])
+    monkeypatch.setattr(loop, "field_text", Mock(side_effect=lambda *a, **k: (next(texts), TextHelper("t", 1))))
+    choose = scripted(decision("e1"), decision("e4"), decision("e5", "CLICK"), DONE)
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "done", result.error
+    assert labels(tab) == ["Amount", "Note", "Submit"]
+
+
+@pytest.mark.parametrize(("typed_value", "formatted"), FORMATTED[1:4:2], ids=["upper", "capital"])
+def test_case_changed_while_typing_still_closes_the_text_step_by_code(monkeypatch, typed_value, formatted):
+    """abc → ABC, john → John сразу при вводе: шаг закрывает код (регистр — не содержимое), без вопроса Jev."""
+    tab = form_tab(typed_value, formatted, when="typing")
+    steps = [ScenarioStep("Type the amount", typed_value), ScenarioStep("Pay")]
+    agent = make_agent(tab, steps=steps, goal="")
+    choose = by_step({1: FORM_PLAN[1]}, [decision("e5", "CLICK", step_done=0.0), CONFIRM])
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "done" and numbers(choose) == [1, 2, 2] and "note" not in agent._history[0]
+
+
+def test_mask_that_changes_digits_while_typing_is_left_to_jev_and_does_not_loop(monkeypatch):
+    """87771234567 → +7 (777) 123-45-67 сразу при вводе: по буквам и цифрам не совпадает — код шаг не закрывает
+    (строго: ложное закрытие пропустило бы шаг), пометка для Jev, а его «шаг выполнен» закрывает шаг без повтора."""
+    tab = form_tab("87771234567", "+7 (777) 123-45-67", when="typing")
+    steps = [ScenarioStep("Type the phone", "87771234567"), ScenarioStep("Pay")]
+    agent = make_agent(tab, steps=steps, goal="")
+    answers = [FORM_PLAN[1], decision("e5", "CLICK", step_done=0.9), decision("e5", "CLICK", step_done=0.0), CONFIRM]
+    choose = scripted(*answers)
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "done" and labels(tab) == ["Amount", "Submit"]
+    assert agent._history[0]["note"] == VANISHED  # Jev видит, что код текста не узнал
+
+
+@pytest.mark.parametrize("left", ["", "\n", " ​ "], ids=["empty", "newline", "zero-width"])
+def test_field_left_blank_by_a_re_render_still_rolls_back(monkeypatch, left):
+    """WhatsApp (стенд search-remount): поле пересоздано пустым — откат к шагу и повторный ввод, как раньше."""
+    tab = chat_tab()
+    remount = tab.remount
+
+    def blank():
+        remount()
+        tab.typed[30] = left
+
+    tab.remount = blank
+    agent = make_agent(tab, steps=CHAT_STEPS, goal="")
+    answers = [TYPE_CHAT, OPEN_CHAT, CONFIRM, TYPE_MSG, SEND, TYPE_MSG, SEND, CONFIRM]
+    choose = remounting(tab, answers, before={5})
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "done" and numbers(choose) == [1, 2, 2, 3, 4, 3, 4, 4]
+    assert labels(tab).count("Send") == 1 and labels(tab).count("Type a message") == 2
+
+
+# --- поля без подписи (docs/core-notes.md, «После ревью ожиданий») ----------------------------------------------------
+
+
+def otp_tab(*, drop_first=False):
+    """Код из SMS: два поля без доступного имени (подпись в снимке — роль, ключ поля ""), узлы 10 и 11, и Verify (40).
+    `drop_first` — первый ввод в поле 10 не держится (поле его не показывает)."""
+    tab = make_tab()
+    typed = tab.typed
+    count = iter(range(1, 1000))
+
+    def otp(*_a, **_k):
+        first, second = typed.get(10, ""), typed.get(11, "")
+        state = {
+            "url": "https://bank.test/otp",
+            "title": "Code",
+            "text": f"Enter the code {next(count)}",
+            "scroll": {"y": 0},
+            "actions": [
+                {"id": "e1", "kind": "fill", "label": "textbox", "role": "textbox", "value": first, "node": 10},
+                {"id": "e2", "kind": "fill", "label": "textbox", "role": "textbox", "value": second, "node": 11},
+                {"id": "e5", "kind": "click", "label": "Verify", "role": "button", "node": 40},
+            ],
+        }
+        state["fingerprint"] = fingerprint(state)
+        return state
+
+    act = tab.act.side_effect
+    dropped = []
+
+    def act_otp(action, page_, text=None):
+        if drop_first and action["node"] == 10 and not dropped:
+            dropped.append(text)
+            return {"executed": action["id"]}
+        return act(action, page_, text=text)
+
+    tab.act.side_effect = act_otp
+    tab.observe.side_effect = otp
+    return tab
+
+
+def test_text_lost_from_one_nameless_field_is_not_typed_into_another(monkeypatch):
+    """Ревью: `_same_field` по ключу "" совпадал с любым полем без имени — текст, пропавший из первой клетки кода, без
+    текстовой модели печатался во вторую."""
+    tab = otp_tab(drop_first=True)
+    agent = make_agent(tab, goal="Enter the code 12")
+    texts = iter(["1", "2"])
+    helper = Mock(side_effect=lambda *a, **k: (next(texts), TextHelper("t", 1)))
+    monkeypatch.setattr(loop, "field_text", helper)
+    monkeypatch.setattr(loop, "choose", scripted(decision("e1"), decision("e2"), DONE))
+    result = agent.run()
+    assert result.status == "done"
+    assert [(c.args[0]["id"], c.kwargs["text"]) for c in tab.act.call_args_list] == [("e1", "1"), ("e2", "2")]
+    assert helper.call_count == 2  # во вторую клетку — свой текст
+
+
+def test_typing_into_another_nameless_field_keeps_the_first_ones_text_checked(monkeypatch):
+    tab = otp_tab()
+    agent = make_agent(tab, goal="Enter the code 12")
+    texts = iter(["1", "2", "3"])
+    monkeypatch.setattr(loop, "field_text", Mock(side_effect=lambda *a, **k: (next(texts), TextHelper("t", 1))))
+    verify = decision("e5", "CLICK")
+    choose = Mock(side_effect=[decision("e1"), decision("e2"), verify, decision("e1"), verify, DONE])
+
+    def ask(*a, **k):
+        if choose.call_count == 2:  # после ввода во вторую клетку сайт очистил первую
+            tab.typed.pop(10)
+        return choose(*a, **k)
+
+    monkeypatch.setattr(loop, "choose", Mock(side_effect=ask))
+    result = agent.run()
+    assert result.status == "done"
+    assert [c.args[0]["id"] for c in tab.act.call_args_list] == ["e1", "e2", "e1", "e5"]  # клетка 1 — заново, до Verify
+    assert [c.kwargs["text"] for c in tab.act.call_args_list][:3] == ["1", "2", "1"]
+
+
+def test_nameless_field_is_found_again_only_when_it_is_the_only_one():
+    typed = loop.Invariant(1, 10, "", "1")
+    cell = {"kind": "fill", "label": "textbox", "role": "textbox"}  # без имени: подпись — роль
+    one = {"actions": [{**cell, "id": "e2", "value": "1", "node": 12}]}
+    two = {"actions": [*one["actions"], {**cell, "id": "e3", "node": 13}]}
+    kept_node = {"actions": [*one["actions"], {**cell, "id": "e1", "node": 10}]}
+    action = {"kind": "fill", "label": "textbox", "role": "textbox", "node": 10}
+    assert [f["node"] for f in loop.typed_fields(one, action)] == [12]  # пересоздано — единственное без имени
+    assert loop.typed_fields(two, action) == []  # два поля без имени: какое наше — не узнать
+    assert loop._same_field(typed, one["actions"][0], one)
+    assert not loop._same_field(typed, two["actions"][0], two)
+    assert not loop._same_field(typed, kept_node["actions"][0], kept_node)  # узел 10 на месте: 12 — другое поле

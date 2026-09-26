@@ -8,8 +8,9 @@ CDP-клиента. Модель никогда не выдаёт селекто
 пользователя (`owned=False`): её не закрываем, не переводим и не меняем ей размер; в конце только `release()`.
 
 Ожидания — по событиям и состояниям, не по времени (docs/plan-waits.md §2): `await_ready` (кадры без значимых мутаций,
-запросы вкладки после действия, readyState, шрифты, конечные анимации, aria-busy) и `await_change` (следующее изменение,
-затем `await_ready`). Единственный потолок одного ожидания — `min(остаток дедлайна − запас, fuse_s)`.
+запросы вкладки после действия, readyState после навигации, шрифты, конечные анимации, aria-busy) и `await_change`
+(следующее изменение, затем `await_ready`). Единственный потолок одного ожидания — `min(остаток дедлайна − запас,
+fuse_s)`.
 """
 
 from __future__ import annotations
@@ -59,7 +60,10 @@ MUTATION_ATTRIBUTES = (
 # не ловят нового класса работы, а только добавляют кадр задержки: всё, что дольше кадра (таймеры, сеть, переходы),
 # закрывают сигналы сети, анимаций и aria-busy, а не счёт кадров.
 QUIET_FRAMES = 2
-WAIT_DEADLINE_MARGIN_S = 0.5  # предохранитель ≤ остаток дедлайна минус это: ответ успевает до дедлайна CDP-вызова
+# Предохранитель ≤ остаток дедлайна минус это: промис страницы кончается раньше дедлайна прогона. Таймаут самого
+# CDP-вызова ожидания — остаток дедлайна (`_budget`): занятый главный поток (долгая задача) запускает промис позже, и
+# ответ приходит позже предохранителя. Нет ответа и тогда — исход ожидания `fuse`, не ошибка: действие уже исполнено.
+WAIT_DEADLINE_MARGIN_S = 0.5
 # Сеть (учёт запросов вкладки, §2 п. 2) во вкладке пользователя — только после замера WhatsApp (§0.2, §8): поток
 # WS-кадров и буфер ответов Chrome в чужой вкладке. До него — сеть только в своей вкладке (`owned`), у пользователя —
 # DOM-сигналы (кадры, readyState, шрифты, анимации, aria-busy).
@@ -88,12 +92,12 @@ _SIGNIFICANT = """
 """
 
 # Только чтение; выполняется после того, как действие записано, даже если его прерывает навигация (§2 п. 1, 3–6).
-# Готово, когда `p.frames` кадров подряд без значимых мутаций И документ загружен (readyState complete), шрифты
-# загружены, нет идущих конечных анимаций (бесконечные — спиннеры — не ждём) и видимых [aria-busy=true]. Комбобокс после
-# ввода с видимыми подсказками — готово сразу. Скрытая вкладка (rAF не идёт) — ходы MessageChannel вместо кадров;
-# условие не выполнено — ход ждёт мутацию, readystatechange или fonts.ready (без холостого цикла). Единственный таймер —
-# предохранитель `p.fuse_ms`. Итог — {reason, ms, mutations, frames}: quiet | options | frames (без кадров) | fuse.
-# На выходе observer отключён, таймер и слушатели сняты.
+# Готово, когда `p.frames` кадров подряд без значимых мутаций И (после навигации, `p.document`) документ загружен
+# (readyState complete), шрифты загружены, нет идущих конечных анимаций (бесконечные — спиннеры — не ждём) и видимых
+# [aria-busy=true]. Комбобокс после ввода с видимыми подсказками — готово сразу. Скрытая вкладка (rAF не идёт) — ходы
+# MessageChannel вместо кадров; условие не выполнено — ход ждёт мутацию, readystatechange или fonts.ready (без
+# холостого цикла). Единственный таймер — предохранитель `p.fuse_ms`. Итог — {reason, ms, mutations, frames}: quiet |
+# options | frames (без кадров) | fuse. На выходе observer отключён, таймер и слушатели сняты.
 READY = (
     """(p => new Promise(resolve => {
   const start=performance.now(), action=p.action||{};
@@ -132,8 +136,8 @@ READY = (
         Number.isFinite(a.effect?.getComputedTiming?.().endTime));
     } catch (e) { return false; }
   };
-  const ready=hidden=>document.readyState==='complete' && document.fonts?.status!=='loading' && !busy() &&
-    (hidden || !animating());
+  const ready=hidden=>(!p.document || document.readyState==='complete') && document.fonts?.status!=='loading' &&
+    !busy() && (hidden || !animating());
   const step=()=>{
     if (dirty) { dirty=false; quiet=0; } else quiet++;
   };
@@ -254,8 +258,9 @@ def _snapshot_part(first: str, last: str) -> str:
 
 
 # Только чтение (docs/plan-waits.md §4.2): на каждый {node, label} — значение поля по узлу из кэша снимка, если узел ещё
-# в документе; иначе первого видимого редактируемого поля с той же подписью (сайт перерисовал поле — узел новый); иначе
-# null. safe/visible/name/role — из snapshot.js, «редактируемое» и значение — как там же (fill-действие и его value).
+# в документе; иначе первого видимого редактируемого поля с той же подписью (сайт перерисовал поле — узел новый), а для
+# подписи '' (поле без имени) — единственного такого поля (клетки кода из SMS друг от друга не отличить); иначе null.
+# safe/visible/name/role — из snapshot.js, «редактируемое» и значение — как там же (fill-действие и его value).
 FIELD_VALUES = (
     "(specs => {\n"
     + _snapshot_part("  const safe = e =>", "    return null;\n  };\n")
@@ -269,9 +274,12 @@ FIELD_VALUES = (
   const value=e=>'value' in e ? String(e.value) :
     e.isContentEditable || role(e)==='combobox' ? e.innerText.trim() : '';
   let fields=null;
-  const labelled=label=>(fields??=[...document.querySelectorAll(selector)].filter(e=>safe(e) && visible(e) &&
-    !e.matches(':disabled') && !e.closest('[aria-disabled="true"]') && editable(e)))
-    .find(e=>label==='' ? !name(e) : (name(e)||role(e))===label);
+  const labelled=label=>{
+    fields??=[...document.querySelectorAll(selector)].filter(e=>safe(e) && visible(e) &&
+      !e.matches(':disabled') && !e.closest('[aria-disabled="true"]') && editable(e));
+    const same=fields.filter(e=>label==='' ? !name(e) : (name(e)||role(e))===label);
+    return label==='' && same.length!==1 ? null : same[0];
+  };
   return specs.map(({node,label})=>{
     const e=node==null ? null : nodes?.get(node);
     if (e?.isConnected && safe(e)) return value(e);
@@ -383,15 +391,6 @@ class Tab:
         self._browser_s -= seconds
         self._wait_s += seconds
 
-    def _sleep(self, seconds: float) -> None:
-        with self._timed(wait=True):
-            time.sleep(seconds)
-
-    def pause(self, seconds: float) -> None:
-        """Подождать (агент ждёт появления элементов); время идёт в `wait_ms`. Совместимость: agent.py до пакета
-        «сценарий» (docs/plan-waits.md §6.2 — там `await_change` вместо опроса); у вкладки своих пауз больше нет."""
-        self._sleep(seconds)
-
     def _budget(self) -> float | None:
         if self.deadline is None:
             return None
@@ -487,7 +486,8 @@ class Tab:
 
     def _await_load(self, timeout: float) -> bool:
         """`LOAD` в документе после commit: True — readyState complete. Документ сменился (редирект) — ждать его
-        запросы (`_wait_network`) и повторить, не больше STALE_RETRIES раз; отмена, дедлайн и `timeout` — False."""
+        запросы (`_wait_network`) и повторить, не больше STALE_RETRIES раз; отмена, дедлайн, `timeout` и документ, не
+        ответивший до дедлайна (CDPTimeout), — False."""
         limit = timeout
         if self.deadline is not None:
             limit = min(limit, self.deadline - time.monotonic() - WAIT_DEADLINE_MARGIN_S)
@@ -503,8 +503,11 @@ class Tab:
                         "Runtime.evaluate",
                         {"expression": expression, "awaitPromise": True, "returnByValue": True},
                         session_id=self.session_id,
-                        timeout=left + WAIT_DEADLINE_MARGIN_S,
+                        timeout=self._budget(),
                     )
+                except CDPTimeout as exc:  # главный поток занят до дедлайна: как предохранитель навигации
+                    log.debug("загрузка: документ не ответил: %s", exc)
+                    return False
                 except CDPError as exc:
                     response = {"exceptionDetails": {"text": str(exc)}}
                 if not response.get("exceptionDetails"):
@@ -572,8 +575,8 @@ class Tab:
         return self.cancel is not None and self.cancel.is_set()
 
     def _fuse(self) -> float:
-        """Потолок одного ожидания: `fuse_s`, но не дальше `deadline − WAIT_DEADLINE_MARGIN_S` (иначе CDPTimeout уронил
-        бы прогон раньше дедлайна). ≤ 0 — не ждать."""
+        """Потолок одного ожидания: `fuse_s`, но не дальше `deadline − WAIT_DEADLINE_MARGIN_S` (промис страницы
+        кончается раньше дедлайна прогона; таймаут CDP-вызова — сам дедлайн). ≤ 0 — не ждать."""
         fuse = self.fuse_s
         if self.deadline is not None:
             fuse = min(fuse, self.deadline - time.monotonic() - WAIT_DEADLINE_MARGIN_S)
@@ -600,14 +603,12 @@ class Tab:
             return self._pending() == 0
         return self.client.wait_events(self.session_id, lambda: self._cancelled() or self._pending() == 0, left)
 
-    def settle(self, action: dict[str, Any] | None = None) -> dict[str, Any] | None:
-        """Совместимость (agent.py до пакета «сценарий», scripts/eval.py): `await_ready`; None — не ждали."""
-        return self.await_ready(action) or None
-
     def await_ready(self, action: dict[str, Any] | None = None) -> dict[str, Any]:
         """Страница готова к решению после действия (docs/plan-waits.md §2): только чтение, время — `wait_ms`.
 
-        Цикл: промис `READY` (кадры, readyState, шрифты, анимации, aria-busy, подсказки комбобокса) → запросы вкладки,
+        Цикл: промис `READY` (кадры, шрифты, анимации, aria-busy, подсказки комбобокса; readyState — только после
+        навигации: `load`, `retry` и проход в новом документе, §2 п. 3 — подресурс, который не догружается, иначе держал
+        бы каждое ожидание до предохранителя) → запросы вкладки,
         начатые после эпохи действия, завершены? нет — насос событий до их завершения → снова `READY` (ответ мог
         изменить DOM) — пока оба условия не выполнятся в одном проходе. Каждый проход кончается событием; единственный
         потолок — предохранитель `_fuse()`: истёк — `fuse`, запросы в полёте — фоновые до конца жизни сессии. Документ
@@ -620,8 +621,11 @@ class Tab:
         self.last_settle = result or None
         return result
 
-    def _ready(self, action: dict[str, Any]) -> dict[str, Any]:
+    def _ready(self, action: dict[str, Any], *, navigated: bool = False) -> dict[str, Any]:
+        """`await_ready` без записи в `last_settle`. `navigated` — документ сменился (навигация): ждать и его загрузку
+        (readyState), как после `load`/`retry`."""
         self.after_input = None  # ожидание после действия — вот оно
+        document = navigated or action.get("kind") in {"load", "retry"}
         if self._cancelled():
             log.debug("await_ready пропущен: отмена")
             return {}
@@ -642,10 +646,11 @@ class Tab:
                 if left <= 0:
                     reason = "fuse"
                     break
-                value = self._ready_pass(action, left)
+                value = self._ready_pass(action, left, document)
                 passes += 1
                 if value is None:
                     interrupted += 1
+                    document = True  # новый документ: ждать и его загрузку
                     if interrupted >= STALE_RETRIES:
                         log.debug("await_ready: документ сменяется %d раз подряд — снимок решит", interrupted)
                         return {}
@@ -685,21 +690,28 @@ class Tab:
         )
         return result
 
-    def _ready_pass(self, action: dict[str, Any], left: float) -> dict[str, Any] | None:
-        """Один проход `READY` (не дольше `left` с). None — документ сменился; {} — ответ без итога."""
+    def _ready_pass(self, action: dict[str, Any], left: float, document: bool) -> dict[str, Any] | None:
+        """Один проход `READY` (предохранитель в странице — `left` с). None — документ сменился; {} — ответ без итога;
+        страница не ответила до дедлайна прогона (главный поток занят) — `{"reason": "fuse"}`."""
         params = {
             "action": {k: action[k] for k in ("kind", "node") if k in action},  # метка и значение в страницу не уходят
             "fuse_ms": max(1, round(left * 1000)),
             "frames": QUIET_FRAMES,
             "attributes": list(MUTATION_ATTRIBUTES),
+            "document": document,
         }
         try:
             response = self.client.call(
                 "Runtime.evaluate",
                 {"expression": READY + json.dumps(params) + ")", "awaitPromise": True, "returnByValue": True},
                 session_id=self.session_id,
-                timeout=left + WAIT_DEADLINE_MARGIN_S,
+                timeout=self._budget(),
             )
+        except CDPTimeout as exc:
+            # Действие уже исполнено: молчание страницы — исход ожидания, а не ошибка прогона (иначе `failed`, и
+            # вызывающий повторит действие). Промис в странице снимет себя сам по своему предохранителю.
+            log.debug("await_ready: страница не ответила: %s", exc)
+            return {"reason": "fuse"}
         except CDPError as exc:
             log.debug("await_ready: проход прерван: %s", exc)
             return None
@@ -713,10 +725,13 @@ class Tab:
         """Дождаться следующего изменения страницы, затем `await_ready` (WAIT Jev, WAIT в проверке, второй взгляд; §2).
 
         Изменение — первое из: значимая мутация или конец CSS-анимации/перехода (промис `CHANGE`), с учётом сети — ещё
-        завершение любого запроса вкладки или WS-кадр (подсказка «сейчас что-то изменится»), смена документа. Каждое
+        завершение запроса, начатого после эпохи последнего действия или навигации (фонового тоже: предохранитель его
+        пережил, а ответ на действие — вот он), смена документа. WS-кадр и запросы страницы, начатые раньше
+        (long-poll, аналитика), не будят: у WhatsApp кадры идут постоянно. Каждое
         из двух ожиданий — не дольше предохранителя; изменения не было — `fuse`, без `await_ready`. Итог — как у
         `await_ready`, плюс `change` (что разбудило) и `ready` (чем кончилась готовность); `wait_reason` — `change`,
-        если изменение было и страница затем готова, иначе `fuse`. Пусто — не ждали (отмена, нет места до дедлайна)."""
+        если изменение было и страница затем готова, иначе `fuse` (и когда страница не ответила до дедлайна прогона).
+        Пусто — не ждали (отмена, нет места до дедлайна)."""
         self.after_input = None
         self.last_settle = None
         if self._cancelled():
@@ -727,10 +742,13 @@ class Tab:
             log.debug("await_change пропущен: до дедлайна меньше %g с", WAIT_DEADLINE_MARGIN_S)
             return {}
         started = time.monotonic()
-        marks = self.client.network_marks(self.session_id) if self.network else (0, 0)
+        epoch = self._epoch  # ответ на запрос последнего действия (или навигации) — будит; фон страницы — нет
+        mark = self.client.finished_mark(self.session_id) if self.network else 0
 
         def moved() -> bool:
-            return self._cancelled() or (self.network and self.client.network_marks(self.session_id) != marks)
+            return self._cancelled() or bool(
+                self.network and self.client.finished_since(self.session_id, mark, epoch) > 0
+            )
 
         params = {"fuse_ms": max(1, round(fuse * 1000)), "attributes": list(MUTATION_ATTRIBUTES)}
         with self._timed(wait=True):
@@ -739,9 +757,12 @@ class Tab:
                     "Runtime.evaluate",
                     {"expression": CHANGE + json.dumps(params) + ")", "awaitPromise": True, "returnByValue": True},
                     session_id=self.session_id,
-                    timeout=fuse + WAIT_DEADLINE_MARGIN_S,
+                    timeout=self._budget(),
                     stop=moved,
                 )
+            except CDPTimeout as exc:  # главный поток занят до дедлайна: изменения не дождались — как предохранитель
+                log.debug("await_change: страница не ответила: %s", exc)
+                response = {"result": {"value": {"reason": "fuse"}}}
             except CDPError as exc:
                 response = {"exceptionDetails": {"text": str(exc)}}
         change: str | None
@@ -749,8 +770,7 @@ class Tab:
             if self._cancelled():
                 log.debug("await_change прерван: отмена")
                 return {}
-            finished, _ws = self.client.network_marks(self.session_id)
-            change = "network" if finished != marks[0] else "websocket"
+            change = "network"
         elif response.get("exceptionDetails"):
             change = "navigation"
         else:
@@ -771,7 +791,7 @@ class Tab:
             self.last_settle = result
             log.debug("await_change: изменений нет за %s мс", result["ms"])
             return result
-        ready = self._ready({"kind": "wait"})
+        ready = self._ready({"kind": "wait"}, navigated=change == "navigation")
         if not ready and (change is None or self._cancelled()):
             return {}
         ready_reason = ready.get("reason")
@@ -796,7 +816,7 @@ class Tab:
         """Что сейчас в полях, куда печатали (`[{node, label}]` из снимка): один `Runtime.evaluate` (`FIELD_VALUES`),
         только чтение, время — `browser_ms`. На каждое — значение поля по узлу из кэша снимка, если узел ещё в
         документе; иначе первого видимого редактируемого поля с той же подписью (`label` "" — поле без имени любой
-        роли: сайт мог пересоздать его с другой ролью); иначе None. Значение — как `value` в
+        роли, если оно такое одно: сайт мог пересоздать его с другой ролью); иначе None. Значение — как `value` в
         снимке; password/file/hidden не читаются, напечатанный текст в страницу не уходит (сравнивает вызывающий).
         Документ сменяется — StalePage."""
         if not specs:
@@ -882,9 +902,12 @@ class Tab:
     def act(self, action: dict[str, Any], page: dict[str, Any], text: str | None = None) -> dict[str, Any]:
         if not self.fresh(page, action):
             raise StalePage("Page changed since this decision. Observe again.")
-        self._epoch = self.client.seq  # WAIT и SELECT (его change — внутри evaluate); у ввода — уточняется в _act
+        acting = action["kind"] != "wait"  # WAIT запросов не начинает: эпоха — того действия, которого ждём
+        if acting:
+            self._epoch = self.client.seq  # SELECT (его change — внутри evaluate); у ввода — уточняется в _act
         result = self._act(action, text)
-        self.action_epoch = self._epoch  # действие исполнено: его запросы — «начатые последним действием»
+        if acting:
+            self.action_epoch = self._epoch  # действие исполнено: его запросы — «начатые последним действием»
         self.after_input = action  # следующий observe() подождёт: WAIT — изменения, остальное — готовности
         return result
 

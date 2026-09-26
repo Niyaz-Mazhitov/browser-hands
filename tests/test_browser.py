@@ -190,6 +190,7 @@ def test_ready_expression_watches_significant_mutations_with_numbers_in_params(m
         "fuse_ms": 1500,  # Thresholds.wait_fuse_s — единственное время
         "frames": 2,
         "attributes": list(browser.MUTATION_ATTRIBUTES),
+        "document": False,  # readyState ждём только после навигации
     }
     assert "style" not in params["attributes"]  # JS-анимации пишут style каждый кадр
     assert {"class", "hidden", "aria-expanded", "aria-busy", "disabled"} <= set(params["attributes"])
@@ -232,10 +233,9 @@ def test_wait_action_waits_for_the_next_change_without_a_pause(monkeypatch):
     client = Mock()
     tab = make_tab(client)
     tab.fresh = Mock(return_value=True)
-    tab._sleep = Mock()
     tab.act(p["actions"][3], p)
-    tab._sleep.assert_not_called()  # WAIT — не пауза по часам
-    client.call.assert_not_called()
+    client.call.assert_not_called()  # WAIT — не пауза по часам и не ввод
+    assert not any(hasattr(Tab, name) for name in ("pause", "settle", "_sleep"))  # пауз по времени у вкладки нет
     assert tab.after_input == p["actions"][3]
     client.call_until.return_value = CHANGED
     client.call.side_effect = [READY_DONE, {"result": {"value": p}}]
@@ -274,6 +274,31 @@ def test_ready_interrupted_by_navigation_runs_again_in_the_new_document(interrup
     assert tab.observe()["actions"] == p["actions"]
     assert tab.last_settle is not None and tab.last_settle["reason"] == "quiet" and tab.last_settle["passes"] == 2
     assert len(ready_calls(client)) == 2 and client.call.call_count == 3
+    # клик увёл на новую страницу: в новом документе ждём и его загрузку (readyState), в старом — нет
+    assert [params_of(c.args[1]["expression"])["document"] for c in ready_calls(client)] == [False, True]
+
+
+def test_document_readiness_is_awaited_only_after_navigation(monkeypatch):
+    """План §2 п. 3: readyState — только после навигации. Подресурс, который не догружается (картинка, счётчик), держал
+    `readyState` не complete — и каждое ожидание после клика шло до предохранителя."""
+    frozen_clock(monkeypatch)
+    client = Mock()
+    client.call.return_value = READY_DONE
+    client.call_until.return_value = {"exceptionDetails": {"text": "Execution context was destroyed"}}
+    tab = make_tab(client)
+    for kind in ("click", "fill", "select", "scroll", "wait", "load", "retry"):
+        tab.await_ready({"kind": kind, "node": 20})
+    tab.await_change()  # изменение — смена документа: готовность нового — с readyState
+    tab.after_input = {"kind": "click", "node": 20}
+    client.call.side_effect = [
+        READY_DONE,
+        {"exceptionDetails": {"text": "navigating"}},
+        READY_DONE,
+        {"result": {"value": page()}},
+    ]
+    tab.observe()  # снимок не удался — документ сменяется: повтор после его загрузки
+    flags = [params_of(c.args[1]["expression"])["document"] for c in ready_calls(client)]
+    assert flags == [False, False, False, False, False, True, True, True, False, True]
 
 
 def test_ready_without_a_value_ends_the_wait_and_the_page_is_snapshotted():
@@ -323,6 +348,33 @@ def test_fuse_stops_short_of_the_run_deadline(monkeypatch):
     assert tab.last_settle is None
 
 
+def test_page_that_does_not_answer_a_wait_in_time_is_a_fuse_not_an_error(monkeypatch):
+    """Главный поток страницы занят (долгая задача дольше предохранителя): ответа на промис ожидания нет вовремя.
+    Действие уже исполнено — это исход `fuse`, а не CDPTimeout наружу (агент дал бы `failed`, вызывающий повторил бы
+    browse — двойная отправка). Таймаут самого вызова — до дедлайна прогона, а не предохранитель + запас."""
+    frozen_clock(monkeypatch)
+    slow = CDPTimeout("Runtime.evaluate: нет ответа за 2.0 с")
+    client = Mock(call_timeout=30.0)
+    client.call.side_effect = slow
+    client.pending_since.return_value = 1
+    tab = make_tab(client, network=True)
+    tab.deadline = 120.0
+    result = tab.await_ready({"kind": "click", "node": 20})
+    assert (result["reason"], result["wait_reason"], result["passes"]) == ("fuse", "fuse", 1)
+    client.mark_background.assert_called_once_with("S1")  # запросы в полёте — фон, как при fuse
+    assert client.call.call_args.kwargs["timeout"] == pytest.approx(20.0)  # остаток дедлайна, не 1,5 + 0,5 с
+
+    quiet = make_tab(Mock(call_timeout=30.0))
+    quiet.client.call_until.side_effect = slow
+    assert quiet.await_change()["wait_reason"] == "fuse"
+    assert quiet.client.call_until.call_args.kwargs["timeout"] is None  # дедлайна нет — таймаут клиента по умолчанию
+    quiet.client.call.assert_not_called()  # изменения не было — готовность не ждём
+
+    quiet.client.call.side_effect = [{"frameId": "F"}, slow]
+    quiet.navigate("https://example.test/")  # документ не ответил на LOAD — дальше без ожидания готовности
+    assert ready_calls(quiet.client) == []
+
+
 def test_waits_are_skipped_after_cancel():
     client = Mock()
     tab = make_tab(client)
@@ -330,7 +382,6 @@ def test_waits_are_skipped_after_cancel():
     tab.cancel.set()
     assert tab.await_ready({"kind": "click", "node": 20}) == {}
     assert tab.await_change() == {}
-    assert tab.settle({"kind": "retry"}) is None  # совместимость agent.py: None — не ждали
     client.call.assert_not_called()
     client.call_until.assert_not_called()
 
@@ -898,6 +949,21 @@ def test_field_values_expression_in_node_by_node_then_by_label():
     assert out["withoutCache"] == ["book", "привет 👋", None, None, None, None, None, "Gödel"]  # только подпись
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="нужен node")
+def test_field_values_expression_finds_a_nameless_field_only_when_it_is_the_only_one():
+    """Код из SMS: клетки без доступного имени. Узел клетки пропал — по подписи '' её не узнать среди нескольких таких
+    полей (ревью: бралось первое поле без имени — значение чужой клетки)."""
+    script = FAKE_DOM.replace(
+        "const elements = [search, hiddenMessage, newMessage, password, readonly, nameless];",
+        "const second = new El('INPUT', {}, {type: 'text', value: '7'});\nconst elements = [search, nameless, second];",
+    ).replace("EXPRESSION", json.dumps(browser.FIELD_VALUES + "specs)"))
+    done = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=10)
+    assert done.returncode == 0, done.stderr
+    out = json.loads(done.stdout)
+    assert out["withCache"][7] is None and out["withoutCache"][7] is None  # два поля без имени — не наше
+    assert out["withCache"][0] == "book"  # поле с подписью — как раньше
+
+
 # --- ожидания на FakeCDPServer с событиями Network (docs/plan-waits.md §5.2–5.4) ----------------------------------
 
 
@@ -1024,6 +1090,72 @@ def test_await_change_is_woken_by_a_finished_request_then_waits_for_readiness(fa
     assert (result["wait_reason"], result["change"], result["ready"]) == ("change", "network", "quiet")
     assert time.monotonic() - started < 1.0  # не ждали предохранитель CHANGE (1,5 с)
     assert [f["params"]["expression"][:20] for f in server.sent("Runtime.evaluate")] == [CHANGE[:20], READY[:20]]
+
+
+def change_times_out(fuse_s, *send):
+    """Обработчик Runtime.evaluate: CHANGE — события `send`, затем ответ `fuse` по истечении предохранителя (как промис
+    страницы без мутаций); READY — сразу."""
+
+    def evaluate(frame, ws):
+        if not frame["params"]["expression"].startswith(CHANGE):
+            return reply(ws, frame, ready_value())
+        for s in send:
+            s(ws)
+        time.sleep(fuse_s)
+        reply(ws, frame, {"result": {"type": "object", "value": {"reason": "fuse", "ms": round(fuse_s * 1000)}}})
+
+    return evaluate
+
+
+def test_websocket_frames_alone_do_not_end_a_wait_for_change(fake_tab):
+    """Ревью: WS-кадр будил `await_change` (WhatsApp шлёт их постоянно — WAIT и второй взгляд не ждали ничего)."""
+    fake_tab.fuse_s = 0.3
+    fake_tab._epoch = fake_tab.client.seq
+    frame = {"requestId": "ws", "response": {"payloadData": "x"}}
+    fake_tab.server.on["Runtime.evaluate"] = change_times_out(
+        0.3, lambda ws: event(ws, "Network.webSocketFrameReceived", frame, "S1")
+    )
+    result = fake_tab.await_change()
+    assert (result["wait_reason"], result["change"]) == ("fuse", None)
+    assert evaluations(fake_tab.server) == []  # готовность после «изменения» не ждали
+
+
+def test_page_background_request_finishing_does_not_end_a_wait_for_change(fake_tab):
+    """Запрос страницы, начатый до последнего действия (long-poll, аналитика), завершился — это не ответ на действие."""
+    server = fake_tab.server
+    server.on["Target.getTargets"] = lambda f, ws: (
+        net(ws, "Network.requestWillBeSent", "poll", type="XHR"),
+        reply(ws, f),
+    )
+    fake_tab.client.call("Target.getTargets")
+    fake_tab._epoch = fake_tab.client.seq  # действие — после запроса страницы
+    fake_tab.fuse_s = 0.3
+    server.on["Runtime.evaluate"] = change_times_out(0.3, lambda ws: net(ws, "Network.loadingFinished", "poll"))
+    result = fake_tab.await_change()
+    assert (result["wait_reason"], result["change"]) == ("fuse", None)
+
+
+def test_wait_action_keeps_the_epoch_of_the_action_it_waits_for(fake_tab):
+    """WAIT запросов не начинает: ожидание изменения после него будит ответ на запрос прошлого действия."""
+    fake_tab.fuse_s = 0.3
+    assert clicked_with_a_slow_request(fake_tab)["wait_reason"] == "fuse"
+    epoch = fake_tab._epoch
+    p = page()
+    fake_tab.fresh = Mock(return_value=True)
+    fake_tab.act(p["actions"][3], p)  # WAIT
+    assert (fake_tab._epoch, fake_tab.action_epoch) == (epoch, epoch)
+    fake_tab.fuse_s = 5.0
+
+    def evaluate(frame, ws):
+        if frame["params"]["expression"].startswith(CHANGE):
+            net(ws, "Network.loadingFinished", "search")
+            return
+        reply(ws, frame, ready_value(mutations=2))
+
+    fake_tab.server.on["Runtime.evaluate"] = evaluate
+    started = time.monotonic()
+    result = fake_tab.await_change()  # то, что сделает observe() после WAIT
+    assert (result["change"], result["wait_reason"]) == ("network", "change") and time.monotonic() - started < 2.0
 
 
 def test_navigate_on_fake_cdp_waits_for_the_document_then_its_requests(fake_tab):
@@ -1258,16 +1390,18 @@ def test_ready_in_node_ticker_with_quiet_gaps_is_ready_between_ticks():
 
 @node_only
 @pytest.mark.parametrize(
-    ("scenario", "ms"),
+    ("scenario", "ms", "kind"),
     [
-        ("finite-animation", 304),  # анимация 300 мс: первый кадр после её finished
-        ("aria-busy", 240),  # aria-busy снят на 200 мс: мутация + два тихих кадра
-        ("fonts", 112),  # шрифты загрузились на 100 мс
-        ("loading-doc", 160),  # readyState complete на 150 мс
+        ("finite-animation", 304, "click"),  # анимация 300 мс: первый кадр после её finished
+        ("aria-busy", 240, "click"),  # aria-busy снят на 200 мс: мутация + два тихих кадра
+        ("fonts", 112, "click"),  # шрифты загрузились на 100 мс
+        ("loading-doc", 160, "load"),  # после навигации: readyState complete на 150 мс
+        ("loading-doc", 160, "retry"),  # снимок не удался, документ сменяется — то же
+        ("loading-doc", 32, "click"),  # после клика документ не ждём: подресурс мог не догрузиться вовсе
     ],
 )
-def test_ready_in_node_waits_for_animations_busy_fonts_and_the_document(scenario, ms):
-    out = ready_in_node(scenario)
+def test_ready_in_node_waits_for_animations_busy_fonts_and_the_document(scenario, ms, kind):
+    out = ready_in_node(scenario, {"kind": kind, "node": 20})
     assert out["result"]["reason"] == "quiet" and out["result"]["ms"] == ms, out["result"]
 
 
@@ -1287,8 +1421,10 @@ def test_ready_in_node_hidden_tab_without_frames_counts_message_channel_turns():
         out = ready_in_node(scenario)
         assert out["result"] == {"reason": "frames", "ms": 0, "mutations": 0, "frames": 0}, out
         assert out["taskRuns"] == 2  # два хода MessageChannel без мутаций
-    out = ready_in_node("background-loading")  # документ грузится: ход ждёт readystatechange, а не крутится
+    out = ready_in_node("background-loading", {"kind": "load"})  # документ грузится: ход ждёт readystatechange
     assert out["result"]["reason"] == "frames" and out["result"]["ms"] == 150 and out["taskRuns"] == 3
+    out = ready_in_node("background-loading")  # после клика документ не ждём
+    assert out["result"]["reason"] == "frames" and out["result"]["ms"] == 0 and out["taskRuns"] == 2
 
 
 @node_only
@@ -1371,9 +1507,68 @@ def test_ready_in_headless_chrome_frames_not_milliseconds(tmp_path):
         assert tab.take_timing().browser_ms < 500  # почти всё — wait_ms
 
 
+# Страница считает свои MutationObserver (обёртка — её код, не наш): сколько наблюдают сейчас и промис «все сняты»;
+# busy(ms) — долгая задача главного потока.
+BUSY_PAGE = """<!doctype html><body><span id=n>0</span><script>
+let live=0, seen=0, idle=[];
+const Base=MutationObserver;
+window.MutationObserver=class extends Base {
+  observe(...a) { live++; seen++; return super.observe(...a); }
+  disconnect() { live--; if (!live) idle.splice(0).forEach(r=>r(true)); return super.disconnect(); }
+};
+window.__watchers=()=>[live, seen];
+window.__idle=()=>new Promise(r=>live ? idle.push(r) : r(true));
+window.busy=ms=>setTimeout(()=>{const t=performance.now(); while (performance.now()-t<ms) {}}, 0);
+TICKER
+</script></body>"""
+TICKER = "const f=()=>{n.textContent=String(+n.textContent+1); requestAnimationFrame(f)}; f();"
+
+
+@chrome_only
+def test_busy_page_in_headless_chrome_ends_waits_by_fuse_and_its_promise_cleans_up_after_release(tmp_path):
+    """Долгая задача 1200 мс: промис ожидания стартует после неё и отвечает позже предохранителя и запаса (зонд ревью:
+    было CDPTimeout). Ответа нет и до дедлайна — `fuse`; вкладку отпустили — промис в странице снимает observer сам."""
+    from urllib.parse import quote
+
+    with headless_chrome(tmp_path) as chrome:
+        tab = chrome.new_tab()
+        tab.navigate("data:text/html," + quote(BUSY_PAGE.replace("TICKER", TICKER)))  # меняется каждый кадр
+        tab.evaluate("busy(1200)")
+        result = tab.await_ready({"kind": "click", "node": 1})
+        assert result["reason"] == "fuse" and result["ms"] >= 1200 + 1500 - 100, result
+
+        tab.navigate("data:text/html," + quote(BUSY_PAGE.replace("TICKER", "")))  # тихая
+        tab.evaluate("busy(1200)")
+        result = tab.await_change()
+        assert result["wait_reason"] == "fuse" and result["change"] is None, result
+
+        # как вкладка пользователя (attach, без сети): ответа нет и до дедлайна, агент её отпускает
+        client = chrome.client
+        attach = {"targetId": tab.target_id, "flatten": True}
+        user = Tab(client, client.call("Target.attachToTarget", attach)["sessionId"], tab.target_id, owned=False)
+        user.setup()
+        before = user.evaluate("__watchers()")[1]
+        user.evaluate("busy(3000)")
+        user.deadline = time.monotonic() + 1.2  # предохранитель 0,7 с
+        result = user.await_ready({"kind": "click", "node": 1})
+        assert result["reason"] == "fuse", result
+        user.release()
+        session = client.call("Target.attachToTarget", attach)["sessionId"]
+        check = {"expression": "__idle().then(()=>__watchers())", "awaitPromise": True, "returnByValue": True}
+        live, seen = client.call("Runtime.evaluate", check, session_id=session, timeout=10.0)["result"]["value"]
+        assert live == 0 and seen > before, (live, seen, before)  # промис отработал после release и снял observer
+        client.call("Target.detachFromTarget", {"sessionId": session})
+
+
 NETWORK_PAGE = """<!doctype html><body>
 <button onclick="fetch('/slow').then(r=>r.text()).then(t=>{out.textContent=t})">Slow</button>
 <button onclick="fetch('/poll').catch(()=>{})">Poll</button>
+<button onclick="fetch('/poll').catch(()=>{}); setTimeout(()=>{location.href='/next'}, 50)">Leave</button>
+<div id=out></div></body>"""
+
+
+# Картинка, которая не догружается (10 с): документ остаётся в readyState interactive.
+STUCK_PAGE = """<!doctype html><body><img src="/poll" alt="stuck"><button onclick="out.textContent='ok'">Go</button>
 <div id=out></div></body>"""
 
 
@@ -1384,7 +1579,7 @@ def network_server():
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            pause, body = {"/slow": (0.7, b"done"), "/poll": (10.0, b"late")}.get(
+            pause, body = {"/slow": (0.7, b"done"), "/poll": (10.0, b"late"), "/stuck": (0.0, STUCK_PAGE.encode())}.get(
                 self.path, (0.0, NETWORK_PAGE.encode())
             )
             time.sleep(pause)
@@ -1431,6 +1626,40 @@ def test_ready_in_headless_chrome_waits_for_fetch_and_long_poll_becomes_backgrou
         assert result["wait_reason"] == "fuse" and result["pending_requests"] == 1, result
         again = tab.await_ready({"kind": "retry"})  # long-poll ещё в полёте — теперь фон
         assert again["wait_reason"] == "quiet" and again["pending_requests"] == 0 and again["ms"] < 300, again
+
+
+@chrome_only
+def test_requests_of_a_page_left_by_a_click_do_not_hold_waits_in_headless_chrome(tmp_path):
+    """Клик шлёт запрос (10 с) и уходит со страницы: Chrome не присылает завершения запросу старого документа (зонд
+    ревью). Было: `fuse` на этом и каждом следующем ожидании, «страница ещё загружается» навсегда."""
+    with headless_chrome(tmp_path) as chrome, network_server() as url:
+        tab = chrome.new_tab()
+        tab.navigate(url)
+        state = tab.observe()
+        leave = next(a for a in state["actions"] if a["label"] == "Leave")
+        tab.act(leave, state)
+        result = tab.await_ready(leave)
+        assert result["wait_reason"] == "quiet" and result["pending_requests"] == 0, result
+        assert tab.evaluate("location.pathname") == "/next"
+        assert tab.in_flight(tab.action_epoch) == 0 and tab.in_flight(0) == 0  # запрос старого документа снят
+        again = tab.await_ready({"kind": "retry"})
+        assert again["wait_reason"] == "quiet" and again["ms"] < 300, again
+
+
+@chrome_only
+def test_click_on_a_page_with_a_stuck_image_is_ready_without_the_document_load_in_headless_chrome(tmp_path):
+    """План §2 п. 3: readyState — только после навигации. Было: картинка, которая не догружается, давала `fuse` на
+    каждом действии (readyState interactive)."""
+    with headless_chrome(tmp_path) as chrome, network_server() as url:
+        tab = chrome.new_tab()
+        tab.navigate(url + "stuck", timeout=1.0)  # загрузка документа не кончится: дальше без ожидания готовности
+        assert tab.evaluate("document.readyState") == "interactive"
+        state = tab.observe()
+        go = next(a for a in state["actions"] if a["label"] == "Go")
+        tab.act(go, state)
+        result = tab.await_ready(go)
+        assert result["wait_reason"] == "quiet" and result["ms"] < 500, result
+        assert "ok" in tab.observe()["text"]
 
 
 FIELDS_PAGE = """<!doctype html><body><input aria-label="Search">

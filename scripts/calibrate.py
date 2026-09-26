@@ -38,7 +38,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from browser_hands.config import Thresholds
+from browser_hands.config import FRAME_S, Thresholds
 
 ROOT = Path(__file__).resolve().parent.parent
 # свои трассы и трассы worktree (`.wt/<пакет>/traces`); трассы других копий — `--traces`
@@ -51,7 +51,6 @@ C_FN = 0.05  # ложный отказ — лишний вызов Jev ($0,0002 
 MIN_BIN = 30  # пар в двух корзинах вокруг θ*, меньше — «мало данных»
 Z = 1.96  # Wilson 95 %
 TARGET_HALF_WIDTH = 0.1  # «сколько собрать»: половина ширины Wilson в корзинах вокруг θ* не больше
-FRAME_S = 1 / 60  # запас кадра к p99 для wait_fuse_s
 SNAPSHOT_MARGIN_MS = 30  # признак шага менялся ближе к моменту снимка — пара неоднозначна
 ACTING = frozenset({"CLICK", "TYPE_TEXT", "SELECT"})
 

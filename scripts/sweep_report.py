@@ -1,4 +1,5 @@
-"""Отчёт развёртки стенда `scripts/eval.py --sweep` (docs/plan-waits.md §7.3–7.4): только stdlib, без сети и моделей.
+"""Отчёт развёртки стенда `scripts/eval.py --sweep` (docs/plan-waits.md §7.3–7.4): stdlib и `browser_hands.config`
+(кадр, нынешний предохранитель), без сети и моделей.
 
     uv run --frozen python scripts/sweep_report.py traces/eval-<ts>.jsonl                  # одна развёртка
     uv run --frozen python scripts/sweep_report.py before.jsonl after.jsonl                # колонки «было / стало»
@@ -27,8 +28,9 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from browser_hands.config import FRAME_S  # запас кадра к p99 для wait_fuse_s — одно число с scripts/calibrate.py
+
 ACTIONS = frozenset({"CLICK", "TYPE_TEXT", "SELECT"})  # решения, после которых страница меняется от нас
-FRAME_MS = 17  # запас кадра к p99 для wait_fuse_s
 FUSE_STEP_S = 0.05  # wait_fuse_s округляем вверх до этого шага
 BAR = 20  # ширина ASCII-кривой: 20 символов = 100 %
 
@@ -244,10 +246,10 @@ def format_fuse(rows: Iterable[Row], wa: Sequence[float]) -> str:
         lines.append("  WhatsApp (§8): замеров не передано (--wa)")
     if p99s:
         worst = max(p99s)
-        fuse = math.ceil((worst + FRAME_MS) / 1000 / FUSE_STEP_S - 1e-9) * FUSE_STEP_S
+        fuse = math.ceil((worst / 1000 + FRAME_S) / FUSE_STEP_S - 1e-9) * FUSE_STEP_S
         now = current_fuse()
         lines.append(
-            f"  рекомендуемое wait_fuse_s = {fuse:.2f} с (p99 {worst:.0f} + кадр {FRAME_MS} мс, вверх до "
+            f"  рекомендуемое wait_fuse_s = {fuse:.2f} с (p99 {worst:.0f} + кадр {FRAME_S * 1000:.0f} мс, вверх до "
             f"{FUSE_STEP_S:g} с)" + (f"; сейчас {now:g}" if now is not None else "")
         )
     return "\n".join(lines)
