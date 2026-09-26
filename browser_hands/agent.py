@@ -616,8 +616,10 @@ class Agent(AgentLike):
         uncertain = decision.operation in ACTING_OPERATIONS and decision.confidence < MIN_ACTION_CONFIDENCE
         if not uncertain:
             self._uncertain = 0
+        # Шаг с `text` DONE не закрывает: его результат проверяет код (поле показывает текст, `_check_typed`).
+        done_counts = current is not None and current.text is None
         if current is not None and (
-            p_done >= STEP_DONE_MIN_P or (selected == "DONE" and p_done >= DONE_STEP_DONE_MIN_P)
+            p_done >= STEP_DONE_MIN_P or (selected == "DONE" and done_counts and p_done >= DONE_STEP_DONE_MIN_P)
         ):
             # Шаг выполнен по свежей странице; действие этого решения выбиралось под этот шаг — не исполняется,
             # следующий тик спросит Jev уже под новый шаг (docs/plan-scenarios.md §0.6).
@@ -639,6 +641,11 @@ class Agent(AgentLike):
                 return
             if selected != "BLOCKED":
                 raise ValueError(f"Decision {decision.operation} is not allowed while checking the step")
+        elif current is not None and selected == "DONE" and current.text is not None:
+            # DONE на шаге с текстом до ввода (Википедия 26.09: p=0.36 до ввода запроса) — не повод для проверки и
+            # `unconfirmed`: текст не напечатан, это код знает сам. Решение отброшено, новый вопрос по свежей странице.
+            self._look_again(page, "DONE до ввода текста шага")
+            return
         elif current is not None and selected == "DONE":
             # DONE без подтверждения step_done — шаг не выполнен, решение отброшено без мутации. Режим проверки:
             # успокоение, свежий снимок и вопрос только с DONE/WAIT/BLOCKED (живая проверка 26.09: иначе Jev искал, что

@@ -1952,6 +1952,20 @@ def test_check_after_unconfirmed_done(monkeypatch, answers, status, settles):
     assert all(h["kind"] == "wait" for h in agent._history)  # Jev видит, что ждали
 
 
+def test_done_on_a_text_step_before_typing_is_ignored_not_checked(monkeypatch):
+    tab = make_tab()
+    agent = make_agent(tab, steps=[ScenarioStep("Type the query into the search box", text="Gödel")], goal="")
+    choose = scripted(
+        decision("DONE", "DONE", step_done=0.36),  # Википедия 26.09: DONE до ввода текста шага
+        decision("DONE", "DONE", step_done=0.6),  # и даже с p ≥ 0.5 DONE не закрывает шаг с текстом
+        decision("e1", "TYPE_TEXT", step_done=0.1),
+    )
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert verifies(choose) == [False, False, False]  # без режима проверки
+    assert tab.act.call_count == 1 and result.status != "unconfirmed"
+
+
 def test_check_never_executes_an_action_even_if_one_comes_back(monkeypatch):
     tab = make_tab()
     agent = make_agent(tab, steps=TWO, goal="")
