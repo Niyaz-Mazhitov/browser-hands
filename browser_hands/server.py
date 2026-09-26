@@ -406,7 +406,8 @@ def tab_line(result: RunResult) -> str | None:
 
 
 def scenario_lines(result: RunResult, steps: Sequence[ScenarioStep] | None = None) -> list[str]:
-    """Итог сценария: «сценарий: k из M выполнено» и, если не `done`, «остановился на шаге k+1 из M: <do>».
+    """Итог сценария: «сценарий: k из M выполнено» и, если не `done`, «остановился на шаге k+1 из M: <do>»; при
+    `unconfirmed` — «шаг k+1 из M не подтверждён (вероятно, выполнен — проверь скриншот): <do>».
 
     Режим цели (`scenario_total` None) — пусто. `do` берётся из `steps`, если это тот же сценарий (M шагов).
     """
@@ -415,7 +416,10 @@ def scenario_lines(result: RunResult, steps: Sequence[ScenarioStep] | None = Non
         return []
     lines = [f"сценарий: {done} из {total} выполнено"]
     if result.status != "done" and done < total:
-        stopped = f"остановился на шаге {done + 1} из {total}"
+        if result.status == "unconfirmed":
+            stopped = f"шаг {done + 1} из {total} не подтверждён (вероятно, выполнен — проверь скриншот)"
+        else:
+            stopped = f"остановился на шаге {done + 1} из {total}"
         if steps is not None and len(steps) == total:
             stopped += f": {steps[done].do}"
         lines.append(stopped)

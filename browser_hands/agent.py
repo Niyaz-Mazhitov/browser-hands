@@ -10,12 +10,16 @@
 
 Сценарий (`steps`, docs/plan-scenarios.md §4.2): Jev ведёт текущий шаг и в том же запросе отвечает «шаг выполнен?»
 (`step_done`). Шаг закрыт — P(yes) ≥ `STEP_DONE_MIN_P` или DONE операции с P(yes) ≥ `DONE_STEP_DONE_MIN_P` на свежей
-странице (действие этого решения не исполняется: выбиралось под старый шаг) или успешный TYPE_TEXT текста шага. DONE
-без такого P(yes) — «не выполнен»: без мутации, счётчик шага растёт, как за WAIT. Текст шага печатается дословно и
-только через `Tab.act` в поле, которое выбрал Jev (проверка фокуса, не password/file); текстовая модель — только для
-шага без `text` и только при `goal` (без него — `blocked`), тексты шагов ей не уходят. На шаг — не больше
-`STEP_ACTIONS_LIMIT` действий (`step_limit`), «3 без изменений» — внутри шага; решений — `2 × max_steps + M`;
-последний шаг закрыт — `done`.
+странице (действие этого решения не исполняется: выбиралось под старый шаг) или TYPE_TEXT текста шага, после которого
+поле на свежем снимке этот текст показывает (пропал — пометка в истории и новое решение Jev; после `RETYPE_LIMIT`
+повторов — `blocked`). DONE без такого P(yes) — режим проверки: успокоение, свежий снимок и вопрос только с DONE, WAIT
+и BLOCKED; снова DONE без подтверждения или второй WAIT — `unconfirmed`. Текст шага печатается дословно и только через
+`Tab.act` в поле, которое выбрал Jev (проверка фокуса, не password/file); текстовая модель — только для шага без `text`
+и только при `goal` (без него — `blocked`), тексты шагов ей не уходят. На шаг — не больше `STEP_ACTIONS_LIMIT` действий
+(`step_limit`), «3 без изменений» — внутри шага; решений — `2 × max_steps + M`; последний шаг закрыт — `done`.
+
+В обоих режимах CLICK/TYPE_TEXT/SELECT с уверенностью ниже `MIN_ACTION_CONFIDENCE` не исполняется: первый раз — как WAIT
+(успокоение, свежий снимок, новый вопрос), второй подряд — `blocked` (docs/core-notes.md, «Живая проверка WhatsApp»).
 
 Вкладка: в attach — открытая вкладка пользователя (`Chrome.find_user_tab`: тот же хост и порт, задан только сайт или
 ровно эта страница), без навигации; в конце — только `release()`, никогда не закрывается. Все подходящие заняты или
@@ -28,7 +32,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Any
+import unicodedata
+from typing import Any, NoReturn
 
 from .browser import NAVIGATE_TIMEOUT_S, StalePage, Tab, url_host
 from .cdp import CDPError, ChromeDisconnected, TabGone
@@ -62,8 +67,17 @@ INTERACTIVE_KINDS = frozenset({"fill", "click", "select"})
 TEXT_ATTEMPTS = 2  # текст переспрашивается один раз (невалидный ответ, таймаут): до ввода, ничего не напечатано
 STEP_DONE_MIN_P = 0.7  # P(yes) головы `step_done`, с которой шаг сценария выполнен (docs/plan-scenarios.md §0.2)
 DONE_STEP_DONE_MIN_P = 0.5  # DONE операции закрывает шаг, только если P(yes) в том же ответе не ниже (после ревью)
-STEP_ACTIONS_LIMIT = 6  # действий на шаг сценария (WAIT и неподтверждённый DONE считаются); больше — step_limit (§0.4)
+STEP_ACTIONS_LIMIT = 6  # действий на шаг сценария (WAIT считается); больше — step_limit (§0.4)
 LOG_LABEL_MAX = 40  # подпись элемента в INFO — не длиннее, с «…» (имя чата, тема письма); полностью — в результате
+# Живая проверка WhatsApp 26.09 (docs/core-notes.md):
+RETYPE_LIMIT = 2  # повторных вводов текста шага, пропавшего из поля; пропал и после них — blocked
+TEXT_VANISHED = "text vanished after typing (page re-rendered)"  # пометка в истории (Jev видит в recent_actions)
+CHECK_WAITS = 2  # WAIT в режиме проверки после неподтверждённого DONE: второй — unconfirmed
+MIN_ACTION_CONFIDENCE = 0.3  # уверенность (`conf` шага) CLICK/TYPE_TEXT/SELECT ниже — не исполняется
+UNCERTAIN_LIMIT = 2  # неуверенных действий подряд — blocked
+ACTING_OPERATIONS = frozenset({"CLICK", "TYPE_TEXT", "SELECT"})
+# Эмодзи и прочие символы: WhatsApp может рисовать эмодзи в поле картинкой (<img alt>), в innerText их нет.
+SYMBOL_CATEGORIES = frozenset({"So", "Sk", "Cf", "Mn", "Me", "Cs", "Co"})
 
 
 def short_label(label: str) -> str:
@@ -74,6 +88,41 @@ def short_label(label: str) -> str:
 def interactive(page: dict[str, Any]) -> bool:
     """В снимке есть хотя бы один элемент для действия (`fill|click|select`); `wait`/`scroll_*` не считаются."""
     return any(a.get("kind") in INTERACTIVE_KINDS for a in page.get("actions") or ())
+
+
+def typed_fields(page: dict[str, Any], action: dict[str, Any]) -> list[dict[str, Any]]:
+    """Поле, куда печатали, на новом снимке: тот же узел, если он ещё есть; иначе — поля той же роли и подписи (сайт
+    перерисовал поле — узел новый). Пусто — поля не видно."""
+    fields = [a for a in page.get("actions") or () if a.get("kind") in {"fill", "click"} and "node" in a]
+    same = [a for a in fields if a["node"] == action.get("node")]
+    if same:
+        return same
+    return [
+        a
+        for a in fields
+        if a["kind"] == "fill" and a.get("role") == action.get("role") and a.get("label") == action.get("label")
+    ]
+
+
+def _spaces(text: str) -> str:
+    return " ".join(text.split())  # str.split() режет и по NBSP, переводам строк
+
+
+def _bare(text: str) -> str:
+    """Текст без эмодзи и символов (`SYMBOL_CATEGORIES`), пробелы нормализованы."""
+    text = unicodedata.normalize("NFC", text)
+    return _spaces("".join(c for c in text if unicodedata.category(c) not in SYMBOL_CATEGORIES))
+
+
+def shows_text(value: Any, text: str) -> bool:
+    """Значение поля содержит текст шага (пробелы нормализованы). Запасное сравнение — без эмодзи и символов с обеих
+    сторон, если без них от текста что-то остаётся: эмодзи картинкой в innerText не попадает."""
+    if not isinstance(value, str):
+        return False
+    if _spaces(text) in _spaces(value):
+        return True
+    bare = _bare(text)
+    return bool(bare) and bare in _bare(value)
 
 
 class RunTimeout(TimeoutError):
@@ -139,6 +188,10 @@ class Agent(AgentLike):
         self._history: list[dict[str, Any]] = []
         self._pending_text: tuple[dict[str, Any], str, TextHelper] | None = None
         self._second_chance_used = False  # BLOCKED переспрашивается раз; снова — после действия, сменившего страницу
+        self._checking = False  # режим проверки шага после неподтверждённого DONE: Jev видит только DONE/WAIT/BLOCKED
+        self._check_waits = 0  # WAIT в режиме проверки
+        self._vanished = 0  # сколько раз на шаге текст шага пропал из поля после ввода
+        self._uncertain = 0  # неуверенных действий подряд (уверенность ниже MIN_ACTION_CONFIDENCE)
         self._model_calls = 0
         self._jev_calls = 0
         self._scenario_no = 1  # текущий шаг сценария (с 1)
@@ -397,6 +450,7 @@ class Agent(AgentLike):
         self._step_actions = 0
         self._step_history = len(self._history)
         self._second_chance_used = False
+        self._checking, self._check_waits, self._vanished, self._uncertain = False, 0, 0, 0
         if self._scenario_done >= total:
             raise _Stop("done")
         self._scenario_no += 1
@@ -419,25 +473,48 @@ class Agent(AgentLike):
             self._second_chance_used = False
         return changed
 
-    def _look_after_typing(self, page: dict[str, Any], step: Step) -> None:
-        """Последний шаг закрыт вводом текста, а снимок после ввода устарел: ещё один снимок без гарантии успеха, чтобы
-        url и title результата были после ввода. Снова устарел — url и title вкладки (`Tab.location`,
-        `Target.getTargetInfo`); нет и их — прежний снимок (до ввода). Шаг уже выполнен: ошибки CDP исход не меняют."""
+    def _refresh_page(self) -> None:
+        """Прогон кончается `unconfirmed`: url и title результата — со свежего снимка. Устарел — url и title вкладки
+        (`Tab.location`, `Target.getTargetInfo`); нет и их — прошлый снимок. Ошибки CDP исход не меняют."""
         tab = self._require_tab()
         try:
             try:
-                new_page = tab.observe()
+                self._page = tab.observe()
             except StalePage:
                 self._location = tab.location()
-                return
         except (TabGone, ChromeDisconnected) as exc:
             self._tab_dead = True
-            log.debug("Снимок после ввода не снят: %s", exc)
-            return
+            log.debug("Снимок в конце не снят: %s", exc)
         except (CDPError, TimeoutError) as exc:
-            log.debug("Снимок после ввода не снят: %s", exc)
+            log.debug("Снимок в конце не снят: %s", exc)
+
+    def _unconfirmed(self, decision: Decision) -> NoReturn:
+        """Режим проверки не подтвердил шаг (снова DONE без подтверждения или второй WAIT): `unconfirmed`, url и title
+        — свежие, финальный кадр снимет `_finish`."""
+        total = len(self.scenario or ())
+        log.info(
+            "шаг %d/%d не подтверждён при проверке (%s, p=%.2f)",
+            self._scenario_no,
+            total,
+            decision.operation,
+            decision.step_done or 0.0,
+        )
+        self._refresh_page()
+        raise _Stop("unconfirmed", f"{self._step_name()}: probably done, not confirmed — check the screenshot")
+
+    def _check_typed(self, action: dict[str, Any], text: str, new_page: dict[str, Any]) -> None:
+        """Текст шага напечатан: шаг закрыт, только если поле на свежем снимке его показывает (`typed_fields`,
+        `shows_text`). Нет — пометка `TEXT_VANISHED` в истории, решает Jev по этому снимку (повторный ввод допустим);
+        пропал и после `RETYPE_LIMIT` повторов — `blocked`."""
+        if any(shows_text(field.get("value"), text) for field in typed_fields(new_page, action)):
+            self._advance("text typed")
             return
-        self._record_observation(page, new_page, step)
+        self._vanished += 1
+        self._history[-1]["note"] = TEXT_VANISHED
+        total = len(self.scenario or ())
+        log.info("шаг %d/%d: текста нет в поле после ввода (%d-й раз)", self._scenario_no, total, self._vanished)
+        if self._vanished > RETYPE_LIMIT:
+            raise _Stop("blocked", f"{self._step_name()}: typed text does not stay in the field")
 
     def _field_text(self, context: dict[str, Any]) -> tuple[str, TextHelper]:
         """Текст для TYPE_TEXT. Невалидный ответ или ошибка провайдера (`InvalidTextValue`) и таймаут (`ModelTimeout`,
@@ -466,14 +543,18 @@ class Agent(AgentLike):
         raise AssertionError("unreachable")
 
     def _second_look(self, page: dict[str, Any]) -> None:
-        """Второй шанс перед BLOCKED: успокоение, переснимок и ещё одно решение Jev (в следующем тике). Не шаг: `Step`
-        не создаётся, в истории — честная запись ожидания (Jev видит, что ждали). Один раз, пока действие не изменит
-        страницу. Отмена и дедлайн — до ожидания; время — `wait_ms`."""
-        tab = self._require_tab()
+        """Второй шанс перед BLOCKED (`_look_again`): один раз, пока действие не изменит страницу."""
         self._second_chance_used = True
+        self._look_again(page, "BLOCKED")
+
+    def _look_again(self, page: dict[str, Any], why: str) -> None:
+        """Новое решение Jev без действия: успокоение, переснимок, вопрос — в следующем тике. Второй шанс перед BLOCKED,
+        проверка шага после неподтверждённого DONE и WAIT в ней, неуверенное действие. Не шаг: `Step` не создаётся, в
+        истории — честная запись ожидания (Jev видит, что ждали). Отмена и дедлайн — до ожидания; время — `wait_ms`."""
+        tab = self._require_tab()
         self._check_cancel()
         self._remaining()
-        log.info("BLOCKED: жду успокоения и спрашиваю ещё раз (%s)", url_host(page["url"]))
+        log.info("%s: жду успокоения и спрашиваю ещё раз (%s)", why, url_host(page["url"]))
         self._history.append(
             {
                 "step": len(self._history) + 1,
@@ -506,7 +587,13 @@ class Agent(AgentLike):
         started = time.perf_counter()
         try:
             decision = choose(
-                self.clients, self._page, self.goal, self._history, timeout=remaining, step=self._step_context()
+                self.clients,
+                self._page,
+                self.goal,
+                self._history,
+                timeout=remaining,
+                step=self._step_context(),
+                verify=self._checking,
             )
         finally:
             self._model_calls += 1
@@ -526,6 +613,9 @@ class Agent(AgentLike):
         selected = decision.choice
         current = self._scenario_step()
         p_done = decision.step_done or 0.0
+        uncertain = decision.operation in ACTING_OPERATIONS and decision.confidence < MIN_ACTION_CONFIDENCE
+        if not uncertain:
+            self._uncertain = 0
         if current is not None and (
             p_done >= STEP_DONE_MIN_P or (selected == "DONE" and p_done >= DONE_STEP_DONE_MIN_P)
         ):
@@ -535,13 +625,28 @@ class Agent(AgentLike):
                 raise StalePage("Page changed since the decision. Choose again.")
             self._advance(f"{'DONE, ' if selected == 'DONE' else ''}p={p_done:.2f}")
             return
-        if current is not None and selected == "DONE":
-            # DONE без подтверждения step_done — шаг не выполнен: без мутации и записи, решение отброшено; счётчик шага
-            # растёт, как за WAIT (Jev, упорно отвечающий DONE, упрётся в step_limit).
-            self._check_step_limit()
-            self._step_actions += 1
+        if self._checking:
+            # Режим проверки — без действий: снова DONE без подтверждения или второй WAIT — `unconfirmed`, BLOCKED — как
+            # обычно (второй шанс, потом blocked). Другое сюда не доходит (`build_request(verify=True)`), но и не
+            # исполняется.
+            if selected == "DONE":
+                self._unconfirmed(decision)
+            if decision.operation == "WAIT":
+                self._check_waits += 1
+                if self._check_waits >= CHECK_WAITS:
+                    self._unconfirmed(decision)
+                self._look_again(page, "WAIT при проверке шага")
+                return
+            if selected != "BLOCKED":
+                raise ValueError(f"Decision {decision.operation} is not allowed while checking the step")
+        elif current is not None and selected == "DONE":
+            # DONE без подтверждения step_done — шаг не выполнен, решение отброшено без мутации. Режим проверки:
+            # успокоение, свежий снимок и вопрос только с DONE/WAIT/BLOCKED (живая проверка 26.09: иначе Jev искал, что
+            # ещё сделать, и кликнул мимо).
             total = len(self.scenario or ())
-            log.info("шаг %d/%d: DONE без подтверждения (p=%.2f) — не выполнен", self._scenario_no, total, p_done)
+            log.info("шаг %d/%d: DONE без подтверждения (p=%.2f) — проверяю", self._scenario_no, total, p_done)
+            self._checking = True
+            self._look_again(page, "DONE")
             return
         if selected in {"DONE", "BLOCKED"}:
             if not tab.fresh(page):
@@ -558,6 +663,18 @@ class Agent(AgentLike):
         action = next((a for a in page["actions"] if a["id"] == selected), None)
         if action is None:
             raise ValueError(f"Decision {selected!r} is not an observed action")
+        if uncertain:
+            # Неуверенное действие не исполняется (26.09: CLICK «00:31 Sent», conf 0.25): первый раз — как WAIT, второй
+            # подряд — blocked.
+            self._uncertain += 1
+            if self._uncertain >= UNCERTAIN_LIMIT:
+                raise _Stop(
+                    "blocked",
+                    f"uncertain action: {decision.operation} on {short_label(action['label'])} "
+                    f"(conf {decision.confidence:.2f})",
+                )
+            self._look_again(page, f"{decision.operation} conf {decision.confidence:.2f}")
+            return
         if len(self.steps) >= self.config.max_steps:
             raise _Stop("step_limit", f"Stopped at max_steps={self.config.max_steps}")
         if current is not None:
@@ -609,20 +726,24 @@ class Agent(AgentLike):
             scenario_step=None if current is None else self._scenario_no,
         )
         self.steps.append(step)
-        # Текст шага напечатан (Tab.act прошёл свежесть и фокус) — шаг выполнен без вопроса к Jev (§0.3).
+        # Текст шага напечатан (Tab.act прошёл свежесть и фокус): шаг закрывается, если поле его показывает на свежем
+        # снимке (`_check_typed`), без вопроса к Jev (§0.3).
         typed_step_text = (
             current is not None and current.text is not None and action["kind"] == "fill" and text == current.text
         )
         if current is not None:
             self._step_actions += 1
         try:
-            new_page = tab.observe()
-        except StalePage:
-            if typed_step_text:
-                if self._scenario_done + 1 >= len(self.scenario or ()):
-                    self._look_after_typing(page, step)  # последний шаг: url/title результата — после ввода
-                self._advance("text typed")  # снимок не удался, но ввод был: шаг закрыт; последний — done
-            raise
+            try:
+                new_page = tab.observe()  # после успокоения (`after_input`)
+            except StalePage:
+                if not typed_step_text:
+                    raise
+                # Снимок после ввода текста шага устарел: ещё один после успокоения; снова — наружу, шаг не закрыт,
+                # решит Jev по следующему снимку.
+                log.info("Снимок после ввода устарел: жду успокоения и снимаю ещё раз (%s)", url_host(page["url"]))
+                tab.settle({"kind": "retry"})
+                new_page = tab.observe()
         finally:
             step.timing, step.cost = self._drain()
         changed = self._record_observation(page, new_page, step)
@@ -643,8 +764,8 @@ class Agent(AgentLike):
             "" if current is None else f" [шаг {self._scenario_no}/{len(self.scenario or ())}]",
         )
         log.debug("step %d text=%r url=%s", step.index, text, new_page["url"])
-        if typed_step_text:
-            self._advance("text typed")
+        if typed_step_text and text is not None:
+            self._check_typed(action, text, new_page)
         # Только действия текущего шага (в режиме цели — все): закрытые шаги с неизменной страницей не копятся.
         repeated = self._history[max(self._step_history, len(self._history) - NO_PROGRESS_STEPS) :]
         if len(repeated) == NO_PROGRESS_STEPS and all(

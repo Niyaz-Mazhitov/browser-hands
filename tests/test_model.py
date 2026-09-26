@@ -798,3 +798,72 @@ def test_goal_mode_ignores_a_step_done_answer():
     d = model.choose(make_clients(post), page(), "Find a book", [])
     assert d.step_done is None and d.choice == "e1"
     assert "step_done" not in post.call_args.args[2]["questions"]
+
+
+# --- живая проверка WhatsApp 26.09: режим проверки и пометка в истории ------------------------------------------------
+
+
+def check_request(number=4):
+    config = ModelConfig(jev_api_key="test-jev")
+    step = model.StepContext(tuple(SCENARIO), number)
+    return model.build_request(config, rich_page(), "", rich_history(), step=step, verify=True)
+
+
+def test_check_request_offers_only_done_wait_and_blocked():
+    body, operations, targets, controls = check_request()
+    assert list(operations) == ["WAIT", "DONE", "BLOCKED"]
+    assert list(body["questions"]) == ["operation", "step_done"]  # ни одной головы *_target
+    assert set(body["questions"]["operation"]["criteria"]) == {"WAIT", "DONE", "BLOCKED"}
+    assert targets == {} and set(controls) == {"WAIT"}
+    assert operations["DONE"] == "The current step is visibly complete."
+    # страница та же (поля и значения видны), но операций у элементов нет
+    normal, *_ = model.build_request(
+        ModelConfig(jev_api_key="test-jev"), rich_page(), "", rich_history(), step=model.StepContext(tuple(SCENARIO), 4)
+    )
+    elements = body["state"]["elements"]
+    assert elements and all("operations" not in e for e in elements)
+    assert elements == [{k: v for k, v in e.items() if k != "operations"} for e in normal["state"]["elements"]]
+    assert body["questions"]["step_done"] == normal["questions"]["step_done"]
+
+
+def check_answers(body, operation):
+    no = {"choice": "no", "confidence": 0.9, "probabilities": {"yes": 0.17, "no": 0.83}}
+    return {
+        "model": "test",
+        "answers": {"operation": choice(body["questions"]["operation"]["criteria"], operation), "step_done": no},
+    }
+
+
+def test_check_answer_can_only_be_done_wait_or_blocked():
+    step = model.StepContext(tuple(SCENARIO), 4)
+    wait = Mock(side_effect=lambda _u, _k, body, **_kw: check_answers(body, "WAIT"))
+    d = model.choose(make_clients(wait), rich_page(), "", [], step=step, verify=True)
+    assert (d.choice, d.operation, d.target) == ("wait", "WAIT", None) and d.step_done == 0.17
+
+    def click(_u, _k, body, **_kw):
+        out = check_answers(body, "WAIT")
+        out["answers"]["operation"] = {"choice": "CLICK", "confidence": 1.0, "probabilities": {"CLICK": 1.0}}
+        out["answers"]["click_target"] = choice(["1", "2"], "2")
+        return out
+
+    with pytest.raises(ValueError, match="Invalid Jev response; no action executed"):
+        model.choose(make_clients(Mock(side_effect=click)), rich_page(), "", [], step=step, verify=True)
+    with pytest.raises(ValueError, match="verify needs a scenario step"):
+        model.build_request(ModelConfig(jev_api_key="k"), rich_page(), "goal", [], verify=True)
+
+
+def test_history_note_reaches_jev_only_where_it_is_set():
+    history = rich_history()
+    history[-2]["note"] = "text vanished after typing (page re-rendered)"
+    body, *_ = model.build_request(
+        ModelConfig(jev_api_key="test-jev"), rich_page(), "", history, step=model.StepContext(tuple(SCENARIO), 3)
+    )
+    recent = body["state"]["recent_actions"]
+    assert recent[-2] == {
+        "action": "Search",
+        "kind": "fill",
+        "text": "Рабочий",
+        "page_changed": True,
+        "note": "text vanished after typing (page re-rendered)",
+    }
+    assert all("note" not in a for a in recent[:-2] + recent[-1:])

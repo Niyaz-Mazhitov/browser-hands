@@ -1,5 +1,6 @@
 import threading
 from pathlib import Path
+from typing import get_args
 
 import pytest
 
@@ -14,8 +15,8 @@ from browser_hands.scenario import (
     parse_steps,
     render,
 )
-from browser_hands.types import RunResult, Step, Timing
-from tests.fakes import FakeChrome, FakeClients, FakeCore, make_result
+from browser_hands.types import RunResult, Status, Step, Timing
+from tests.fakes import FakeChrome, FakeClients, FakeCore, make_result, unconfirmed_result
 
 
 def test_contract_defaults_and_timing_sum():
@@ -145,3 +146,10 @@ def test_fakes_carry_scenario():
     core.agent_factory(FakeChrome(), FakeClients(), "https://x.test", "goal", RunConfig(), **kwargs)
     assert core.agents[0]["steps"] == steps
     assert core.agents[1]["steps"] is None
+
+
+def test_unconfirmed_is_a_status_and_the_fake_carries_it():
+    assert get_args(Status) == ("done", "blocked", "failed", "timeout", "step_limit", "unconfirmed")
+    result = unconfirmed_result()
+    assert result.status == "unconfirmed" and (result.scenario_done, result.scenario_total) == (3, 4)
+    assert result.error == "step 4 of 4: probably done, not confirmed — check the screenshot"

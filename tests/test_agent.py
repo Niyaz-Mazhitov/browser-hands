@@ -42,19 +42,26 @@ def page(text="Search"):
     return state
 
 
-def changing_pages():
+def changing_pages(typed=None):
+    """Каждый снимок — новая страница; `typed` — {узел: текст}: поле показывает то, что в него напечатали."""
     n = 0
     while True:
         n += 1
-        yield page(f"Search {n}")
+        state = page(f"Search {n}")
+        if typed:
+            for action in state["actions"]:
+                if action.get("node") in typed:
+                    action["value"] = typed[action["node"]]
+            state["fingerprint"] = fingerprint(state)
+        yield state
 
 
-def decision(action="e1", operation="TYPE_TEXT", cost=None, step_done=None):
+def decision(action="e1", operation="TYPE_TEXT", cost=None, step_done=None, confidence=1.0):
     return Decision(
         choice=action,
         operation=operation,
         target="1",
-        confidence=1.0,
+        confidence=confidence,
         probabilities={action: 1.0},
         cost=cost,
         latency_ms=10,
@@ -63,10 +70,20 @@ def decision(action="e1", operation="TYPE_TEXT", cost=None, step_done=None):
 
 
 def make_tab(owned=True):
+    """Mock-вкладка: снимки меняются, напечатанный текст остаётся в поле (`tab.typed`) — как на обычной странице."""
     tab = Mock()
     tab.owned = owned
     tab.fresh.return_value = True
-    tab.observe.side_effect = changing_pages()
+    typed = {}
+
+    def act(action, _page, text=None):
+        if action["kind"] == "fill":
+            typed[action["node"]] = text
+        return {"executed": action["id"]}
+
+    tab.act.side_effect = act
+    tab.typed = typed
+    tab.observe.side_effect = changing_pages(typed)
     tab.take_timing.return_value = Timing(browser_ms=2, wait_ms=1)
     tab.screenshot.return_value = JPEG
     tab.location.return_value = None  # Target.getTargetInfo не ответил
@@ -682,6 +699,7 @@ def fake_user_chrome(server, tmp_path):
     state.update(
         url="https://web.whatsapp.com/", w=1728, h=1000, marker="m1", page_key=["k"], guards={"10": "g", "20": "g"}
     )
+    server.state = state  # что отдаёт снимок страницы; тест может менять
 
     def evaluate(frame, ws):
         if server.page_js(frame, ws):  # метка __bhOwner и уборка в release()
@@ -1391,19 +1409,6 @@ def test_scenario_stale_page_on_step_done_reobserves_without_closing(monkeypatch
     tab.act.assert_not_called()
 
 
-def test_scenario_text_step_closes_even_if_the_snapshot_after_typing_is_stale(monkeypatch):
-    tab = make_tab()
-    tab.observe.side_effect = [page(), StalePage("navigating"), page("Typed"), page("Typed")]
-    steps = [ScenarioStep("Type the query", "Gödel's incompleteness theorems"), ScenarioStep("Open the article")]
-    agent = make_agent(tab, steps=steps, goal="")
-    choose = scripted(decision("e1", "TYPE_TEXT", step_done=0.0), DONE_STEP)
-    monkeypatch.setattr(loop, "choose", choose)
-    result = agent.run()
-    assert result.status == "done" and result.scenario_done == 2 and numbers(choose) == [1, 2]
-    assert len(result.steps) == 1 and result.steps[0].page_changed is None
-    assert tab.act.call_args.kwargs["text"] == "Gödel's incompleteness theorems"
-
-
 def test_scenario_cancel_before_the_action_keeps_an_honest_count(monkeypatch):
     cancel = threading.Event()
     tab = make_tab()
@@ -1529,7 +1534,12 @@ def test_scenario_text_end_to_end_reaches_the_page_only_through_insert_text_afte
             else:
                 base(frame, ws)
 
+        def insert_text(frame, ws):  # страница: напечатанное остаётся в поле, снимок его покажет
+            server.state["actions"][0]["value"] = server.state["actions"][1]["value"] = frame["params"]["text"]
+            reply(ws, frame, {})
+
         server.on["Runtime.evaluate"] = evaluate
+        server.on["Input.insertText"] = insert_text
         clients = ModelClients(ModelConfig(jev_api_key="test", text_api_key="test"), http=Mock())
         result = Agent(chrome, clients, "https://web.whatsapp.com", "", RunConfig(timeout_s=30.0), steps=steps).run()
         chrome.close()
@@ -1568,31 +1578,44 @@ def test_scenario_done_closes_the_step_only_when_step_done_confirms_it(monkeypat
     assert result.status == "done" and result.scenario_done == 2
     assert numbers(choose) == ([1, 2] if closed else [1, 1, 2])  # DONE без подтверждения шаг не закрыл
     tab.act.assert_not_called()
-    assert result.steps == [] and agent._history == []  # отклонённый DONE — не действие и не запись истории
+    assert result.steps == []  # отклонённый DONE — не действие; дальше — проверка: только запись ожидания
+    assert [h["kind"] for h in agent._history] == ([] if closed else ["wait"])
     assert loop.DONE_STEP_DONE_MIN_P == 0.5
 
 
-def test_scenario_unconfirmed_done_counts_toward_the_step_limit_like_wait(monkeypatch, caplog):
+def test_scenario_repeated_unconfirmed_done_is_unconfirmed_after_one_check(monkeypatch, caplog):
     tab = make_tab()
     agent = make_agent(tab, steps=TWO, goal="")
     choose = Mock(return_value=decision("DONE", "DONE", step_done=0.1))
     monkeypatch.setattr(loop, "choose", choose)
     result, info = info_lines(caplog, agent.run)
-    assert result.status == "step_limit" and result.error == "Step 1 of 2 not completed after 6 actions"
-    assert result.scenario_done == 0 and result.steps == [] and result.jev_calls == 7
+    assert result.status == "unconfirmed"
+    assert result.error == "step 1 of 2: probably done, not confirmed — check the screenshot"
+    assert result.scenario_done == 0 and result.steps == [] and result.jev_calls == 2
     tab.act.assert_not_called()
-    tab.settle.assert_not_called()
-    assert "шаг 1/2: DONE без подтверждения (p=0.10) — не выполнен" in info
+    tab.settle.assert_called_once_with({"kind": "retry"})
+    assert "шаг 1/2: DONE без подтверждения (p=0.10) — проверяю" in info
+    assert "шаг 1/2 не подтверждён при проверке (DONE, p=0.10)" in info
+
+
+def with_message_box(pages, typed):
+    """Снимки `pages` плюс поле сообщения e4 (узел 30), которое показывает напечатанное в него."""
+    for state in pages:
+        state["actions"].insert(3, {"id": "e4", "kind": "fill", "label": "Message", "role": "textbox", "node": 30})
+        state["actions"][3]["value"] = typed.get(30, "")
+        state["fingerprint"] = fingerprint(state)
+        yield state
 
 
 def test_scenario_texts_never_reach_the_text_model(monkeypatch):
     tab = make_tab()
+    tab.observe.side_effect = with_message_box(changing_pages(tab.typed), tab.typed)
     steps = [
         ScenarioStep("Type the chat name into the chat search box", CHAT),
         ScenarioStep("Type a greeting into the message box"),
     ]
     agent = make_agent(tab, steps=steps, goal="Say hi to the team")
-    choose = scripted(decision("e1", "TYPE_TEXT", step_done=0.0), decision("e1", "TYPE_TEXT", step_done=0.0), DONE_STEP)
+    choose = scripted(decision("e1", "TYPE_TEXT", step_done=0.0), decision("e4", "TYPE_TEXT", step_done=0.0), DONE_STEP)
     monkeypatch.setattr(loop, "choose", choose)
     field_text = Mock(return_value=("hi", TextHelper("t", 5)))
     monkeypatch.setattr(loop, "field_text", field_text)
@@ -1654,56 +1677,15 @@ def test_scenario_decision_budget_is_twice_max_steps_plus_the_steps(monkeypatch)
     assert result.jev_calls == 2 * 3 + 2
 
 
-def after_typing():
-    state = page("Typed")
-    state["url"], state["title"] = "https://example.test/typed", "Typed"
-    state["fingerprint"] = fingerprint(state)
-    return state
-
-
-def test_scenario_last_text_step_looks_again_when_the_snapshot_after_typing_is_stale(monkeypatch):
-    tab = make_tab()
-    tab.observe.side_effect = [page(), StalePage("navigating"), after_typing()]
-    agent = make_agent(tab, steps=[ScenarioStep("Type the query", "q")], goal="")
-    monkeypatch.setattr(loop, "choose", scripted(decision("e1", "TYPE_TEXT", step_done=0.0)))
-    result = agent.run()
-    assert result.status == "done" and result.scenario_done == 1 and result.jev_calls == 1
-    assert (result.url, result.title) == ("https://example.test/typed", "Typed")  # после ввода, не до
-    assert result.steps[0].page_changed is True and result.steps[0].url == "https://example.test/typed"
-    tab.location.assert_not_called()
-
-
-def test_scenario_last_text_step_takes_the_tab_location_when_both_snapshots_are_stale(monkeypatch):
-    tab = make_tab()
-    tab.observe.side_effect = [page(), StalePage("navigating"), StalePage("still navigating")]
-    tab.location.return_value = ("https://example.test/typed", "Typed")
-    agent = make_agent(tab, steps=[ScenarioStep("Type the query", "q")], goal="")
-    monkeypatch.setattr(loop, "choose", scripted(decision("e1", "TYPE_TEXT", step_done=0.0)))
-    result = agent.run()
-    assert result.status == "done" and result.scenario_done == 1
-    assert (result.url, result.title) == ("https://example.test/typed", "Typed")
-    assert result.steps[0].page_changed is None
-    tab.location.assert_called_once_with()
-
-
-@pytest.mark.parametrize(
-    "second", [StalePage("still navigating"), CDPTimeout("slow"), TabGone("closed")], ids=["stale", "cdp", "gone"]
-)
-def test_scenario_last_text_step_keeps_the_old_snapshot_when_the_second_look_fails(monkeypatch, second):
-    tab = make_tab()
-    tab.observe.side_effect = [page(), StalePage("navigating"), second]
-    agent = make_agent(tab, steps=[ScenarioStep("Type the query", "q")], goal="")
-    monkeypatch.setattr(loop, "choose", scripted(decision("e1", "TYPE_TEXT", step_done=0.0)))
-    result = agent.run()
-    # шаг выполнен вводом: неудачный второй взгляд исход не меняет, url/title — снимка до ввода
-    assert result.status == "done" and (result.url, result.title) == ("https://example.test/", "Search")
-    assert result.scenario_done == 1 and result.error is None
-
-
 def test_scenario_no_progress_counts_only_actions_of_the_current_step(monkeypatch):
     tab = make_tab()
-    tab.observe.side_effect = None
-    tab.observe.return_value = page()  # ни одно действие страницу не меняет
+
+    def same_page(*_a, **_k):  # отпечаток — как до действий: страница «не меняется», но текст в поле виден
+        state = page()
+        state["actions"][0]["value"] = tab.typed.get(10, "")
+        return state
+
+    tab.observe.side_effect = same_page
     steps = [ScenarioStep("Fill A", "a"), ScenarioStep("Fill B", "b"), ScenarioStep("Fill C", "c")]
     agent = make_agent(tab, steps=[*steps, ScenarioStep("Submit")], goal="")
     typed = decision("e1", "TYPE_TEXT", step_done=0.0)
@@ -1742,3 +1724,303 @@ def test_step_log_cuts_the_element_label_to_40_characters(monkeypatch, caplog, s
     assert any(m.startswith(f"step 1 CLICK {short!r} @ example.test") for m in info)
     assert all(LONG_LABEL not in m for m in info)
     assert loop.LOG_LABEL_MAX == 40
+
+
+# --- живая проверка WhatsApp 26.09 (docs/core-notes.md, «Живая проверка WhatsApp 26.09 и правки») --------------------
+
+VANISHED = "text vanished after typing (page re-rendered)"
+TYPE_AND_SEND = [ScenarioStep("Type the message into the message box", MESSAGE), ScenarioStep("Send the message")]
+
+
+def field_page(value, *, node=10, text="Рабочий", label="Type a message"):
+    """Чат с полем сообщения (узел `node`, в поле — `value`) и кнопкой Send."""
+    state = {
+        "url": "https://web.whatsapp.com/",
+        "title": "WhatsApp",
+        "text": text,
+        "scroll": {"y": 0},
+        "actions": [
+            {"id": "e1", "kind": "fill", "label": label, "role": "textbox", "value": value, "node": node},
+            {"id": "e2", "kind": "click", "label": f"Open {label}", "role": "textbox", "value": value, "node": node},
+            {"id": "e3", "kind": "click", "label": "Send", "role": "button", "value": "", "node": 20},
+            {"id": "wait", "kind": "wait", "label": "Wait for the page to update"},
+        ],
+    }
+    state["fingerprint"] = fingerprint(state)
+    return state
+
+
+def numbered_pages():
+    """Каждый снимок — свой url и title (`…/n`, `Page n`): видно, с какого снимка url и title результата."""
+    n = 0
+    while True:
+        n += 1
+        state = page(f"Search {n}")
+        state["url"], state["title"] = f"https://example.test/{n}", f"Page {n}"
+        state["fingerprint"] = fingerprint(state)
+        yield state
+
+
+TYPE_MESSAGE = decision("e1", "TYPE_TEXT", step_done=0.0)
+
+
+# п. 1: шаг с `text` закрывается только по видимому результату
+
+
+def test_text_vanished_after_typing_keeps_the_step_open_and_jev_decides_on_the_fresh_page(monkeypatch, caplog):
+    tab = make_tab()
+    tab.observe.side_effect = [
+        field_page("", text="Рабочий (загрузка)"),
+        field_page("", node=11),  # WhatsApp догрузил чат и перерисовал поле: текста нет
+        field_page(MESSAGE, node=11),  # повторный ввод в открытом чате — остался
+    ]
+    agent = make_agent(tab, steps=TYPE_AND_SEND, goal="")
+    choose = scripted(TYPE_MESSAGE, TYPE_MESSAGE, DONE_STEP)
+    monkeypatch.setattr(loop, "choose", choose)
+    result, info = info_lines(caplog, agent.run)
+    assert result.status == "done" and result.scenario_done == 2
+    assert numbers(choose) == [1, 1, 2]  # после пропажи — новое решение Jev на том же шаге
+    assert [c.kwargs["text"] for c in tab.act.call_args_list] == [MESSAGE, MESSAGE]
+    fresh = choose.call_args_list[1].args[1]
+    assert fresh["actions"][0]["node"] == 11 and fresh["actions"][0]["value"] == ""  # по свежему снимку, поле пусто
+    assert agent._history[0]["note"] == VANISHED and "note" not in agent._history[1]
+    assert [s.scenario_step for s in result.steps] == [1, 1]
+    assert sorted(set(info)).count("шаг 1/2 выполнен (text typed, действий 2)") == 1
+
+
+def test_text_that_never_stays_in_the_field_is_blocked_after_two_retypes(monkeypatch):
+    tab = make_tab()
+    tab.observe.side_effect = (field_page("", text=f"Рабочий {n}") for n in range(100))
+    agent = make_agent(tab, steps=TYPE_AND_SEND, goal="")
+    choose = Mock(return_value=TYPE_MESSAGE)
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "blocked" and result.error == "step 1 of 2: typed text does not stay in the field"
+    assert tab.act.call_count == 3 and choose.call_count == 3  # ввод и 2 повторных
+    assert result.scenario_done == 0 and [h.get("note") for h in agent._history] == [VANISHED] * 3
+
+
+@pytest.mark.parametrize(
+    ("shown", "closed"),
+    [
+        (MESSAGE, True),
+        (" это я через агента,\n проверка 👋 ", True),  # пробелы нормализуются
+        ("это я через агента, проверка", True),  # эмодзи картинкой (<img alt>): в innerText его нет
+        ("это я через агента", False),
+        ("", False),
+    ],
+    ids=["same", "spaces", "emoji-img", "part", "empty"],
+)
+def test_text_step_closes_only_when_the_field_shows_the_text(monkeypatch, shown, closed):
+    tab = make_tab()
+    tab.observe.side_effect = [field_page(""), field_page(shown, text="Рабочий 1"), field_page(shown, text="Рабочий 2")]
+    agent = make_agent(tab, steps=TYPE_AND_SEND, goal="")
+    choose = scripted(TYPE_MESSAGE, decision("e3", "CLICK", step_done=0.9), DONE_STEP)
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "done" and result.scenario_done == 2 and tab.act.call_count == 1
+    assert numbers(choose) == ([1, 2] if closed else [1, 1, 2])
+
+
+@pytest.mark.parametrize(
+    ("node", "label", "closed"),
+    [(10, "Type a message", True), (11, "Type a message", True), (11, "Search or start a new chat", False)],
+    ids=["same-node", "same-role-and-label", "other-field"],
+)
+def test_typed_field_is_found_by_node_then_by_role_and_label(monkeypatch, node, label, closed):
+    tab = make_tab()
+    tab.observe.side_effect = [field_page(""), field_page(MESSAGE, node=node, label=label, text="Рабочий 1")]
+    agent = make_agent(tab, steps=TYPE_AND_SEND, goal="")
+    choose = scripted(TYPE_MESSAGE, decision("e3", "CLICK", step_done=0.9), DONE_STEP)
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "done" and tab.act.call_count == 1
+    assert numbers(choose) == ([1, 2] if closed else [1, 1, 2])
+
+
+def test_stale_snapshot_after_typing_is_taken_again_after_settling(monkeypatch):
+    tab = make_tab()
+    tab.observe.side_effect = [field_page(""), StalePage("navigating"), field_page(MESSAGE, text="Рабочий 1")]
+    agent = make_agent(tab, steps=TYPE_AND_SEND, goal="")
+    choose = scripted(TYPE_MESSAGE, DONE_STEP)
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "done" and numbers(choose) == [1, 2]
+    tab.settle.assert_called_once_with({"kind": "retry"})
+    assert result.steps[0].page_changed is True
+
+
+def test_text_step_is_not_closed_when_both_snapshots_after_typing_are_stale(monkeypatch):
+    tab = make_tab()
+    tab.observe.side_effect = [
+        field_page(""),
+        StalePage("navigating"),
+        StalePage("still navigating"),
+        field_page(MESSAGE, text="Рабочий 1"),  # переснимок в следующем тике
+    ]
+    agent = make_agent(tab, steps=TYPE_AND_SEND, goal="")
+    choose = scripted(TYPE_MESSAGE, decision("wait", "WAIT", step_done=0.9), DONE_STEP)
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "done" and numbers(choose) == [1, 1, 2]  # шаг закрыл Jev, а не ввод вслепую
+    assert tab.act.call_count == 1 and result.steps[0].page_changed is None
+    tab.settle.assert_called_once_with({"kind": "retry"})
+    tab.location.assert_not_called()
+
+
+def test_last_text_step_closes_on_the_fresh_snapshot_with_its_url_and_title(monkeypatch):
+    tab = make_tab()
+    after = field_page(MESSAGE, text="Рабочий 1")
+    after["url"], after["title"] = "https://web.whatsapp.com/typed", "Typed"
+    after["fingerprint"] = fingerprint(after)
+    tab.observe.side_effect = [field_page(""), StalePage("navigating"), after]
+    agent = make_agent(tab, steps=TYPE_AND_SEND[:1], goal="")
+    monkeypatch.setattr(loop, "choose", scripted(TYPE_MESSAGE))
+    result = agent.run()
+    assert result.status == "done" and result.scenario_done == 1 and result.jev_calls == 1
+    assert (result.url, result.title) == ("https://web.whatsapp.com/typed", "Typed")
+    tab.location.assert_not_called()
+
+
+@pytest.mark.parametrize("second", [CDPTimeout("slow"), TabGone("closed")], ids=["cdp", "gone"])
+def test_failed_second_snapshot_after_typing_does_not_close_the_step(monkeypatch, second):
+    tab = make_tab()
+    tab.observe.side_effect = [field_page(""), StalePage("navigating"), second]
+    agent = make_agent(tab, steps=TYPE_AND_SEND[:1], goal="")
+    monkeypatch.setattr(loop, "choose", scripted(TYPE_MESSAGE))
+    result = agent.run()
+    assert result.status == "failed" and result.scenario_done == 0
+
+
+# п. 2: после неподтверждённого DONE новых действий нет
+
+
+def verifies(choose):
+    """Флаг режима проверки в каждом вызове Jev."""
+    return [c.kwargs.get("verify", False) for c in choose.call_args_list]
+
+
+def test_whatsapp_send_step_ends_unconfirmed_without_an_extra_click(monkeypatch):
+    """26.09: CLICK Send → DONE p=0.36 → DONE p=0.47 → раньше CLICK «00:31 Sent» (conf 0.25) и step_limit."""
+    tab = make_tab()
+    tab.observe.side_effect = numbered_pages()
+    agent = make_agent(tab, steps=[ScenarioStep("Send the message")], goal="")
+    choose = scripted(
+        decision("e3", "CLICK", step_done=0.1, confidence=0.99),
+        decision("DONE", "DONE", step_done=0.36),
+        decision("DONE", "DONE", step_done=0.47),
+        decision("e3", "CLICK", step_done=0.2, confidence=0.25),  # лишний клик в чужом месте
+    )
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "unconfirmed"
+    assert result.error == "step 1 of 1: probably done, not confirmed — check the screenshot"
+    assert tab.act.call_count == 1 and [s.operation for s in result.steps] == ["CLICK"]
+    assert choose.call_count == 3 and verifies(choose) == [False, False, True]
+    tab.settle.assert_called_once_with({"kind": "retry"})  # перед проверкой — успокоение и свежий снимок
+    assert result.scenario_done == 0 and result.screenshot_jpeg == JPEG
+    last = tab.observe.call_count  # url и title — последнего снимка, снятого после ответа Jev
+    assert (result.url, result.title) == (f"https://example.test/{last}", f"Page {last}")
+    assert choose.call_args_list[2].args[1]["url"] != result.url
+
+
+WAIT_CHECK = decision("wait", "WAIT", step_done=0.1)
+
+
+@pytest.mark.parametrize(
+    ("answers", "status", "settles"),
+    [
+        ([decision("DONE", "DONE", step_done=0.5)], "done", 1),
+        ([WAIT_CHECK, decision("DONE", "DONE", step_done=0.6)], "done", 2),
+        ([decision("wait", "WAIT", step_done=0.8)], "done", 1),  # P(yes) ≥ 0.7 закрывает шаг и в проверке
+        ([decision("DONE", "DONE", step_done=0.2)], "unconfirmed", 1),
+        ([WAIT_CHECK, WAIT_CHECK], "unconfirmed", 2),
+        ([WAIT_CHECK, decision("DONE", "DONE", step_done=0.1)], "unconfirmed", 2),
+    ],
+    ids=["done", "wait-done", "wait-yes", "done-again", "wait-wait", "wait-done-again"],
+)
+def test_check_after_unconfirmed_done(monkeypatch, answers, status, settles):
+    tab = make_tab()
+    agent = make_agent(tab, steps=[ScenarioStep("Send the message")], goal="")
+    choose = scripted(decision("DONE", "DONE", step_done=0.3), *answers)
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == status and choose.call_count == 1 + len(answers)
+    assert verifies(choose) == [False] + [True] * len(answers)
+    tab.act.assert_not_called()
+    assert result.steps == [] and tab.settle.call_count == settles
+    assert all(h["kind"] == "wait" for h in agent._history)  # Jev видит, что ждали
+
+
+def test_check_never_executes_an_action_even_if_one_comes_back(monkeypatch):
+    tab = make_tab()
+    agent = make_agent(tab, steps=TWO, goal="")
+    monkeypatch.setattr(
+        loop, "choose", scripted(decision("DONE", "DONE", step_done=0.3), decision("e3", "CLICK", step_done=0.2))
+    )
+    result = agent.run()
+    assert result.status == "failed" and "not allowed while checking" in result.error
+    tab.act.assert_not_called()
+
+
+def test_check_mode_ends_with_the_step(monkeypatch):
+    tab = make_tab()
+    agent = make_agent(tab, steps=TWO, goal="")
+    choose = scripted(
+        decision("DONE", "DONE", step_done=0.3),
+        decision("DONE", "DONE", step_done=0.9),  # проверка подтвердила шаг 1
+        decision("e3", "CLICK", step_done=0.1),  # шаг 2 — обычный вопрос со всеми действиями
+        DONE_STEP,
+    )
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "done" and verifies(choose) == [False, True, False, False]
+    assert numbers(choose) == [1, 1, 2, 2] and tab.act.call_count == 1
+
+
+# п. 3: порог уверенности для действий
+
+
+def test_uncertain_action_is_not_executed_the_first_time_and_jev_is_asked_again(monkeypatch):
+    tab = make_tab()
+    agent = make_agent(tab)
+    choose = scripted(decision("e3", "CLICK", confidence=0.25), decision("e3", "CLICK", confidence=0.9), DONE)
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "done" and choose.call_count == 3
+    assert tab.act.call_count == 1 and [s.confidence for s in result.steps] == [0.9]
+    tab.settle.assert_called_once_with({"kind": "retry"})  # как WAIT: успокоение, свежий снимок, новый вопрос
+    assert agent._history[0]["kind"] == "wait" and choose.call_args_list[1].args[3][0]["kind"] == "wait"
+
+
+@pytest.mark.parametrize("scenario", [False, True], ids=["goal", "scenario"])
+def test_two_uncertain_actions_in_a_row_are_blocked(monkeypatch, scenario):
+    tab = make_tab()
+    tab.observe.side_effect = long_label_pages()
+    agent = make_agent(tab, steps=TWO if scenario else None, goal="" if scenario else "Open the chat")
+    p = 0.2 if scenario else None
+    choose = scripted(
+        decision("e1", "TYPE_TEXT", step_done=p, confidence=0.1), decision("e3", "CLICK", step_done=p, confidence=0.25)
+    )
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "blocked" and result.error == f"uncertain action: CLICK on {LONG_LABEL[:39]}… (conf 0.25)"
+    tab.act.assert_not_called()
+    assert choose.call_count == 2 and result.steps == []
+
+
+def test_only_consecutive_uncertain_actions_block_and_the_threshold_is_0_3(monkeypatch):
+    tab = make_tab()
+    agent = make_agent(tab)
+    choose = scripted(
+        decision("e3", "CLICK", confidence=0.29),
+        decision("e3", "CLICK", confidence=0.3),  # на пороге — исполняется
+        decision("e3", "CLICK", confidence=0.2),  # снова неуверенно, но не подряд
+        decision("e3", "CLICK", confidence=0.95),
+        DONE,
+    )
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert result.status == "done" and [s.confidence for s in result.steps] == [0.3, 0.95]
+    assert tab.act.call_count == 2 and tab.settle.call_count == 2
+    assert loop.MIN_ACTION_CONFIDENCE == 0.3

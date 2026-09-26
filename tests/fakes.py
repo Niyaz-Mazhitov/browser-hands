@@ -111,6 +111,13 @@ def cancelled_result() -> RunResult:
     return make_result("failed", steps=0, screenshot=None, error="cancelled")
 
 
+def unconfirmed_result(scenario: tuple[int, int] = (3, 4), steps: int = 4) -> RunResult:
+    """Что возвращает ядро, когда шаг `done + 1` сценария, вероятно, выполнен, но Jev его не подтвердил."""
+    done, total = scenario
+    error = f"step {done + 1} of {total}: probably done, not confirmed — check the screenshot"
+    return make_result("unconfirmed", steps=steps, scenario=scenario, error=error)
+
+
 class FakeAgent:
     """AgentLike: возвращает заданный RunResult или бросает; `gate` — держать run(), пока не отпустят.
 

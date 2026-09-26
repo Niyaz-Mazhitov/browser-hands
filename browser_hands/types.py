@@ -3,7 +3,8 @@
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-Status = Literal["done", "blocked", "failed", "timeout", "step_limit"]
+# unconfirmed — сценарий: шаг, вероятно, выполнен, но Jev не подтвердил его и при проверке (смотреть скриншот)
+Status = Literal["done", "blocked", "failed", "timeout", "step_limit", "unconfirmed"]
 TabKind = Literal["user", "new"]  # user — открытая вкладка пользователя (attach), new — своя
 
 
@@ -50,7 +51,7 @@ class RunResult:
     elapsed_ms: int
     timing: Timing  # сумма по шагам + старт (навигация)
     model_calls: int
-    error: str | None = None  # текст причины для failed/timeout
+    error: str | None = None  # текст причины для не-done (failed, timeout, blocked, step_limit, unconfirmed)
     tab_kept: bool = False
     tab: TabKind | None = None  # где работал агент; None — до вкладки не дошло
     scenario_done: int | None = None  # сколько шагов сценария выполнено; None — режим цели
