@@ -1542,17 +1542,22 @@ def test_busy_page_in_headless_chrome_ends_waits_by_fuse_and_its_promise_cleans_
         result = tab.await_change()
         assert result["wait_reason"] == "fuse" and result["change"] is None, result
 
-        before = tab.evaluate("__watchers()")[1]
-        tab.evaluate("busy(3000)")
-        tab.deadline = time.monotonic() + 1.2  # предохранитель 0,7 с, ответа нет и до дедлайна
-        result = tab.await_ready({"kind": "click", "node": 1})
+        # как вкладка пользователя (attach, без сети): ответа нет и до дедлайна, агент её отпускает
+        client = chrome.client
+        attach = {"targetId": tab.target_id, "flatten": True}
+        user = Tab(client, client.call("Target.attachToTarget", attach)["sessionId"], tab.target_id, owned=False)
+        user.setup()
+        before = user.evaluate("__watchers()")[1]
+        user.evaluate("busy(3000)")
+        user.deadline = time.monotonic() + 1.2  # предохранитель 0,7 с
+        result = user.await_ready({"kind": "click", "node": 1})
         assert result["reason"] == "fuse", result
-        tab.release()
-        session = chrome.client.call("Target.attachToTarget", {"targetId": tab.target_id, "flatten": True})["sessionId"]
+        user.release()
+        session = client.call("Target.attachToTarget", attach)["sessionId"]
         check = {"expression": "__idle().then(()=>__watchers())", "awaitPromise": True, "returnByValue": True}
-        live, seen = chrome.client.call("Runtime.evaluate", check, session_id=session, timeout=10.0)["result"]["value"]
+        live, seen = client.call("Runtime.evaluate", check, session_id=session, timeout=10.0)["result"]["value"]
         assert live == 0 and seen > before, (live, seen, before)  # промис отработал после release и снял observer
-        chrome.client.call("Target.detachFromTarget", {"sessionId": session})
+        client.call("Target.detachFromTarget", {"sessionId": session})
 
 
 NETWORK_PAGE = """<!doctype html><body>
