@@ -9,7 +9,7 @@
 Отмена (`cancel`) проверяется перед каждым вызовом модели и каждым действием: `failed` / `cancelled`, без новых мутаций.
 
 Сценарий (`steps`, docs/plan-scenarios.md §4.2): Jev ведёт текущий шаг и в том же запросе отвечает «шаг выполнен?»
-(`step_done`). Шаг закрыт — P(yes) ≥ `STEP_DONE_MIN_P` или DONE операции с P(yes) ≥ `DONE_STEP_DONE_MIN_P` на свежей
+(`step_done`). Шаг закрыт — P(yes) ≥ `step_done_min_p` или DONE операции с P(yes) ≥ `done_step_done_min_p` на свежей
 странице (действие этого решения не исполняется: выбиралось под старый шаг) или TYPE_TEXT текста шага, после которого
 поле на свежем снимке этот текст показывает (пропал — пометка в истории и новое решение Jev; после `RETYPE_LIMIT`
 повторов — `blocked`). DONE без такого P(yes) — режим проверки: успокоение, свежий снимок и вопрос только с DONE, WAIT
@@ -18,8 +18,10 @@
 и только при `goal` (без него — `blocked`), тексты шагов ей не уходят. На шаг — не больше `STEP_ACTIONS_LIMIT` действий
 (`step_limit`), «3 без изменений» — внутри шага; решений — `2 × max_steps + M`; последний шаг закрыт — `done`.
 
-В обоих режимах CLICK/TYPE_TEXT/SELECT с уверенностью ниже `MIN_ACTION_CONFIDENCE` не исполняется: первый раз — как WAIT
+В обоих режимах CLICK/TYPE_TEXT/SELECT с уверенностью ниже `min_action_confidence` не исполняется: первый раз — как WAIT
 (успокоение, свежий снимок, новый вопрос), второй подряд — `blocked` (docs/core-notes.md, «Живая проверка WhatsApp»).
+Пороги — `Agent.thresholds` (`config.Thresholds`, docs/plan-waits.md §4.1); одноимённые константы модуля — алиасы
+значений по умолчанию.
 
 Вкладка: в attach — открытая вкладка пользователя (`Chrome.find_user_tab`: тот же хост и порт, задан только сайт или
 ровно эта страница), без навигации; в конце — только `release()`, никогда не закрывается. Все подходящие заняты или
@@ -38,7 +40,7 @@ from typing import Any, NoReturn
 from .browser import NAVIGATE_TIMEOUT_S, StalePage, Tab, url_host
 from .cdp import CDPError, ChromeDisconnected, TabGone
 from .chrome import Chrome, TabTaken, UserTabUnavailable
-from .config import RunConfig
+from .config import RunConfig, Thresholds
 from .model import (
     Decision,
     InvalidTextValue,
@@ -65,15 +67,17 @@ EMPTY_PAGE_WAIT_LATER_S = 1.0
 EMPTY_PAGE_POLL_S = 0.25
 INTERACTIVE_KINDS = frozenset({"fill", "click", "select"})
 TEXT_ATTEMPTS = 2  # текст переспрашивается один раз (невалидный ответ, таймаут): до ввода, ничего не напечатано
-STEP_DONE_MIN_P = 0.7  # P(yes) головы `step_done`, с которой шаг сценария выполнен (docs/plan-scenarios.md §0.2)
-DONE_STEP_DONE_MIN_P = 0.5  # DONE операции закрывает шаг, только если P(yes) в том же ответе не ниже (после ревью)
+# Пороги модели — `Agent.thresholds` (`config.Thresholds`); константы ниже — алиасы значений по умолчанию (тесты, docs).
+DEFAULT_THRESHOLDS = Thresholds()
+STEP_DONE_MIN_P = DEFAULT_THRESHOLDS.step_done_min_p  # P(yes) головы `step_done`, с которой шаг сценария выполнен
+DONE_STEP_DONE_MIN_P = DEFAULT_THRESHOLDS.done_step_done_min_p  # DONE операции закрывает шаг при P(yes) не ниже
 STEP_ACTIONS_LIMIT = 6  # действий на шаг сценария (WAIT считается); больше — step_limit (§0.4)
 LOG_LABEL_MAX = 40  # подпись элемента в INFO — не длиннее, с «…» (имя чата, тема письма); полностью — в результате
 # Живая проверка WhatsApp 26.09 (docs/core-notes.md):
 RETYPE_LIMIT = 2  # повторных вводов текста шага, пропавшего из поля; пропал и после них — blocked
 TEXT_VANISHED = "text vanished after typing (page re-rendered)"  # пометка в истории (Jev видит в recent_actions)
 CHECK_WAITS = 2  # WAIT в режиме проверки после неподтверждённого DONE: второй — unconfirmed
-MIN_ACTION_CONFIDENCE = 0.3  # уверенность (`conf` шага) CLICK/TYPE_TEXT/SELECT ниже — не исполняется
+MIN_ACTION_CONFIDENCE = DEFAULT_THRESHOLDS.min_action_confidence  # `conf` CLICK/TYPE_TEXT/SELECT ниже — не исполняется
 UNCERTAIN_LIMIT = 2  # неуверенных действий подряд — blocked
 ACTING_OPERATIONS = frozenset({"CLICK", "TYPE_TEXT", "SELECT"})
 # Эмодзи и прочие символы: WhatsApp может рисовать эмодзи в поле картинкой (<img alt>), в innerText их нет.
@@ -154,6 +158,7 @@ class Agent(AgentLike):
         screenshot_scale: float = 1.0,
         steps: list[ScenarioStep] | None = None,
         cancel: threading.Event | None = None,
+        thresholds: Thresholds | None = None,
     ) -> None:
         if not url.strip():
             raise ValueError("Supply a url")
@@ -171,6 +176,7 @@ class Agent(AgentLike):
         self.screenshot_quality = screenshot_quality
         self.screenshot_scale = screenshot_scale
         self.cancel = cancel
+        self.thresholds = thresholds if thresholds is not None else DEFAULT_THRESHOLDS
         self._begin()
 
     # --- состояние одного прогона ------------------------------------------------------------------------------
@@ -191,7 +197,7 @@ class Agent(AgentLike):
         self._checking = False  # режим проверки шага после неподтверждённого DONE: Jev видит только DONE/WAIT/BLOCKED
         self._check_waits = 0  # WAIT в режиме проверки
         self._vanished = 0  # сколько раз на шаге текст шага пропал из поля после ввода
-        self._uncertain = 0  # неуверенных действий подряд (уверенность ниже MIN_ACTION_CONFIDENCE)
+        self._uncertain = 0  # неуверенных действий подряд (уверенность ниже thresholds.min_action_confidence)
         self._model_calls = 0
         self._jev_calls = 0
         self._scenario_no = 1  # текущий шаг сценария (с 1)
@@ -613,13 +619,15 @@ class Agent(AgentLike):
         selected = decision.choice
         current = self._scenario_step()
         p_done = decision.step_done or 0.0
-        uncertain = decision.operation in ACTING_OPERATIONS and decision.confidence < MIN_ACTION_CONFIDENCE
+        limits = self.thresholds
+        uncertain = decision.operation in ACTING_OPERATIONS and decision.confidence < limits.min_action_confidence
         if not uncertain:
             self._uncertain = 0
         # Шаг с `text` DONE не закрывает: его результат проверяет код (поле показывает текст, `_check_typed`).
         done_counts = current is not None and current.text is None
         if current is not None and (
-            p_done >= STEP_DONE_MIN_P or (selected == "DONE" and done_counts and p_done >= DONE_STEP_DONE_MIN_P)
+            p_done >= limits.step_done_min_p
+            or (selected == "DONE" and done_counts and p_done >= limits.done_step_done_min_p)
         ):
             # Шаг выполнен по свежей странице; действие этого решения выбиралось под этот шаг — не исполняется,
             # следующий тик спросит Jev уже под новый шаг (docs/plan-scenarios.md §0.6).

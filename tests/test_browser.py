@@ -16,7 +16,8 @@ import pytest
 
 from browser_hands import browser
 from browser_hands.browser import SETTLE, NavigationFailed, StalePage, Tab, fingerprint, url_host
-from browser_hands.cdp import CDPError, CDPTimeout, ChromeDisconnected, TabGone
+from browser_hands.cdp import CDPClient, CDPError, CDPTimeout, ChromeDisconnected, TabGone
+from tests.fake_cdp import FakeCDPServer, reply
 
 
 def page():
@@ -621,6 +622,133 @@ def test_borrowed_snapshot_tracks_the_window_size_for_scrolling():
     assert (wheel["x"], wheel["y"]) == (round(1440 * 550 / 1120), round(600 * 650 / 780))  # внутри окна
 
 
+# --- контракт ожиданий и значения полей (docs/plan-waits.md §4.2) -------------------------------------------------
+
+
+def test_await_ready_is_settle_and_empty_when_it_did_not_wait():
+    client = Mock()
+    client.call.return_value = SETTLED
+    tab = make_tab(client)
+    assert tab.await_ready({"kind": "click", "node": 20}) == {"reason": "quiet", "ms": 230, "mutations": 4}
+    assert settle_params(client.call.call_args.args[1]["expression"])["action"] == {"kind": "click", "node": 20}
+    assert tab.last_settle == {"reason": "quiet", "ms": 230, "mutations": 4}
+    client.call.return_value = {"exceptionDetails": {"text": "Execution context was destroyed"}}
+    assert tab.await_ready() == {} and tab.last_settle is None  # прервано навигацией
+    tab.cancel = threading.Event()
+    tab.cancel.set()
+    calls = client.call.call_count
+    assert tab.await_ready() == {} and client.call.call_count == calls  # отмена — не ждём
+
+
+def test_await_change_pauses_like_wait_then_settles():
+    client = Mock()
+    client.call.return_value = SETTLED
+    tab = make_tab(client)
+    tab._sleep = Mock()
+    assert tab.await_change() == {"reason": "quiet", "ms": 230, "mutations": 4}
+    tab._sleep.assert_called_once_with(0.1)
+    assert settle_params(client.call.call_args.args[1]["expression"])["action"] == {"kind": "wait"}
+
+
+def test_field_values_reads_all_fields_in_one_evaluate_on_fake_cdp():
+    with FakeCDPServer() as server:
+        values = {"result": {"type": "object", "value": ["book", None]}}
+        server.on["Runtime.evaluate"] = lambda f, ws: reply(ws, f, values)
+        client = CDPClient(server.url, call_timeout=2.0, connect_timeout=2.0)
+        try:
+            tab = Tab(client, "S1", "T1")
+            specs = [{"node": 10, "label": "Search", "value": "секрет"}, {"node": "x", "label": 5}]
+            assert tab.field_values(specs) == ["book", None]
+            assert tab.field_values([]) == []  # пусто — без вызова
+        finally:
+            client.close()
+    (frame,) = server.frames
+    assert frame["method"] == "Runtime.evaluate" and frame["sessionId"] == "S1"
+    assert frame["params"]["returnByValue"] is True and "awaitPromise" not in frame["params"]
+    expression = frame["params"]["expression"]
+    assert expression.startswith(browser.FIELD_VALUES) and expression.endswith(")")
+    # в страницу уходят только узел и подпись; кривые — как null; значения полей и тексты шагов — нет
+    assert json.loads(expression[len(browser.FIELD_VALUES) : -1]) == [
+        {"node": 10, "label": "Search"},
+        {"node": None, "label": None},
+    ]
+    assert "секрет" not in expression
+    assert tab.take_timing().wait_ms == 0  # чтение — работа CDP, не ожидание
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"exceptionDetails": {"text": "Execution context was destroyed"}},
+        {"result": {"type": "object", "value": ["one"]}},  # не по числу полей
+        {"result": {"type": "object", "value": None}},
+    ],
+    ids=["exception", "short", "null"],
+)
+def test_field_values_on_a_changing_document_is_stale(response):
+    client = Mock()
+    client.call.return_value = response
+    with pytest.raises(StalePage):
+        make_tab(client).field_values([{"node": 10, "label": "Search"}, {"node": 20, "label": "Go"}])
+
+
+def test_field_values_expression_shares_label_and_role_code_with_the_snapshot():
+    for helper in (
+        "const safe = e =>",
+        "const visible = e =>",
+        "const name = (e,seen=new Set()) =>",
+        "const role = e =>",
+    ):
+        assert helper in browser.FIELD_VALUES and helper in browser.READ_STATE
+
+
+FAKE_DOM = """
+class El {
+  constructor(tagName, attrs, props) {
+    Object.assign(this, {tagName, attrs, isConnected: true, childNodes: [], readOnly: false}, props);
+  }
+  getAttribute(name) { return name in this.attrs ? this.attrs[name] : null; }
+  closest() { return null; }
+  matches() { return false; }
+  checkVisibility() { return !this.hiddenForTest; }
+}
+const input = (label, value, props={}) => new El('INPUT', {'aria-label': label}, {type: 'text', value, ...props});
+const editor = (label, text, props={}) =>
+  new El('DIV', {'aria-label': label, role: 'textbox'}, {isContentEditable: true, innerText: text, ...props});
+const search = input('Search', 'book');
+const oldMessage = editor('Type a message', 'привет', {isConnected: false});  // пересоздан: узел вне документа
+const hiddenMessage = editor('Type a message', 'чужое', {hiddenForTest: true});
+const newMessage = editor('Type a message', '  привет 👋 ');
+const password = input('Password', 'secret', {type: 'password'});
+const readonly = input('Code', '1234', {readOnly: true});
+const elements = [search, hiddenMessage, newMessage, password, readonly];
+globalThis.document = {querySelectorAll: () => elements, getElementById: () => null};
+const specs = [
+  {node: 1, label: 'Search'}, {node: 2, label: 'Type a message'}, {node: 3, label: 'Password'},
+  {node: null, label: 'Code'}, {node: 99, label: 'Nothing'}, {node: null, label: null},
+  {node: 1, label: 'Renamed'},  // подпись сменилась, узел тот же
+];
+globalThis.window = {__jevFast: {nodes: new Map([[1, search], [2, oldMessage], [3, password]])}};
+const withCache = eval(EXPRESSION);
+globalThis.window = {};  // документ сменился: кэша снимка нет — только по подписи
+const withoutCache = eval(EXPRESSION);
+console.log(JSON.stringify({withCache, withoutCache}));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="нужен node")
+def test_field_values_expression_in_node_by_node_then_by_label():
+    expression = browser.FIELD_VALUES + "specs)"  # исполняем с переменной specs скрипта
+    script = FAKE_DOM.replace("EXPRESSION", json.dumps(expression))
+    done = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=10)
+    assert done.returncode == 0, done.stderr
+    out = json.loads(done.stdout)
+    # узел в документе — его значение; узел пересоздан — первое видимое редактируемое поле с той же подписью;
+    # password не читается ни по узлу, ни по подписи; readonly — не поле ввода; нет ни узла, ни подписи — null
+    assert out["withCache"] == ["book", "привет 👋", None, None, None, None, "book"]
+    assert out["withoutCache"] == ["book", "привет 👋", None, None, None, None, None]  # узел не найти — только подпись
+
+
 # --- SETTLE в node: виртуальное время, фейковые DOM и MutationObserver (tests/settle_harness.js) ------------------
 
 HARNESS = Path(__file__).with_name("settle_harness.js")
@@ -745,5 +873,44 @@ def test_settle_in_headless_chrome_endless_animation_is_capped(tmp_path):
         result = tab.settle({"kind": "click", "node": 1})
         assert result is not None and result["reason"] == "quiet" and result["ms"] < 400, result
         assert tab.take_timing().browser_ms < 500  # почти всё — wait_ms
+    finally:
+        chrome.close()
+
+
+FIELDS_PAGE = """<!doctype html><body><input aria-label="Search">
+<div id=msg contenteditable=true role=textbox aria-label="Type a message"></div>
+<input type=password aria-label="Password" value="secret"></body>"""
+
+
+@pytest.mark.skipif(not CHROME_TESTS, reason="настоящий Chrome — по BROWSER_HANDS_CHROME_TESTS=1")
+def test_field_values_in_headless_chrome_follow_a_re_rendered_field(tmp_path):
+    from urllib.parse import quote
+
+    from browser_hands.chrome import Chrome
+    from browser_hands.config import BrowserConfig
+
+    config = BrowserConfig(mode="launch", headless=True, launch_data_dir=tmp_path / "profile", connect_timeout_s=30.0)
+    if not config.chrome_binary.exists():
+        pytest.skip("нет Chrome")
+    chrome = Chrome(config)
+    chrome.connect()
+    try:
+        tab = chrome.new_tab()
+        tab.navigate("data:text/html," + quote(FIELDS_PAGE))
+        for label, text in (("Search", "book"), ("Type a message", "привет")):
+            state = tab.observe()
+            field = next(a for a in state["actions"] if a["kind"] == "fill" and a["label"] == label)
+            tab.act(field, state, text=text)
+        state = tab.observe()
+        fills = {a["label"]: a["node"] for a in state["actions"] if a["kind"] == "fill"}
+        assert set(fills) == {"Search", "Type a message"}  # password в снимок не попадает
+        specs = [{"node": fills[label], "label": label} for label in ("Search", "Type a message")]
+        specs.append({"node": None, "label": "Password"})
+        assert tab.field_values(specs) == ["book", "привет", None]
+        # поле пересоздано (как у WhatsApp): новый узел с той же подписью, текст потерян — читается новое поле
+        tab.evaluate("(() => { const old=document.getElementById('msg'); old.replaceWith(old.cloneNode(false)); })()")
+        assert tab.field_values(specs) == ["book", "", None]
+        tab.evaluate("document.getElementById('msg').textContent='снова'")
+        assert tab.field_values(specs) == ["book", "снова", None]
     finally:
         chrome.close()

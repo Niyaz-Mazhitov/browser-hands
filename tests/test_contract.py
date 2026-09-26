@@ -1,11 +1,14 @@
+import dataclasses
+import json
 import threading
 from pathlib import Path
 from typing import get_args
 
 import pytest
 
-from browser_hands import model
-from browser_hands.config import RunConfig, Settings
+from browser_hands import model, server
+from browser_hands.cli import result_to_json
+from browser_hands.config import RunConfig, Settings, Thresholds, apply_overrides
 from browser_hands.scenario import (
     MAX_DO,
     MAX_STEPS,
@@ -153,3 +156,57 @@ def test_unconfirmed_is_a_status_and_the_fake_carries_it():
     result = unconfirmed_result()
     assert result.status == "unconfirmed" and (result.scenario_done, result.scenario_total) == (3, 4)
     assert result.error == "step 4 of 4: probably done, not confirmed — check the screenshot"
+
+
+def test_thresholds_are_settings_without_env():
+    t = Settings().thresholds
+    assert t == Thresholds(
+        step_done_min_p=0.7,
+        done_step_done_min_p=0.5,
+        min_action_confidence=0.3,
+        done_min_confidence=0.5,
+        wait_fuse_s=1.5,
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        t.step_done_min_p = 0.9  # type: ignore[misc]
+    # меняет расчёт (docs/calibration.md), не оператор: env порогов нет, флаги их не трогают
+    env = {"BROWSER_HANDS_STEP_DONE_MIN_P": "0.9", "BROWSER_HANDS_WAIT_FUSE_S": "9", "BROWSER_HANDS_THRESHOLDS": "x"}
+    assert Settings.from_env(env).thresholds == Thresholds()
+    custom = Settings(thresholds=Thresholds(wait_fuse_s=2.0))
+    assert apply_overrides(custom, max_steps=5, timeout_s=10.0).thresholds.wait_fuse_s == 2.0
+
+
+def test_service_passes_the_thresholds_to_the_agent(monkeypatch):
+    core = FakeCore()
+    settings = Settings(thresholds=Thresholds(step_done_min_p=0.8))
+    settings.models.jev_api_key = settings.models.text_api_key = "k"
+    monkeypatch.setattr(server, "import_core", lambda name: None)
+    server.BrowseService(settings, **core.factories()).browse("https://x.test", "goal")
+    assert core.agents[0]["thresholds"] is settings.thresholds
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        server, "import_core", lambda name: type("Core", (), {"Agent": lambda *a, **kw: calls.append(kw)})
+    )
+    common = {"screenshot_quality": 60, "screenshot_scale": 1.0, "cancel": threading.Event()}
+    server.default_agent_factory(None, None, "https://x.test", "g", RunConfig(), **common)  # type: ignore[arg-type]
+    server.default_agent_factory(
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        "https://x.test",
+        "g",
+        RunConfig(),
+        thresholds=settings.thresholds,
+        **common,
+    )
+    assert calls[0]["thresholds"] is None and calls[1]["thresholds"] is settings.thresholds
+
+
+def test_step_wait_fields_default_to_not_waited_and_reach_the_json():
+    step = Step(1, "CLICK", "Send", None, True, "https://x.test", 0.9, Timing(), None)
+    assert (step.wait_reason, step.pending_requests) == (None, 0)
+    result = make_result(steps=2)
+    assert [(s.wait_reason, s.pending_requests) for s in result.steps] == [("quiet", 0), ("quiet", 0)]
+    # eval.py и bench.py пишут строку прогона через cli.result_to_json — новые поля шагов в ней есть
+    row = json.loads(json.dumps(result_to_json(result)))
+    assert [(s["wait_reason"], s["pending_requests"]) for s in row["steps"]] == [("quiet", 0), ("quiet", 0)]

@@ -38,6 +38,9 @@ class Step:
     timing: Timing
     cost: float | None  # usage.cost этого шага (Jev + текст), если пришёл
     scenario_step: int | None = None  # номер шага сценария (с 1); None — режим цели
+    # Ожидание после действия (docs/plan-waits.md §2): чем кончилось — quiet|fuse|options|frames|change; None — не ждали
+    wait_reason: str | None = None
+    pending_requests: int = 0  # запросов вкладки в полёте, когда ожидание кончилось (после fuse — фоновые)
 
 
 @dataclass(slots=True)

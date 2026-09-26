@@ -28,6 +28,7 @@ from browser_hands.config import (
     ModelConfig,
     RunConfig,
     Settings,
+    Thresholds,
     apply_overrides,
 )
 from browser_hands.logging import get_logger, quiet_http_loggers
@@ -117,6 +118,7 @@ def default_agent_factory(
     screenshot_scale: float,
     cancel: threading.Event,
     steps: list[ScenarioStep] | None = None,
+    thresholds: Thresholds | None = None,
 ) -> AgentLike:
     agent_cls = import_core("agent").Agent
     scenario = {} if steps is None else {"steps": steps}  # режим цели зовёт ядро как раньше
@@ -129,6 +131,7 @@ def default_agent_factory(
         screenshot_quality=screenshot_quality,
         screenshot_scale=screenshot_scale,
         cancel=cancel,
+        thresholds=thresholds,  # None — пороги ядра по умолчанию
         **scenario,
     )
 
@@ -264,6 +267,7 @@ class BrowseService:
             screenshot_quality=self._settings.browser.screenshot_quality,
             screenshot_scale=self._settings.browser.screenshot_scale,
             cancel=cancel,
+            thresholds=self._settings.thresholds,
             **scenario,
         )
         if steps is None:

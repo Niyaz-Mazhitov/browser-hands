@@ -15,7 +15,7 @@ from browser_hands.agent import Agent
 from browser_hands.browser import FOCUSED, MARKER, MEASURE, READ_STATE, RESOLVE_TARGET, StalePage, fingerprint
 from browser_hands.cdp import CDPError, CDPTimeout, ChromeDisconnected, TabGone
 from browser_hands.chrome import AMBIGUOUS, BUSY, Chrome, TabTaken
-from browser_hands.config import BrowserConfig, ModelConfig, RunConfig
+from browser_hands.config import BrowserConfig, ModelConfig, RunConfig, Settings, Thresholds
 from browser_hands.model import Decision, InvalidTextValue, ModelClients, ModelTimeout, TextHelper
 from browser_hands.scenario import ScenarioError, ScenarioStep
 from browser_hands.types import Timing
@@ -1340,6 +1340,40 @@ def test_scenario_step_done_threshold(monkeypatch, p, closed):
     assert result.status == "done" and result.scenario_done == 2
     assert tab.act.call_count == (0 if closed else 1)
     assert numbers(choose) == ([1, 2] if closed else [1, 1, 2])
+
+
+def test_thresholds_come_from_config_and_the_old_names_are_aliases():
+    assert make_agent().thresholds == Thresholds() == Settings().thresholds
+    defaults = Thresholds()
+    assert (loop.STEP_DONE_MIN_P, loop.DONE_STEP_DONE_MIN_P, loop.MIN_ACTION_CONFIDENCE) == (
+        defaults.step_done_min_p,
+        defaults.done_step_done_min_p,
+        defaults.min_action_confidence,
+    )
+
+
+@pytest.mark.parametrize(
+    ("limits", "acts", "asked"),
+    [
+        (Thresholds(step_done_min_p=0.8), 1, [1, 1, 2]),  # p=0.75 шаг не закрывает, CLICK conf 0.4 ≥ 0.3 исполняется
+        (Thresholds(step_done_min_p=0.75), 0, [1, 2]),  # p=0.75 на пороге — шаг закрыт, действие не исполняется
+        (Thresholds(step_done_min_p=0.8, min_action_confidence=0.5), 0, [1, 1, 2]),  # conf 0.4 < 0.5 — не исполняется
+    ],
+)
+def test_agent_reads_the_thresholds_it_was_given(monkeypatch, limits, acts, asked):
+    tab = make_tab()
+    chrome = Mock()
+    chrome.new_tab.return_value = tab
+    chrome.find_user_tab.return_value = None
+    clients = ModelClients(ModelConfig(jev_api_key="test", text_api_key="test"), http=Mock())
+    run = RunConfig(timeout_s=30.0)
+    agent = Agent(chrome, clients, "https://example.test/", "", run, steps=TWO, thresholds=limits)
+    choose = scripted(decision("e3", "CLICK", step_done=0.75, confidence=0.4), DONE_STEP, DONE_STEP)
+    monkeypatch.setattr(loop, "choose", choose)
+    result = agent.run()
+    assert agent.thresholds is limits
+    assert result.status == "done" and result.scenario_done == 2
+    assert tab.act.call_count == acts and numbers(choose) == asked
 
 
 @pytest.mark.parametrize("action", ["e3", "wait"])

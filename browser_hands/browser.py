@@ -142,6 +142,41 @@ FOCUSED = """(node => {
   return !(d.tagName==='INPUT' && ['password','file','hidden'].includes(d.type));
 })("""
 
+
+def _snapshot_part(first: str, last: str) -> str:
+    """Кусок `snapshot.js` от `first` до `last` включительно: общие функции без второй копии (подпись поля — та же)."""
+    start = READ_STATE.index(first)
+    return READ_STATE[start : READ_STATE.index(last, start) + len(last)]
+
+
+# Только чтение (docs/plan-waits.md §4.2): на каждый {node, label} — значение поля по узлу из кэша снимка, если узел ещё
+# в документе; иначе первого видимого редактируемого поля с той же подписью (сайт перерисовал поле — узел новый); иначе
+# null. safe/visible/name/role — из snapshot.js, «редактируемое» и значение — как там же (fill-действие и его value).
+FIELD_VALUES = (
+    "(specs => {\n"
+    + _snapshot_part("  const safe = e =>", "    return null;\n  };\n")
+    + """  const nodes=window.__jevFast?.nodes;
+  const editable=e=>{
+    const rname=role(e);
+    return !e.readOnly && e.getAttribute('aria-readonly')!=='true' &&
+      (['textbox','searchbox','spinbutton'].includes(rname) ||
+        (rname==='combobox' && ['INPUT','TEXTAREA'].includes(e.tagName)));
+  };
+  const value=e=>'value' in e ? String(e.value) :
+    e.isContentEditable || role(e)==='combobox' ? e.innerText.trim() : '';
+  let fields=null;
+  const labelled=label=>(fields??=[...document.querySelectorAll(selector)].filter(e=>safe(e) && visible(e) &&
+    !e.matches(':disabled') && !e.closest('[aria-disabled="true"]') && editable(e)))
+    .find(e=>(name(e)||role(e))===label);
+  return specs.map(({node,label})=>{
+    const e=node==null ? null : nodes?.get(node);
+    if (e?.isConnected && safe(e)) return value(e);
+    const same=label==null ? null : labelled(label);
+    return same ? value(same) : null;
+  });
+})("""
+)
+
 NAVIGATE_TIMEOUT_S = 15.0
 STALE_RETRIES = 10
 SCREENSHOT_TIMEOUT_S = 5.0
@@ -426,6 +461,41 @@ class Tab:
         self.last_settle = value
         log.debug("settle %s %s мс, мутаций %s", value.get("reason"), value.get("ms"), value.get("mutations"))
         return value
+
+    def await_ready(self, action: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Страница готова к решению после действия (docs/plan-waits.md §2). Контракт §4.2: пока — `settle(action)`.
+
+        Итог — `{reason, ms, mutations}`; пусто — не ждали (отмена, до дедлайна не осталось места) или ожидание прервала
+        навигация."""
+        return self.settle(action) or {}
+
+    def await_change(self) -> dict[str, Any]:
+        """Дождаться следующего изменения страницы, затем `await_ready` (WAIT Jev, WAIT в проверке, второй взгляд; §2).
+
+        Контракт §4.2: пока — пауза 0,1 с, как у WAIT в `act`, и `settle`; время — `wait_ms`, итог — как у
+        `await_ready`."""
+        self._sleep(0.1)
+        return self.await_ready({"kind": "wait"})
+
+    def field_values(self, specs: list[dict[str, Any]]) -> list[str | None]:
+        """Что сейчас в полях, куда печатали (`[{node, label}]` из снимка): один `Runtime.evaluate` (`FIELD_VALUES`),
+        только чтение, время — `browser_ms`. На каждое — значение поля по узлу из кэша снимка, если узел ещё в
+        документе; иначе первого видимого редактируемого поля с той же подписью; иначе None. Значение — как `value` в
+        снимке; password/file/hidden не читаются, напечатанный текст в страницу не уходит (сравнивает вызывающий).
+        Документ сменяется — StalePage."""
+        if not specs:
+            return []
+        payload = [
+            {
+                "node": spec.get("node") if type(spec.get("node")) is int else None,
+                "label": spec.get("label") if isinstance(spec.get("label"), str) else None,
+            }
+            for spec in specs
+        ]
+        values = self.evaluate(FIELD_VALUES + json.dumps(payload) + ")")
+        if not isinstance(values, list) or len(values) != len(specs):
+            raise StalePage("Document is navigating")
+        return [value if isinstance(value, str) else None for value in values]
 
     def observe(self, screenshot: bool = False) -> dict[str, Any]:
         if self.after_input:
