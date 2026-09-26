@@ -166,11 +166,25 @@ def test_little_data_keeps_the_current_value_and_says_how_much_to_collect():
     assert verdict.need_pairs > 0 and "мало данных" in verdict.reason
 
 
-def test_little_data_keeps_even_a_current_value_outside_the_admissible_range_but_says_so():
-    data = pairs((0.62, False, 5), (0.9, True, 50))
-    verdict = cal.decide("step_done_min_p", data, current=0.6)
-    assert not verdict.enough and verdict.admissible == (0.65, 0.9) and verdict.recommended == 0.6
-    assert "вне допустимых" in verdict.reason
+def test_little_data_but_unambiguous_false_accepts_between_current_and_the_bound_move_to_the_bound():
+    """Стенд 26.09: не-DONE с P(yes) 0,70–0,74 — 8 из 8 закрыли невыполненный шаг; θ* у пустой корзины."""
+    data = pairs((0.72, False, 8), (0.9, True, 50))
+    verdict = cal.decide("step_done_min_p", data, current=0.7)
+    assert not verdict.enough and verdict.admissible == (0.75, 0.9) and verdict.recommended == 0.75
+    assert "граница допустимых" in verdict.reason
+
+
+def test_little_data_and_an_ambiguous_band_keep_the_current_value_but_say_so():
+    lowering = pairs((0.4, True, 20), (0.9, True, 50))  # 20 из 20 «да»: Wilson снизу 0,84 < 0,95 — не опускать
+    verdict = cal.decide("done_step_done_min_p", lowering, current=0.5)
+    assert verdict.admissible == (0.0, 0.4) and verdict.recommended == 0.5
+    assert "вне допустимых" in verdict.reason and "не однозначно" in verdict.reason
+
+
+def test_automatic_choice_can_be_switched_off():
+    data = pairs((0.62, False, 40), (0.67, True, 40), (0.95, True, 100))
+    verdict = cal.decide("min_action_confidence", data, current=0.3, automatic=False)
+    assert verdict.best == 0.65 and verdict.recommended == 0.3 and "выключен" in verdict.reason
 
 
 def test_no_pairs_keeps_the_current_value():
@@ -195,8 +209,13 @@ def test_fuse_samples_come_from_reports_and_observe_files(tmp_path):
     observe.write_text(json.dumps({"click": {"done": True}, "mutations": {"last_significant_ms": 1640.0}}))
     skipped = tmp_path / "wa-observe-2.json"
     skipped.write_text(json.dumps({"click": {"done": False}, "mutations": {"last_significant_ms": None}}))
-    samples, sources = cal.settle_samples([run], [observe, skipped])
-    assert samples == pytest.approx([0.8, 0.2, 1.64]) and sources == {"reports": 2, "observe": 1}
+    run["steps"][0]["timing"] = {"text_ms": 300}  # текст генерировался 0,3 с после ответа Jev: действие — в 1300
+    sweep = {**chat_run("s"), "reports": [{"t_ms": 9000}], "cell": 1, "axes": "delay"}
+    for i, decision in enumerate(sweep["decisions"]):
+        decision["t_ms"] = 1000 * (i + 1)
+    samples, sources = cal.settle_samples([run, sweep], [observe, skipped])
+    assert samples == pytest.approx([0.5, 0.2, 1.64])
+    assert sources == {"reports": 2, "observe": 1, "sweep_runs_skipped": 1}
     assert cal.fuse_verdict(samples, 1.5).recommended == 1.5  # 3 замера < 30
     assert cal.fuse_verdict([0.5] * 29 + [1.2], 1.5).recommended == 1.3  # p99 1,2 + кадр → вверх до 0,1
 
@@ -218,12 +237,42 @@ def test_main_reads_traces_writes_markdown_and_prints_recommendations(tmp_path, 
 
 
 def test_calibration_doc_matches_the_thresholds_in_config():
-    """docs/calibration.md — источник значений `Thresholds`: у каждого порога строка `recommended:` с тем же
-    значением, что в config.py, и config.py ссылается на раздел документа."""
+    """docs/calibration.md снят при нынешних `Thresholds`: в итоговой таблице «текущее» у каждого порога — значение из
+    config.py, есть строка `recommended:`; config.py ссылается на раздел документа."""
     doc = (ROOT / "docs" / "calibration.md").read_text(encoding="utf-8")
     config = (ROOT / "browser_hands" / "config.py").read_text(encoding="utf-8")
     for name, value in asdict(Thresholds()).items():
-        assert re.search(rf"`recommended: {name} = {value:g}`", doc), name
+        assert re.search(rf"^\| `{name}` \| {value:g} \| [0-9.]+ \|", doc, re.MULTILINE), name
+        assert re.search(rf"`recommended: {name} = [0-9.]+`", doc), name
         section = re.search(rf"{name}: float = [0-9.]+  # значение — docs/calibration\.md (§\d)", config)
         assert section is not None, name
         assert f"## {section[1]}." in doc
+
+
+def timed_send_run(appears_after_ms, sendstatus_like=False):
+    """Сценарий чата с историей отчётов: Send исполнен в ответ на решение 5 (t=6000), шаг — 40 + 210 мс (снимок в 6250);
+    сообщение появляется через `appears_after_ms` после ответа."""
+    run = chat_run("t")
+    for i, decision in enumerate(run["decisions"]):
+        decision["t_ms"] = 1000 * (i + 1)
+    for step in run["steps"]:
+        step["timing"] = {"text_ms": 0, "browser_ms": 40, "wait_ms": 210}
+    opened = {"openChat": CHAT, "sent": []}
+    run["reports"] = [
+        {"t_ms": 100, "openChat": None, "sent": []},
+        {"t_ms": 3100, **opened},  # клик по чату — ответ на решение 3 (t=3000)
+        {"t_ms": 6000 + appears_after_ms, "openChat": CHAT, "sent": [MESSAGE]},
+    ]
+    return run
+
+
+@pytest.mark.parametrize(
+    ("appears_after_ms", "truth"),
+    [(300, False), (20, True), (240, None)],
+    ids=["after-the-snapshot", "before-the-snapshot", "ambiguous"],
+)
+def test_page_reports_give_the_state_at_the_snapshot_jev_saw(appears_after_ms, truth):
+    """Send без sendstatus: сообщение через ~300 мс, снимок — через 250: низкий P(yes) там верен, а не ошибка."""
+    _other, done = cal.step_done_pairs([timed_send_run(appears_after_ms)])
+    last = [p for p in done if p.score == 0.4]  # DONE сразу после Send
+    assert [p.truth for p in last] == ([] if truth is None else [truth])

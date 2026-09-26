@@ -41,7 +41,12 @@ from typing import Any
 from browser_hands.config import Thresholds
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_TRACES = ("traces/*.jsonl", "~/Personal/browser-hands*/traces/*.jsonl")
+# свои трассы, трассы всех копий репозитория и их worktree (`.wt/<пакет>/traces`)
+DEFAULT_TRACES = (
+    "traces/*.jsonl",
+    "~/Personal/browser-hands*/traces/*.jsonl",
+    "~/Personal/browser-hands*/.wt/*/traces/*.jsonl",
+)
 DEFAULT_OBSERVE = ("traces/wa-observe-*.json", "~/Personal/browser-hands*/traces/wa-observe-*.json")
 STEP = 0.05
 GRID = tuple(round(i * STEP, 2) for i in range(int(round(1 / STEP)) + 1))
@@ -51,6 +56,7 @@ MIN_BIN = 30  # пар в двух корзинах вокруг θ*, меньш
 Z = 1.96  # Wilson 95 %
 TARGET_HALF_WIDTH = 0.1  # «сколько собрать»: половина ширины Wilson в корзинах вокруг θ* не больше
 FRAME_S = 1 / 60  # запас кадра к p99 для wait_fuse_s
+SNAPSHOT_MARGIN_MS = 30  # признак шага менялся ближе к моменту снимка — пара неоднозначна
 ACTING = frozenset({"CLICK", "TYPE_TEXT", "SELECT"})
 
 # Шаги стенда (scripts/eval.py, CHAT_SCENARIO): что показывает отчёт страницы, если шаг выполнен к концу прогона.
@@ -161,6 +167,54 @@ class StepView:
     last_action: int | None  # индекс решения, исполнившего последнее CLICK/TYPE_TEXT/SELECT шага
     first_typed: int | None  # индекс решения, напечатавшего текст шага (впервые)
     done_at_end: bool | None  # шаг выполнен к концу прогона; None — неизвестно
+    timed: dict[int, bool | None] | None = None  # по истории отчётов: решение → выполнен ли в момент снимка
+
+
+def _state_at(reports: Sequence[Mapping[str, Any]], t: float) -> Mapping[str, Any] | None:
+    before = [r for r in reports if r["t_ms"] <= t]
+    return before[-1] if before else None
+
+
+def timed_truth(
+    run: Mapping[str, Any], number: int, mine: Sequence[int], executed: Mapping[int, int]
+) -> dict[int, bool | None] | None:
+    """Правда шага в момент снимка, по истории отчётов страницы (`reports` с `t_ms`, §7.2), если у шага есть признак в
+    отчёте (`FINAL_STATE`). Момент снимка решения i — ответ на решение i−1 плюс его шаг (`text_ms + browser_ms +
+    wait_ms`: ввод, ожидание, снимок), не позже `t_ms` решения i без 150 мс (ответ Jev не быстрее). Признак менялся в
+    ±`SNAPSHOT_MARGIN_MS` от этого момента — None (неоднозначно). Решение i−1 не исполнено: признак был уже в момент
+    ответа на него — «да», не стал и к ответу на i — «нет», иначе None. Нет отчётов или признака — None."""
+    reports = [r for r in run.get("reports") or () if isinstance(r, Mapping) and isinstance(r.get("t_ms"), int | float)]
+    state = FINAL_STATE.get(str(run.get("task")))
+    scenario = run.get("scenario") or []
+    if not reports or state is None or state(number, reports[-1], scenario) is None:
+        return None
+    decisions, steps = run["decisions"], run.get("steps") or []
+
+    def holds(t: float) -> bool:
+        current = _state_at(reports, t)
+        return bool(current is not None and state(number, current, scenario))
+
+    changes = [r["t_ms"] for k, r in enumerate(reports) if k and holds(r["t_ms"]) != holds(reports[k - 1]["t_ms"])]
+    out: dict[int, bool | None] = {}
+    for i in mine:
+        answered = decisions[i].get("t_ms")
+        previous = decisions[i - 1].get("t_ms") if i else 0
+        if not isinstance(answered, int | float) or not isinstance(previous, int | float):
+            out[i] = None
+            continue
+        if i - 1 in executed:
+            timing = steps[executed[i - 1]].get("timing") or {}
+            spent = sum(v for k in ("text_ms", "browser_ms", "wait_ms") if isinstance(v := timing.get(k), int | float))
+            shot = min(previous + spent, answered - 150)
+            ambiguous = any(abs(t - shot) <= SNAPSHOT_MARGIN_MS for t in changes)
+            out[i] = None if ambiguous else holds(shot)
+        elif holds(previous):
+            out[i] = True
+        elif not holds(answered):
+            out[i] = False
+        else:
+            out[i] = None
+    return out
 
 
 def step_views(run: Mapping[str, Any]) -> list[StepView]:
@@ -180,7 +234,8 @@ def step_views(run: Mapping[str, Any]) -> list[StepView]:
             state = FINAL_STATE.get(str(run.get("task")))
             report = run.get("report")
             done = state(number, report, scenario) if state is not None and isinstance(report, Mapping) else None
-        views.append(StepView(number, text, mine, acts[-1] if acts else None, typed[0] if typed else None, done))
+        timed = timed_truth(run, number, mine, executed) if text is None else None
+        views.append(StepView(number, text, mine, acts[-1] if acts else None, typed[0] if typed else None, done, timed))
     return views
 
 
@@ -203,6 +258,11 @@ def step_done_pairs(runs: Iterable[Mapping[str, Any]]) -> tuple[list[Pair], list
                     if view.first_typed is not None and i > view.first_typed:
                         continue
                     truth = False
+                elif view.timed is not None:
+                    # история отчётов: состояние страницы в момент снимка, который видел Jev
+                    if (known := view.timed.get(i)) is None:
+                        continue
+                    truth = known
                 elif view.done_at_end is None:
                     continue
                 elif not view.done_at_end:
@@ -265,23 +325,32 @@ def done_pairs(runs: Iterable[Mapping[str, Any]]) -> list[Pair]:
 
 def settle_samples(runs: Iterable[Mapping[str, Any]], observe: Iterable[Path]) -> tuple[list[float], dict[str, int]]:
     """§4: «действие → последняя значимая мутация», с. Отчёты страницы с `t_ms` (§7.2): последний отчёт между
-    исполненным решением и следующим решением; файлы замера (§8): `mutations.last_significant_ms` после клика."""
+    действием и следующим решением; момент действия — ответ Jev (`t_ms` решения) плюс время текстовой модели этого
+    шага (`text_ms`: в режиме цели текст генерируется между решением и вводом). Прогоны развёртки (`--sweep`: ключи
+    `cell`/`axes`) не берутся: их задержки задают оси, p99 там — максимум оси, а не свойство страницы. Файлы замера
+    (§8): `mutations.last_significant_ms` после клика."""
     samples: list[float] = []
-    sources = {"reports": 0, "observe": 0}
+    sources = {"reports": 0, "observe": 0, "sweep_runs_skipped": 0}
     for run in runs:
         reports = run.get("reports")
         if not isinstance(reports, list) or not reports:
             continue
+        if "cell" in run or "axes" in run:
+            sources["sweep_runs_skipped"] += 1
+            continue
         decisions = run["decisions"]
-        executed = align(decisions, run.get("steps") or [])
+        steps = run.get("steps") or []
+        executed = align(decisions, steps)
         times: list[float] = [
             float(r["t_ms"]) for r in reports if isinstance(r, Mapping) and isinstance(r.get("t_ms"), int | float)
         ]
         for i in sorted(executed):
-            start = decisions[i].get("t_ms")
+            answered = decisions[i].get("t_ms")
             end = decisions[i + 1].get("t_ms") if i + 1 < len(decisions) else math.inf
-            if not isinstance(start, int | float) or not isinstance(end, int | float):
+            if not isinstance(answered, int | float) or not isinstance(end, int | float):
                 continue
+            text_ms = (steps[executed[i]].get("timing") or {}).get("text_ms") or 0
+            start = answered + (text_ms if isinstance(text_ms, int | float) else 0)
             inside = [t for t in times if start < t < end]
             if inside:
                 samples.append((max(inside) - start) / 1000)
@@ -398,10 +467,15 @@ class Verdict:
     need_runs: int | None = None
 
 
-def decide(name: str, pairs: Sequence[Pair], current: float) -> Verdict:
+BREAK_EVEN = C_FP / (C_FP + C_FN)  # доля «да», выше которой принимать выгодно (≈ 0,95)
+
+
+def decide(name: str, pairs: Sequence[Pair], current: float, *, automatic: bool = True) -> Verdict:
     """θ* — минимум стоимости (при равенстве — ближе к текущему, затем ниже); допустимые — стоимость меньше
-    стоимости θ* + C_FP. Мало данных у θ* — оставить текущий (вне допустимых — сказать); данных хватает: текущий
-    допустим — оставить, иначе θ*."""
+    стоимости θ* + C_FP. Данных хватает (у θ* не меньше `MIN_BIN` пар): текущий допустим — оставить, иначе θ*. Мало
+    данных — оставить текущий, кроме случая, когда он вне допустимых и корзины между ним и ближайшей допустимой
+    границей однозначны по Wilson: при повышении порога верхняя граница доли «да» в них ниже `BREAK_EVEN`, при
+    понижении нижняя — выше (тогда — эта граница). `automatic=False` — только кривые, текущий остаётся."""
     if not pairs:
         return Verdict(name, current, current, None, None, 0, False, "пар нет — оставить текущий")
     rows = curve(pairs)
@@ -413,19 +487,39 @@ def decide(name: str, pairs: Sequence[Pair], current: float) -> Verdict:
     near_pairs = [p for p in pairs if _bin(p.score) in (k - 1, min(k, len(GRID) - 2))]
     near = len(near_pairs)
     current_ok = any(abs(theta - current) < 1e-9 for theta in ok) or admissible[0] < current < admissible[1]
-    if near < MIN_BIN:
-        total = needed(sum(p.truth for p in near_pairs), near)
-        runs = {p.run for p in near_pairs}
-        need_runs = math.ceil((total - near) / (near / len(runs))) if runs else None
-        reason = f"мало данных ({near} пар в корзинах у θ* < {MIN_BIN}) — оставить текущий"
-        if not current_ok:
-            reason += "; текущий вне допустимых по точечной оценке"
-        return Verdict(name, current, current, best, admissible, near, False, reason, total - near, need_runs)
+    if not automatic:
+        reason = "автоматический выбор выключен (метка — не вред, см. раздел) — оставить текущий"
+        return Verdict(name, current, current, best, admissible, near, near >= MIN_BIN, reason)
+    if near >= MIN_BIN:
+        if current_ok:
+            reason = f"данных хватает ({near} пар у θ*), текущий допустим — оставить"
+            return Verdict(name, current, current, best, admissible, near, True, reason)
+        reason = f"данных хватает ({near} пар у θ*), текущий вне допустимых — θ*"
+        return Verdict(name, current, best, best, admissible, near, True, reason)
+    total = needed(sum(p.truth for p in near_pairs), near)
+    runs = {p.run for p in near_pairs}
+    need_runs = math.ceil((total - near) / (near / len(runs))) if runs else None
+    reason = f"мало данных ({near} пар в корзинах у θ* < {MIN_BIN}) — оставить текущий"
     if current_ok:
-        reason = f"данных хватает ({near} пар у θ*), текущий допустим — оставить"
-        return Verdict(name, current, current, best, admissible, near, True, reason)
-    reason = f"данных хватает ({near} пар у θ*), текущий вне допустимых — θ*"
-    return Verdict(name, current, best, best, admissible, near, True, reason)
+        return Verdict(name, current, current, best, admissible, near, False, reason, total - near, need_runs)
+    bound = min(admissible, key=lambda theta: abs(theta - current))
+    lo, hi = sorted((current, bound))
+    between = [p for p in pairs if lo - 1e-9 <= p.score < hi - 1e-9]
+    yes = sum(p.truth for p in between)
+    low_share, high_share = wilson(yes, len(between))
+    raising = bound > current
+    if between and (high_share < BREAK_EVEN if raising else low_share > BREAK_EVEN):
+        side = f"«да» {yes}/{len(between)}, Wilson [{low_share:.2f}; {high_share:.2f}]"
+        reason = (
+            f"мало данных у θ* ({near} пар), но в [{lo:.2f}; {hi:.2f}) {side} — "
+            f"{'ниже' if raising else 'выше'} безубыточной доли {BREAK_EVEN:.2f}: граница допустимых"
+        )
+        return Verdict(name, current, bound, best, admissible, near, False, reason, total - near, need_runs)
+    reason += (
+        f"; текущий вне допустимых по точечной оценке, но в [{lo:.2f}; {hi:.2f}) «да» {yes}/{len(between)} "
+        f"(Wilson [{low_share:.2f}; {high_share:.2f}]) — не однозначно"
+    )
+    return Verdict(name, current, current, best, admissible, near, False, reason, total - near, need_runs)
 
 
 def fuse_verdict(samples: Sequence[float], current: float) -> Verdict:
@@ -527,7 +621,9 @@ def calibrate(
     verdicts = {
         "step_done_min_p": decide("step_done_min_p", other, thresholds.step_done_min_p),
         "done_step_done_min_p": decide("done_step_done_min_p", done_op, thresholds.done_step_done_min_p),
-        "min_action_confidence": decide("min_action_confidence", scenario_actions, thresholds.min_action_confidence),
+        "min_action_confidence": decide(
+            "min_action_confidence", scenario_actions, thresholds.min_action_confidence, automatic=False
+        ),
         "done_min_confidence": decide("done_min_confidence", goal_done, thresholds.done_min_confidence),
         "wait_fuse_s": fuse_verdict(samples, thresholds.wait_fuse_s),
     }
@@ -555,6 +651,9 @@ def calibrate(
         "принятие стоит прогон, ложный отказ — лишний вызов Jev ($0,0002 и ~0,7 с против $0,001 и ~7 с прогона).",
         "- θ* — минимум стоимости (при равенстве — ближе к текущему). Допустимые θ — стоимость меньше стоимости θ* плюс"
         " одна ложная приёмка (данные их не различают).",
+        f"- Исключение из «мало данных»: текущий вне допустимых, а корзины между ним и ближайшей допустимой границей "
+        f"однозначны по Wilson — доля «да» в них целиком ниже (при повышении) или выше (при понижении) безубыточной "
+        f"{BREAK_EVEN:.2f} = C_FP/(C_FP+C_FN); тогда — эта граница.",
         f"- Правило: в двух корзинах вокруг θ* меньше {MIN_BIN} пар — «мало данных», оставить текущее и назвать, "
         f"сколько собрать (Wilson ±{TARGET_HALF_WIDTH:g}); данных хватает, но текущее допустимо — оставить; "
         "иначе — θ*.",
@@ -562,7 +661,10 @@ def calibrate(
         "нетекстовый шаг, выполненный к концу прогона (verified или отчёт страницы: `openChat`, `sent`), — «да» у "
         "решений после его последнего исполненного CLICK/TYPE_TEXT/SELECT, «нет» до; не выполненный — «нет». "
         "Текстовый шаг — «нет» до первого ввода текста, после — не размечается (закрывает код). Допущение: после "
-        "последнего действия шаг уже выполнен, до него — ещё нет (на стенде шаг — одно действие).",
+        "последнего действия шаг уже выполнен, до него — ещё нет (на стенде шаг — одно действие). Где есть история "
+        "отчётов с `t_ms` (§7.2), правда — состояние страницы в момент снимка (ответ на прошлое решение + ввод, "
+        "ожидание и снимок его шага), неоднозначное (изменение ближе 30 мс) не размечается: Send без `sendstatus` "
+        "показывает сообщение через ~300 мс, снимок раньше — низкий P(yes) там верен, а прокси считал его ошибкой.",
         "- Полезность действия (§2) — совпадение с последним действием выполненного шага (операция и элемент); "
         "повторный ввод того же текста — тоже полезен. Неисполненные решения (ниже порога, устаревшие) не размечены.",
         "",
@@ -586,7 +688,9 @@ def calibrate(
             "Исполненные действия в сценарии: `confidence` головы `operation` → действие полезно. «Нет» здесь — "
             "лишнее, а не вредное действие (на стенде — клик по полю поиска перед строкой чата): его цена — лишний "
             "шаг, а не прогон, так что `C_FP = 1` её завышает; и неисполненное действие не бесплатно: два "
-            "неуверенных подряд — `blocked` (`UNCERTAIN_LIMIT`). Поэтому θ* ниже — верхняя граница, а не цель.",
+            "неуверенных подряд — `blocked` (`UNCERTAIN_LIMIT`; стенд 26.09: верное восстановление — клик по строке "
+            "чата с conf 0.29, затем 0.27). Цену ложного отказа трассы не дают, поэтому автоматический выбор здесь "
+            "выключен: θ* ниже — верхняя граница, а не цель.",
         ),
         f"Для справки, режим цели (прокси «прогон verified», не для порога): {len(goal_actions)} пар, "
         f"«да» — {sum(p.truth for p in goal_actions)}; ниже 0,3 — "
@@ -604,8 +708,8 @@ def calibrate(
         "",
         "«Действие → последняя значимая мутация»: отчёты страницы с `t_ms` (`reports`, §7.2) и замер "
         f"`wa-observe-*.json` (§8). Замеров: {len(samples)} (отчёты — {sources['reports']}, "
-        f"замер — {sources['observe']}). В старых eval-трассах этой метки нет: отчёт страницы только итоговый, "
-        "у шагов нет времени.",
+        f"замер — {sources['observe']}; прогонов развёртки пропущено — {sources['sweep_runs_skipped']}: их задержки "
+        "задают оси, p99 = максимум оси). В старых eval-трассах этой метки нет: отчёт страницы только итоговый.",
         "",
     ]
     if samples:
