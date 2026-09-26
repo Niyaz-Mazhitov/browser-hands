@@ -1080,13 +1080,11 @@ def test_second_chance_end_to_end_on_fake_chrome_waits_once_then_reads_the_page(
     assert result.status == "done" and result.tab == "user" and result.model_calls == 2 and result.steps == []
     between = server.frames[marks[0] : marks[1]]
     assert all(f["method"] == "Runtime.evaluate" for f in between)  # никаких Input.*, навигации и закрытий
-    settles = [
-        i
-        for i, f in enumerate(between)
-        if f["params"].get("awaitPromise") and "MutationObserver" in f["params"]["expression"]
-    ]
-    assert len(settles) == 1
-    assert between[settles[0] + 1]["params"]["expression"] == READ_STATE  # сразу после ожидания — снимок
+    # ожидание изменения (await_change: в контракте — одно успокоение, по событиям — изменение, затем готовность),
+    # сразу за ним — снимок
+    waits = [i for i, f in enumerate(between) if f["params"].get("awaitPromise")]
+    assert 1 <= len(waits) <= 2 and waits == list(range(waits[0], waits[0] + len(waits)))
+    assert between[waits[-1] + 1]["params"]["expression"] == READ_STATE
     assert {f["sessionId"] for f in between} == {"S-U1"}
     assert {"Target.closeTarget", "Page.navigate", "Emulation.setDeviceMetricsOverride"}.isdisjoint(server.methods())
 
