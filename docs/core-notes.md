@@ -603,7 +603,7 @@ matching article from the suggestions or search results"}]`, goal пустой.
 
 ### Проверка
 
-- `check.sh` — 624 теста (+2 пропуска), pyright — 0. Новые тесты (39 в `test_agent`, 19 в `test_calibrate`) падали
+- `check.sh` — 624 теста (+2 пропуска), pyright — 0. Новые тесты (29 в `test_agent` — 17 функций, 19 в `test_calibrate`) падали
   до правки: список — блоки «инварианты сценария» и «находки ревью 2–5 и режим цели».
 - Слияние с `feat/waits-events` (c690bab) во временной копии (scratchpad): 650 тестов, pyright 0; после — одна
   правка теста e2e второго шанса (с событиями `await_change` — два промиса: изменение и готовность).
