@@ -12,7 +12,7 @@ from mcp.client.stdio import stdio_client
 from browser_hands.cli import _stop_handler, main
 from browser_hands.scenario import MAX_STEPS, ScenarioStep
 from browser_hands.server import BROWSE_DESCRIPTION, INSTRUCTIONS
-from tests.fakes import JPEG, FakeCore, make_result
+from tests.fakes import JPEG, FakeCore, make_result, unconfirmed_result
 
 ROOT = Path(__file__).resolve().parent.parent
 ENV = {"OPENROUTER_API_KEY": "test-key"}
@@ -344,6 +344,21 @@ def test_run_text_names_the_step_it_stopped_on(tmp_path, capsys):
         "error: Step 2 of 2 not completed",
         "сценарий: 1 из 2 выполнено",
         "остановился на шаге 2 из 2: Send the message",
+    ]
+
+
+def test_run_unconfirmed_exits_like_not_done(tmp_path, capsys):
+    core = FakeCore(result=unconfirmed_result(scenario=(1, 2), steps=2))
+
+    code = main([*SCN_RUN, "--steps-file", str(steps_file(tmp_path, SCENARIO))], env=ENV, factories=core.factories())
+
+    lines = capsys.readouterr().out.splitlines()
+    assert code == 2
+    assert lines[:4] == [
+        "status: unconfirmed",
+        "error: step 2 of 2: probably done, not confirmed — check the screenshot",
+        "сценарий: 1 из 2 выполнено",
+        "шаг 2 из 2 не подтверждён (вероятно, выполнен — проверь скриншот): Send the message",
     ]
 
 

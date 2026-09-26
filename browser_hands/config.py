@@ -1,4 +1,6 @@
-"""Настройки (контракт, docs/plan.md §4): датаклассы и значения по умолчанию; разбор env и флагов — Пакет 2."""
+"""Настройки (контракт, docs/plan.md §4): датаклассы и значения по умолчанию; разбор env и флагов — Пакет 2.
+
+Пороги модели и предохранитель ожидания — `Thresholds` (docs/plan-waits.md §4.1), без env."""
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -65,11 +67,29 @@ class RunConfig:
     new_tab: bool = False  # attach: всегда своя вкладка, даже если сайт открыт у пользователя
 
 
+# Кадр страницы при 60 Гц — запас к p99 «действие → последнее изменение страницы» в расчёте `wait_fuse_s`
+# (scripts/calibrate.py, scripts/sweep_report.py): изменение из отчёта страницы ложится в DOM к следующему кадру.
+FRAME_S = 1 / 60
+
+
+@dataclass(frozen=True, slots=True)
+class Thresholds:
+    """Пороги модели и предохранитель одного ожидания (docs/plan-waits.md §4.1). Меняет их расчёт
+    (`scripts/calibrate.py` → docs/calibration.md), не оператор: env `BROWSER_HANDS_*` для них нет (§12)."""
+
+    step_done_min_p: float = 0.75  # значение — docs/calibration.md §1; P(yes) `step_done`, с которой шаг выполнен
+    done_step_done_min_p: float = 0.45  # значение — docs/calibration.md §1; DONE закрывает шаг при P(yes) не ниже
+    min_action_confidence: float = 0.3  # значение — docs/calibration.md §2; CLICK/TYPE_TEXT/SELECT ниже — не исполнять
+    done_min_confidence: float = 0.5  # значение — docs/calibration.md §3; DONE цели ниже — второй взгляд (заглушка)
+    wait_fuse_s: float = 1.5  # значение — docs/calibration.md §4; потолок одного ожидания (пока = потолок успокоения)
+
+
 @dataclass(slots=True)
 class Settings:
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     models: ModelConfig = field(default_factory=ModelConfig)
     run: RunConfig = field(default_factory=RunConfig)
+    thresholds: Thresholds = field(default_factory=Thresholds)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "Settings":

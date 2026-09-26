@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from browser_hands.config import BrowserConfig, ModelConfig, RunConfig
+from browser_hands.config import BrowserConfig, ModelConfig, RunConfig, Thresholds
 from browser_hands.scenario import ScenarioStep
 from browser_hands.types import RunResult, Status, Step, TabKind, Timing
 
@@ -26,7 +26,8 @@ def make_result(
     scenario: tuple[int, int] | None = None,
     jev_calls: int = 0,
 ) -> RunResult:
-    """RunResult с `steps` шагами: нечётные — CLICK, чётные — TYPE_TEXT; `cost` — цена одного шага.
+    """RunResult с `steps` шагами: нечётные — CLICK, чётные — TYPE_TEXT; `cost` — цена одного шага; ожидание после
+    каждого — `quiet`, запросов в полёте нет.
 
     `scenario=(done, total)` — режим сценария: `scenario_done/total`, у шага i `scenario_step = min(i, total)`.
     """
@@ -42,6 +43,8 @@ def make_result(
             timing=Timing(model_ms=600, text_ms=0 if i % 2 else 300, browser_ms=40, wait_ms=50),
             cost=cost,
             scenario_step=None if scenario is None else min(i, scenario[1]),
+            wait_reason="quiet",
+            pending_requests=0,
         )
         for i in range(1, steps + 1)
     ]
@@ -109,6 +112,13 @@ class FakeClients:
 def cancelled_result() -> RunResult:
     """Что возвращает ядро на выставленный `cancel`: failed, error="cancelled"."""
     return make_result("failed", steps=0, screenshot=None, error="cancelled")
+
+
+def unconfirmed_result(scenario: tuple[int, int] = (3, 4), steps: int = 4) -> RunResult:
+    """Что возвращает ядро, когда шаг `done + 1` сценария, вероятно, выполнен, но Jev его не подтвердил."""
+    done, total = scenario
+    error = f"step {done + 1} of {total}: probably done, not confirmed — check the screenshot"
+    return make_result("unconfirmed", steps=steps, scenario=scenario, error=error)
 
 
 class FakeAgent:
@@ -189,6 +199,7 @@ class FakeCore:
         screenshot_scale: float,
         steps: list[ScenarioStep] | None = None,
         cancel: threading.Event | None = None,
+        thresholds: Thresholds | None = None,
     ) -> FakeAgent:
         self.agents.append(
             {
@@ -201,6 +212,7 @@ class FakeCore:
                 "screenshot_scale": screenshot_scale,
                 "steps": steps,
                 "cancel": cancel,
+                "thresholds": thresholds,
             }
         )
         started = threading.Event()

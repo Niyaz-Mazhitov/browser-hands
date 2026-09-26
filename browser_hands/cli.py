@@ -25,7 +25,7 @@ from browser_hands.server import BrowseService, build_server, format_result
 from browser_hands.types import RunResult
 
 EXIT_DONE = 0
-EXIT_NOT_DONE = 2  # и ошибки конфигурации/аргументов, как у argparse
+EXIT_NOT_DONE = 2  # не done (и unconfirmed тоже), ошибки конфигурации и аргументов (как у argparse)
 
 log = get_logger("cli")
 

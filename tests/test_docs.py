@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from browser_hands import agent, browser, model
-from browser_hands.config import ModelConfig
+from browser_hands.config import ModelConfig, Thresholds
 from browser_hands.scenario import MAX_DO, MAX_STEPS, MAX_TEXT, ScenarioStep, parse_steps
 from browser_hands.server import BROWSE_DESCRIPTION, INSTRUCTIONS, STEPS_DESCRIPTION, URL_DESCRIPTION, format_result
 from tests.fakes import make_result
@@ -36,16 +36,16 @@ def test_user_tab_rule_is_the_same_in_readme_and_tool_descriptions():
 def test_readme_states_both_empty_page_ceilings():
     text = flat(README)
     assert f"в начале прогона — до {agent.EMPTY_PAGE_WAIT_S:g} с" in text
-    assert f"в середине (после первого решения Jev) — до {agent.EMPTY_PAGE_WAIT_LATER_S:g} с" in text
-    assert f"пауза до {agent.EMPTY_PAGE_WAIT_LATER_S:g} с" in text  # «Ограничения»
+    assert "в середине (после первого решения Jev) — одно ожидание следующего изменения страницы" in text
+    assert "пустой экран в середине работы (например, прокрутили за все кнопки) — одно ожидание следующего" in text
 
 
 def test_readme_limitations_state_settle_and_single_retries():
     limits = flat(section(README, "## Ограничения"))
-    quiet = f"{browser.SETTLE_QUIET_MS / 1000:g}".replace(".", ",")
-    ceiling = f"{browser.SETTLE_CEILING_MS / 1000:g}".replace(".", ",")
-    assert f"агент ждёт тишины DOM {quiet} с (не дольше {ceiling} с)" in limits
-    assert f"добавляет до {ceiling} с на шаг" in limits
+    fuse = f"{Thresholds().wait_fuse_s:g}".replace(".", ",")
+    assert browser.QUIET_FRAMES == 2 and "два кадра подряд без изменений DOM" in limits
+    assert f"Предохранитель одного ожидания — {fuse} с" in limits
+    assert f"добавляет до {fuse} с на шаг" in limits
     assert "На BLOCKED переспрашивает один раз" in limits
     assert agent.TEXT_ATTEMPTS == 2 and "повторяет запрос один раз" in limits
 
@@ -140,3 +140,19 @@ def test_readme_says_step_texts_never_reach_the_text_model():
     assert "текстовая модель на таком шаге не вызывается" not in text
     security = flat(section(README, "## Безопасность и приватность"))
     assert "сценарий `steps` (`do` и `text`; `text` — только Jev)" in security
+
+
+def test_readme_states_unconfirmed_and_the_action_confidence_threshold():
+    answer = flat(section(README, "## Ответ `browse`"))
+    assert "`done|blocked|failed|timeout|step_limit|unconfirmed`" in answer
+    scenario = flat(section(README, SCENARIO))
+    assert "`unconfirmed`" in scenario and "разрешая только DONE, WAIT и BLOCKED" in scenario
+    assert f"после {agent.RETYPE_LIMIT} повторных вводов" in scenario
+    assert "`step k of M: typed text does not stay in the field`" in scenario
+    steps = [ScenarioStep(f"Step {i}") for i in range(1, 5)]
+    line = format_result(make_result("unconfirmed", steps=4, scenario=(3, 4)), steps=steps).splitlines()[2]
+    assert line == "шаг 4 из 4 не подтверждён (вероятно, выполнен — проверь скриншот): Step 4"
+    assert "`шаг N из M не подтверждён (вероятно, выполнен — проверь скриншот): <do>`" in scenario
+    limits = flat(section(README, "## Ограничения"))
+    threshold = f"{agent.MIN_ACTION_CONFIDENCE:g}".replace(".", ",")
+    assert f"уверена меньше чем на {threshold}" in limits and "`uncertain action: …`" in limits

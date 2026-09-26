@@ -28,6 +28,7 @@ from browser_hands.config import (
     ModelConfig,
     RunConfig,
     Settings,
+    Thresholds,
     apply_overrides,
 )
 from browser_hands.logging import get_logger, quiet_http_loggers
@@ -44,7 +45,7 @@ STEPS_DESCRIPTION = (
     "сценарий для многошаговых задач и точных текстов: список {do, text?}; do — что сделать, по-английски; "
     "text печатается дословно (иначе текст подберёт модель по goal)"
 )
-DO_DESCRIPTION = "что сделать на этом шаге, по-английски"
+DO_DESCRIPTION = "что сделать на этом шаге, по-английски, с видимым признаком готовности: … (done when …)"
 TEXT_DESCRIPTION = "что напечатать дословно"
 NO_TASK = "нужен goal или steps"
 URL_DESCRIPTION = (
@@ -117,6 +118,7 @@ def default_agent_factory(
     screenshot_scale: float,
     cancel: threading.Event,
     steps: list[ScenarioStep] | None = None,
+    thresholds: Thresholds | None = None,
 ) -> AgentLike:
     agent_cls = import_core("agent").Agent
     scenario = {} if steps is None else {"steps": steps}  # режим цели зовёт ядро как раньше
@@ -129,6 +131,7 @@ def default_agent_factory(
         screenshot_quality=screenshot_quality,
         screenshot_scale=screenshot_scale,
         cancel=cancel,
+        thresholds=thresholds,  # None — пороги ядра по умолчанию
         **scenario,
     )
 
@@ -264,6 +267,7 @@ class BrowseService:
             screenshot_quality=self._settings.browser.screenshot_quality,
             screenshot_scale=self._settings.browser.screenshot_scale,
             cancel=cancel,
+            thresholds=self._settings.thresholds,
             **scenario,
         )
         if steps is None:
@@ -406,7 +410,8 @@ def tab_line(result: RunResult) -> str | None:
 
 
 def scenario_lines(result: RunResult, steps: Sequence[ScenarioStep] | None = None) -> list[str]:
-    """Итог сценария: «сценарий: k из M выполнено» и, если не `done`, «остановился на шаге k+1 из M: <do>».
+    """Итог сценария: «сценарий: k из M выполнено» и, если не `done`, «остановился на шаге k+1 из M: <do>»; при
+    `unconfirmed` — «шаг k+1 из M не подтверждён (вероятно, выполнен — проверь скриншот): <do>».
 
     Режим цели (`scenario_total` None) — пусто. `do` берётся из `steps`, если это тот же сценарий (M шагов).
     """
@@ -415,7 +420,10 @@ def scenario_lines(result: RunResult, steps: Sequence[ScenarioStep] | None = Non
         return []
     lines = [f"сценарий: {done} из {total} выполнено"]
     if result.status != "done" and done < total:
-        stopped = f"остановился на шаге {done + 1} из {total}"
+        if result.status == "unconfirmed":
+            stopped = f"шаг {done + 1} из {total} не подтверждён (вероятно, выполнен — проверь скриншот)"
+        else:
+            stopped = f"остановился на шаге {done + 1} из {total}"
         if steps is not None and len(steps) == total:
             stopped += f": {steps[done].do}"
         lines.append(stopped)
