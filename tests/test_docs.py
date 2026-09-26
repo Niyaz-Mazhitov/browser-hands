@@ -140,3 +140,19 @@ def test_readme_says_step_texts_never_reach_the_text_model():
     assert "текстовая модель на таком шаге не вызывается" not in text
     security = flat(section(README, "## Безопасность и приватность"))
     assert "сценарий `steps` (`do` и `text`; `text` — только Jev)" in security
+
+
+def test_readme_states_unconfirmed_and_the_action_confidence_threshold():
+    answer = flat(section(README, "## Ответ `browse`"))
+    assert "`done|blocked|failed|timeout|step_limit|unconfirmed`" in answer
+    scenario = flat(section(README, SCENARIO))
+    assert "`unconfirmed`" in scenario and "разрешая только DONE, WAIT и BLOCKED" in scenario
+    assert f"после {agent.RETYPE_LIMIT} повторных вводов" in scenario
+    assert "`step k of M: typed text does not stay in the field`" in scenario
+    steps = [ScenarioStep(f"Step {i}") for i in range(1, 5)]
+    line = format_result(make_result("unconfirmed", steps=4, scenario=(3, 4)), steps=steps).splitlines()[2]
+    assert line == "шаг 4 из 4 не подтверждён (вероятно, выполнен — проверь скриншот): Step 4"
+    assert "`шаг N из M не подтверждён (вероятно, выполнен — проверь скриншот): <do>`" in scenario
+    limits = flat(section(README, "## Ограничения"))
+    threshold = f"{agent.MIN_ACTION_CONFIDENCE:g}".replace(".", ",")
+    assert f"уверена меньше чем на {threshold}" in limits and "`uncertain action: …`" in limits
