@@ -1449,6 +1449,7 @@ def test_busy_page_in_headless_chrome_ends_waits_by_fuse_and_its_promise_cleans_
 NETWORK_PAGE = """<!doctype html><body>
 <button onclick="fetch('/slow').then(r=>r.text()).then(t=>{out.textContent=t})">Slow</button>
 <button onclick="fetch('/poll').catch(()=>{})">Poll</button>
+<button onclick="fetch('/poll').catch(()=>{}); setTimeout(()=>{location.href='/next'}, 50)">Leave</button>
 <div id=out></div></body>"""
 
 
@@ -1506,6 +1507,24 @@ def test_ready_in_headless_chrome_waits_for_fetch_and_long_poll_becomes_backgrou
         assert result["wait_reason"] == "fuse" and result["pending_requests"] == 1, result
         again = tab.await_ready({"kind": "retry"})  # long-poll ещё в полёте — теперь фон
         assert again["wait_reason"] == "quiet" and again["pending_requests"] == 0 and again["ms"] < 300, again
+
+
+@chrome_only
+def test_requests_of_a_page_left_by_a_click_do_not_hold_waits_in_headless_chrome(tmp_path):
+    """Клик шлёт запрос (10 с) и уходит со страницы: Chrome не присылает завершения запросу старого документа (зонд
+    ревью). Было: `fuse` на этом и каждом следующем ожидании, «страница ещё загружается» навсегда."""
+    with headless_chrome(tmp_path) as chrome, network_server() as url:
+        tab = chrome.new_tab()
+        tab.navigate(url)
+        state = tab.observe()
+        leave = next(a for a in state["actions"] if a["label"] == "Leave")
+        tab.act(leave, state)
+        result = tab.await_ready(leave)
+        assert result["wait_reason"] == "quiet" and result["pending_requests"] == 0, result
+        assert tab.evaluate("location.pathname") == "/next"
+        assert tab.in_flight(tab.action_epoch) == 0 and tab.in_flight(0) == 0  # запрос старого документа снят
+        again = tab.await_ready({"kind": "retry"})
+        assert again["wait_reason"] == "quiet" and again["ms"] < 300, again
 
 
 FIELDS_PAGE = """<!doctype html><body><input aria-label="Search">
