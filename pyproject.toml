@@ -1,0 +1,33 @@
+[project]
+name = "browser-hands"
+version = "0.1.0"
+description = "MCP server: a fast browser agent (Jev via OpenRouter) that drives Chrome over CDP."
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.28,<2",
+    "httpx[http2]>=0.28,<1",
+    "websockets>=15,<16",
+]
+
+[project.scripts]
+browser-hands = "browser_hands.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["pytest>=8.4,<9", "ruff>=0.14,<1"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.format]
+exclude = ["*.md"]  # ruff 0.16 форматирует python-блоки в Markdown: иначе `ruff format --check .` (check.sh) падает на docs/plan.md
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
