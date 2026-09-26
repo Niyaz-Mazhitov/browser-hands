@@ -349,6 +349,9 @@ class Tab:
         self._focus_emulated = False
         self._network_enabled = False
         self._epoch = 0  # client.seq перед командой последнего действия: запросы, начатые позже, — от действия
+        # то же, но только исполненного действия агента (`act`), без навигации: агент помнит её у каждого действия и
+        # спрашивает `in_flight` — какие запросы его действий ещё в полёте; None — действий ещё не было
+        self.action_epoch: int | None = None
         self._owner: str | None = None  # своя метка __bhOwner (claim); release() удаляет её, только если она наша
         self._foreign = False  # метка чужая: release() страницу не трогает
         self._browser_s = 0.0
@@ -579,6 +582,13 @@ class Tab:
     def _pending(self) -> int:
         """Запросов вкладки в полёте, начатых после эпохи действия (без учёта сети — 0)."""
         return self.client.pending_since(self.session_id, self._epoch) if self.network else 0
+
+    def in_flight(self, since: int | None) -> int:
+        """Запросов вкладки в полёте, начатых после эпохи `since` (`client.seq`), в том числе фоновых: предохранитель
+        ожидания их пережил, ответа ещё нет. Без учёта сети или без эпохи — 0. Только учёт в Python, без вызова CDP."""
+        if not self.network or since is None:
+            return 0
+        return self.client.in_flight_since(self.session_id, since)
 
     def _wait_network(self, until: float) -> bool:
         """Насос событий, пока запросы после эпохи не завершатся (или отмена), не дольше `until` (monotonic). True —
@@ -874,6 +884,7 @@ class Tab:
             raise StalePage("Page changed since this decision. Observe again.")
         self._epoch = self.client.seq  # WAIT и SELECT (его change — внутри evaluate); у ввода — уточняется в _act
         result = self._act(action, text)
+        self.action_epoch = self._epoch  # действие исполнено: его запросы — «начатые последним действием»
         self.after_input = action  # следующий observe() подождёт: WAIT — изменения, остальное — готовности
         return result
 

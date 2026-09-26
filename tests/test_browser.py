@@ -1078,6 +1078,95 @@ def test_click_epoch_is_taken_right_before_the_input(fake_tab):
     assert fake_tab.after_input == p["actions"][2]
 
 
+def clicked_with_a_slow_request(fake_tab):
+    """Клик по «Go» (узел 20) на FakeCDPServer: до клика страница начала свой запрос `boot`, клик — запрос `search`,
+    ответ на который не приходит (медленный сервер). Итог — ожидание после клика (`await_ready`)."""
+    server = fake_tab.server
+    p = page()
+    p.update(marker="m", page_key=["k"], guards={"20": "g"})
+    server.on["Target.getTargets"] = lambda f, ws: (
+        net(ws, "Network.requestWillBeSent", "boot", type="XHR"),
+        reply(ws, f),
+    )
+    fake_tab.client.call("Target.getTargets")
+
+    def evaluate(frame, ws):
+        expression = frame["params"]["expression"]
+        if "c.pageKey()" in expression:
+            reply(ws, frame, {"result": {"value": [["k"], "g"]}})
+        elif expression.startswith(READY):
+            reply(ws, frame, ready_value())
+        else:
+            reply(ws, frame, {"result": {"value": {"x": 5, "y": 5}}})
+
+    def mouse(frame, ws):
+        if frame["params"]["type"] == "mousePressed":
+            net(ws, "Network.requestWillBeSent", "search", type="Fetch")
+        reply(ws, frame)
+
+    server.on["Runtime.evaluate"] = evaluate
+    server.on["Input.dispatchMouseEvent"] = mouse
+    fake_tab.act(p["actions"][2], p)
+    return fake_tab.await_ready(p["actions"][2])
+
+
+def test_in_flight_counts_requests_of_the_action_even_after_the_fuse(fake_tab):
+    fake_tab.fuse_s = 0.3
+    assert fake_tab.action_epoch is None and fake_tab.in_flight(fake_tab.action_epoch) == 0  # действий ещё не было
+    result = clicked_with_a_slow_request(fake_tab)
+    assert (result["wait_reason"], result["pending_requests"]) == ("fuse", 1)
+    assert fake_tab.client.pending_since("S1", fake_tab._epoch) == 0  # фон: ожиданий больше не держит
+    assert fake_tab.action_epoch == fake_tab._epoch
+    assert fake_tab.in_flight(fake_tab.action_epoch) == 1  # но ответа нет — страница загружается (`boot` — не от клика)
+    assert fake_tab.in_flight(0) == 2 and fake_tab.in_flight(None) == 0
+    fake_tab.server.on["Target.getTargets"] = lambda f, ws: (net(ws, "Network.loadingFinished", "search"), reply(ws, f))
+    fake_tab.client.call("Target.getTargets")
+    assert fake_tab.in_flight(fake_tab.action_epoch) == 0
+
+
+def test_wait_after_the_fuse_is_woken_when_the_backgrounded_request_of_the_action_finishes(fake_tab):
+    fake_tab.fuse_s = 0.3
+    assert clicked_with_a_slow_request(fake_tab)["wait_reason"] == "fuse"
+    server = fake_tab.server
+    fake_tab.fuse_s = 5.0  # WAIT Jev: изменения нет до ответа сервера — будит ответ, а не предохранитель
+
+    def evaluate(frame, ws):
+        if frame["params"]["expression"].startswith(CHANGE):
+            time.sleep(0.1)
+            net(ws, "Network.loadingFinished", "search")  # фоновый запрос действия завершился
+            return
+        reply(ws, frame, ready_value(mutations=4))  # результаты поиска легли в DOM
+
+    server.on["Runtime.evaluate"] = evaluate
+    started = time.monotonic()
+    result = fake_tab.await_change()
+    assert (result["wait_reason"], result["change"], result["ready"]) == ("change", "network", "quiet")
+    assert time.monotonic() - started < 2.0
+    assert fake_tab.in_flight(fake_tab.action_epoch) == 0
+
+
+def test_navigation_is_not_an_action_epoch(fake_tab):
+    server = fake_tab.server
+
+    def navigate(frame, ws):
+        net(ws, "Network.requestWillBeSent", "poll", type="XHR")  # long-poll страницы с загрузки
+        reply(ws, frame, {"frameId": "F", "loaderId": "L"})
+
+    server.on["Page.navigate"] = navigate
+    server.on["Runtime.evaluate"] = lambda f, ws: reply(
+        ws, f, LOADED if f["params"]["expression"].startswith(LOAD) else ready_value()
+    )
+    fake_tab.fuse_s = 0.2
+    fake_tab.navigate("https://example.test/")
+    assert fake_tab.action_epoch is None and fake_tab.in_flight(fake_tab.action_epoch) == 0
+    assert fake_tab.in_flight(0) == 1
+
+
+def test_user_tab_without_network_never_reports_requests_in_flight():
+    tab = make_tab(Mock(), owned=False, network=None)
+    assert tab.network is False and tab.in_flight(0) == 0
+
+
 def test_user_tab_on_fake_cdp_enables_no_network_and_waits_on_dom_signals_only(fake_tab):
     server = fake_tab.server
     tab = Tab(fake_tab.client, "S1", "T1", owned=False)

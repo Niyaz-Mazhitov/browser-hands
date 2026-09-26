@@ -239,6 +239,21 @@ def test_requests_started_before_the_epoch_are_background(server, client):
     assert client.network["S1"].pending == {} and client.network["S1"].background == set()  # не копятся
 
 
+def test_in_flight_counts_background_requests_too(server, client):
+    server.on["Target.getTargets"] = lambda f, ws: (request(ws, "old"), reply(ws, f))
+    client.call("Target.getTargets")
+    epoch = client.seq
+    server.on["Runtime.evaluate"] = lambda f, ws: (request(ws, "slow"), request(ws, "ws", "WebSocket"), reply(ws, f))
+    client.call("Runtime.evaluate", {"expression": "1"}, session_id="S1")
+    client.mark_background("S1")  # предохранитель вышел
+    assert client.pending_since("S1", epoch) == 0  # ожиданий не держат
+    assert client.in_flight_since("S1", epoch) == 1  # но ответа ещё нет; WebSocket — не в счёт
+    assert client.in_flight_since("S1", 0) == 2 and client.in_flight_since("S2", 0) == 0
+    server.on["Target.getTargets"] = lambda f, ws: (finished(ws, "slow"), reply(ws, f))
+    client.call("Target.getTargets")
+    assert client.in_flight_since("S1", epoch) == 0
+
+
 def test_wait_events_pumps_until_the_predicate_holds(server, client):
     def handler(frame, ws):
         request(ws, "slow")
