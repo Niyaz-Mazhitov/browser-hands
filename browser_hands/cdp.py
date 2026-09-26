@@ -267,6 +267,15 @@ class CDPClient:
             return 0
         return sum(1 for rid, start in state.pending.items() if start > seq and rid not in state.background)
 
+    def in_flight_since(self, session_id: str, seq: int) -> int:
+        """Незавершённых запросов сессии, начатых после эпохи `seq`, в том числе фоновых (пережили предохранитель, но
+        ответа ещё нет): «страница ещё загружается» для наблюдения Jev и правила «нет изменений» (WebSocket,
+        event-stream — не в счёт, как в `pending_since`)."""
+        state = self.network.get(session_id)
+        if state is None:
+            return 0
+        return sum(1 for start in state.pending.values() if start > seq)
+
     def mark_background(self, session_id: str) -> int:
         """Все незавершённые запросы сессии — фоновые (пережили предохранитель): больше не держат ожиданий. Итог —
         сколько их."""
