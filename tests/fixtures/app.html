@@ -5,6 +5,11 @@
   delay=<мс> — задержка результатов поиска (700); spinner=1 — пока ищем, список заменён строкой
   «Searching» с точками, меняются каждые 100 мс (без него список молчит до результатов);
   history=<символов> — объём переписки в открытом чате (3000); run=<id> — метка прогона для отчёта.
+  remount=<мс> — как WhatsApp, догружающий чат: через столько после открытия чата поле сообщения удаляется и создаётся
+  заново (новый узел, пустой: введённый текст пропадает, Send прячется); подпись поля — «Type a message to <чат>»
+  (без remount — «Type a message»). sendstatus=<мс> — Send: сообщение сразу в списке со статусом «Sending…» (часики),
+  через столько — «Sent» (галочка); статус у исходящих — кнопка «HH:MM Sent» (у прошлых тоже), клик — панель
+  «Message info». Оба по умолчанию выключены (0): без sendstatus сообщение появляется через 300 мс, статус — не кнопка.
   Отчёт: state() читает только DOM → POST /report при каждом изменении и sendBeacon на pagehide.
   Чаты «Работа» и «Рабочий» — ниже края списка: без поиска их не видно (как в настоящем WhatsApp).
 -->
@@ -68,9 +73,19 @@
     box-shadow: 0 1px .5px rgba(11, 20, 26, .13); }
   .msg.out { align-self: flex-end; background: #d9fdd3; }
   .msg .meta { float: right; margin: 6px 0 -4px 10px; font-size: 11px; color: #667781; }
+  .msg .meta[role="button"] { cursor: pointer; border-radius: 4px; }
+  .msg .meta[role="button"]:hover { background: rgba(11, 20, 26, .06); }
+  .msg .status { margin-left: 3px; }
   .conv-foot { flex: none; display: flex; align-items: center; gap: 8px; padding: 8px 16px; background: #f0f2f5; }
   #composer { flex: 1; min-height: 42px; max-height: 120px; overflow-y: auto; padding: 10px 12px;
     border-radius: 8px; background: #fff; }
+  #info { width: 340px; flex: none; display: flex; flex-direction: column; background: #fff;
+    border-left: 1px solid #d1d7db; }
+  .info-head { height: 60px; flex: none; display: flex; align-items: center; gap: 12px; padding: 0 12px;
+    background: #f0f2f5; font-size: 16px; }
+  .info-body { padding: 16px; display: flex; flex-direction: column; gap: 10px; color: #667781; }
+  .info-body .msg { align-self: flex-end; color: #111b21; }
+  .info-row { display: flex; justify-content: space-between; border-bottom: 1px solid #e9edef; padding: 8px 0; }
 </style>
 </head>
 <body>
@@ -118,6 +133,17 @@
       </footer>
     </section>
   </main>
+  <aside id="info" role="dialog" aria-label="Message info" hidden>
+    <header class="info-head">
+      <button id="info-close" class="icon" type="button" aria-label="Close">✕</button>
+      <span>Message info</span>
+    </header>
+    <div class="info-body">
+      <div id="info-msg" class="msg out"></div>
+      <div class="info-row"><span>Sent</span><span id="info-time"></span></div>
+      <div class="info-row"><span>Delivered</span><span>—</span></div>
+    </div>
+  </aside>
 </div>
 
 <script>
@@ -129,6 +155,7 @@
   };
   const BOOT = num('boot', 0), DELAY = num('delay', 700), HISTORY = num('history', 3000);
   const SPINNER = params.get('spinner') === '1', RUN = params.get('run') || '';
+  const REMOUNT = num('remount', 0), SENDSTATUS = num('sendstatus', 0);
   const $ = id => document.getElementById(id);
   const el = (tag, cls, text) => {
     const e = document.createElement(tag);
@@ -175,8 +202,9 @@
   });
 
   const list = $('chats'), search = $('search'), clear = $('clear');
-  const composer = $('composer'), send = $('send'), voice = $('voice');
-  let current = null, shownQuery = '', searchTimer = 0, spinTimer = 0;
+  const send = $('send'), voice = $('voice');
+  let composer = $('composer');  // remount заменяет узел: всегда через эту переменную
+  let current = null, shownQuery = '', searchTimer = 0, spinTimer = 0, remountTimer = 0, sentKey = 0;
 
   const textOf = box => box.innerText.replace(/ /g, ' ').trim();
   const normalize = box => { if (!textOf(box)) box.replaceChildren(); };  // пустое поле → :empty (плейсхолдер)
@@ -243,14 +271,37 @@
     renderList('');
   });
 
+  function meta(message) {
+    if (!SENDSTATUS || !message.out) return el('span', 'meta', message.time + (message.out ? ' ✓✓' : ''));
+    // Статус исходящего — кнопка: подпись в снимке «HH:MM Sent» / «HH:MM Sending…», видно время и значок.
+    const sending = message.status === 'sending';
+    const box = el('span', 'meta', message.time), icon = el('span', 'status', sending ? '🕓' : '✓');
+    icon.setAttribute('aria-label', sending ? 'Sending…' : 'Sent');
+    box.setAttribute('role', 'button');
+    box.tabIndex = 0;
+    box.append(icon);
+    box.addEventListener('click', () => showInfo(message));
+    return box;
+  }
+
+  function showInfo(message) {
+    $('info-msg').textContent = message.text;
+    $('info-time').textContent = message.status === 'sending' ? '—' : message.time;
+    $('info').hidden = false;
+  }
+  $('info-close').addEventListener('click', () => { $('info').hidden = true; });
+
   function renderMessages(chat) {
     const box = $('messages');
     const children = [el('div', 'day', 'TODAY')];
     for (const message of chat.messages) {
       const bubble = el('div', message.out ? 'msg out' : 'msg');
       bubble.setAttribute('role', 'listitem');
-      if (message.fresh) bubble.dataset.out = '1';  // только отправленные на этой странице
-      bubble.append(el('span', 'meta', message.time + (message.out ? ' ✓✓' : '')), el('span', 'text', message.text));
+      if (message.fresh) {  // только отправленные на этой странице
+        bubble.dataset.out = '1';
+        bubble.dataset.key = String(message.key);
+      }
+      bubble.append(meta(message), el('span', 'text', message.text));
       children.push(bubble);
     }
     box.replaceChildren(...children);
@@ -271,17 +322,46 @@
     $('welcome').hidden = true;
     $('conv').hidden = false;
     $('chat-title').textContent = chat.name;
+    $('info').hidden = true;
     composer.replaceChildren();
     updateComposer();
     renderMessages(chat);
+    clearTimeout(remountTimer);
+    if (REMOUNT > 0) {
+      composer.setAttribute('aria-label', `Type a message to ${chat.name}`);
+      remountTimer = setTimeout(remountComposer, REMOUNT);
+    }
+  }
+
+  function remountComposer() {  // «чат догрузился»: новый пустой узел с теми же атрибутами, прежний текст пропал
+    const fresh = composer.cloneNode(false);
+    wireComposer(fresh);
+    composer.replaceWith(fresh);
+    composer = fresh;
+    updateComposer();
   }
 
   function sendMessage() {
     const text = textOf(composer), chat = current;
     if (!text || !chat) return;
+    if (SENDSTATUS > 0) {  // сразу в списке «Sending…», поле очищено; через SENDSTATUS мс — «Sent»
+      const now = new Date().toTimeString().slice(0, 5);
+      const message = {out: true, fresh: true, text, time: now, status: 'sending', key: ++sentKey};
+      chat.messages.push(message);
+      chat.time = now;
+      composer.replaceChildren();
+      updateComposer();
+      if (current === chat) renderMessages(chat);
+      if (!spinTimer) renderList(shownQuery);
+      setTimeout(() => {
+        message.status = 'sent';
+        document.querySelector(`#messages [data-key="${message.key}"] .meta`)?.replaceWith(meta(message));
+      }, SENDSTATUS);
+      return;
+    }
     setTimeout(() => {  // сервер «подтвердил» через 300 мс: сообщение в списке, поле очищено
       const now = new Date();
-      chat.messages.push({out: true, fresh: true, text, time: now.toTimeString().slice(0, 5)});
+      chat.messages.push({out: true, fresh: true, text, time: now.toTimeString().slice(0, 5), key: ++sentKey});
       chat.time = now.toTimeString().slice(0, 5);
       composer.replaceChildren();
       updateComposer();
@@ -290,13 +370,16 @@
     }, 300);
   }
 
-  composer.addEventListener('input', () => { normalize(composer); updateComposer(); });
-  composer.addEventListener('keydown', event => {
-    if (event.key === 'Enter' && !event.shiftKey) {
-      event.preventDefault();
-      sendMessage();
-    }
-  });
+  function wireComposer(box) {
+    box.addEventListener('input', () => { normalize(box); updateComposer(); });
+    box.addEventListener('keydown', event => {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        sendMessage();
+      }
+    });
+  }
+  wireComposer(composer);
   send.addEventListener('click', sendMessage);
 
   // Отчёт стенду: только то, что видно в DOM.

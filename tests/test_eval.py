@@ -6,6 +6,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 
 import pytest
 
@@ -64,7 +65,7 @@ def test_server_serves_fixtures_and_keeps_the_latest_report_per_run():
         assert outside.value.code == 404
 
 
-@pytest.mark.parametrize("name", ["search", "search-spinner", "boot"])
+@pytest.mark.parametrize("name", ["search", "search-spinner", "boot", "search-remount"])
 def test_chat_tasks_check_the_open_chat_and_the_exact_text(name):
     task = stand.TASKS[name]
     assert task.check(GOOD_CHAT)
@@ -103,9 +104,43 @@ def test_task_pages_exist_and_carry_the_labels_the_scenarios_use():
             assert (FIXTURES / task.page.split("?")[0]).is_file()
 
 
+def test_remount_task_turns_on_the_whatsapp_like_page_parts():
+    task = stand.TASKS["search-remount"]
+    params = dict(parse_qsl(urlsplit(task.page).query))
+    assert params == {"delay": "700", "remount": "900", "sendstatus": "1500"}
+    assert (int(params["remount"]), int(params["sendstatus"])) == (stand.REMOUNT_MS, stand.SEND_STATUS_MS)
+    assert task.goal == stand.CHAT_GOAL and task.scenario == stand.CHAT_SCENARIO
+    for other in ("search", "search-spinner", "boot"):  # прежние задачи — без пересоздания и статусов
+        assert "remount" not in stand.TASKS[other].page and "sendstatus" not in stand.TASKS[other].page
+    app = (FIXTURES / "app.html").read_text(encoding="utf-8")
+    for part in ("num('remount', 0)", "num('sendstatus', 0)", "Type a message to ${chat.name}", "'Sending…'", "'Sent'"):
+        assert part in app
+    assert 'aria-label="Message info"' in app
+    assert stand.COMPOSER_TO == "Type a message to Рабочий"
+
+
+def test_status_labels_match_only_message_status_buttons():
+    page = {
+        "actions": [
+            {"kind": "click", "label": "09:42 Sent"},
+            {"kind": "click", "label": "10:05 Sending…"},
+            {"kind": "click", "label": "Рабочий 12:52 Кто заберёт ключи"},
+            {"kind": "click", "label": "Sent"},
+            {"kind": "fill", "label": stand.COMPOSER_TO, "value": ""},
+        ]
+    }
+    assert stand.labels(page, stand.STATUS_SENT) == ["09:42 Sent"]
+    assert stand.labels(page, stand.STATUS_SENDING) == ["10:05 Sending…"]
+
+
 def test_delay_flag_changes_only_pages_with_a_search_delay():
     assert stand.page_for(stand.TASKS["search"], delay=900) == "app.html?delay=900"
     assert stand.page_for(stand.TASKS["boot"], delay=900) == "app.html?boot=4000&delay=900"
+    assert stand.page_for(stand.TASKS["search-remount"], delay=900) == "app.html?delay=900&remount=900&sendstatus=1500"
+    remount = stand.page_for(stand.TASKS["search-remount"], delay=None, remount=1600)
+    assert remount == "app.html?delay=700&remount=1600&sendstatus=1500"
+    assert stand.page_for(stand.TASKS["search"], delay=None, remount=1600) == "app.html?delay=700"  # remount нет
+    assert stand.parse_args(["--remount", "1600"]).remount == 1600 and stand.parse_args([]).remount is None
     assert stand.page_for(stand.TASKS["form"], delay=900) == "form.html"
     assert stand.with_params("form.html", run="x-1") == "form.html?run=x-1"
 
@@ -120,23 +155,27 @@ def test_main_on_fake_core_writes_every_run_unverified(tmp_path, capsys, monkeyp
 
     assert code == 1  # FakeAgent страницу не открывает: отчётов нет
     assert len(core.chromes) == 1 and core.chromes[0].config.mode == "launch" and core.chromes[0].config.headless
-    assert len(core.agents) == 8 and all("run=" in agent["url"] for agent in core.agents)
+    assert len(core.agents) == 10 and all("run=" in agent["url"] for agent in core.agents)
     assert {agent["run"].max_steps for agent in core.agents} == {12}
     (trace,) = tmp_path.glob("eval-*.jsonl")
     lines = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
     runs, summary = lines[:-1], lines[-1]["summary"]
-    assert len(runs) == 8 and all(row["verified"] is False for row in runs)
+    assert len(runs) == 10 and all(row["verified"] is False for row in runs)
     assert all("run=" in row["start_url"] and row["label"] == "t" for row in runs)
     # по кругу: прогон 1 всех задач, потом 2; wiki (сеть) по умолчанию не входит
-    assert [row["task"] for row in runs[:4]] == stand.DEFAULT_TASKS == ["search", "search-spinner", "boot", "form"]
+    assert (
+        [row["task"] for row in runs[:5]]
+        == stand.DEFAULT_TASKS
+        == ["search", "search-spinner", "boot", "search-remount", "form"]
+    )
     assert runs[0]["problem"] == "нет отчёта со страницы"
     assert all(row["mode"] == "goal" and "scenario" not in row for row in runs)
     assert all(agent["goal"] and agent["steps"] is None for agent in core.agents)  # режим цели — как раньше
-    assert summary["runs"] == 8 and summary["verified"] == 0 and summary["mode"] == "goal"
+    assert summary["runs"] == 10 and summary["verified"] == 0 and summary["mode"] == "goal"
     assert [s["task"] for s in summary["tasks"]] == stand.DEFAULT_TASKS
     assert summary["tasks"][0]["done"] == 2 and summary["tasks"][0]["failures"] == {"done: нет отчёта со страницы": 2}
     out = capsys.readouterr().out
-    assert "verified 0/8" in out and "trace:" in out
+    assert "verified 0/10" in out and "trace:" in out
 
 
 def test_main_stops_at_the_cost_budget(tmp_path, monkeypatch):
@@ -196,6 +235,7 @@ def test_record_decisions_keeps_what_jev_saw_and_restores_choose():
     assert seen["op"] == "CLICK" and seen["target"] == "Clear search" and seen["controls_total"] == 2
     assert seen["controls"] == [f"fill:{stand.SEARCH_LABEL}='Раб'", "click:Clear search"]
     assert seen["step_done"] is None and "scenario_step" not in seen  # режим цели / ядро без step_done
+    assert isinstance(seen["t_ms"], int) and seen["t_ms"] >= 0  # когда пришёл ответ, от начала прогона
     assert stand.trail(sink) == "CLICK «Clear search»"
 
 
@@ -218,6 +258,7 @@ def test_every_task_has_a_valid_scenario_with_the_goal_texts():
     chat = stand.TASKS["search"].steps()
     assert [step.text for step in chat] == [stand.CHAT, None, stand.MESSAGE, None]
     assert stand.TASKS["search-spinner"].scenario == stand.TASKS["boot"].scenario == stand.CHAT_SCENARIO
+    assert stand.TASKS["search-remount"].scenario == stand.CHAT_SCENARIO
     form = stand.TASKS["form"].steps()
     assert [step.text for step in form[:2]] == [stand.FORM_EXPECTED["name"], stand.FORM_EXPECTED["email"]]
     assert "Kazakhstan" in form[2].do and form[2].text is None
@@ -251,7 +292,7 @@ def test_scenario_mode_passes_steps_without_goal(tmp_path, monkeypatch, capsys):
 
     assert stand.main(argv, env=ENV, factories=core.factories()) == 1
 
-    assert [agent["goal"] for agent in core.agents] == [""] * 4
+    assert [agent["goal"] for agent in core.agents] == [""] * 5
     for agent, name in zip(core.agents, stand.DEFAULT_TASKS, strict=True):
         assert agent["steps"] == stand.TASKS[name].steps()
     runs, summary = read_trace(tmp_path)
@@ -264,7 +305,7 @@ def test_scenario_mode_passes_steps_without_goal(tmp_path, monkeypatch, capsys):
     assert (first["jev_calls_median"], first["text_calls_median"], first["text_calls_total"]) == (3, 0, 0)
     assert first["failures"] == {"blocked [сценарий 1/4]: нет отчёта со страницы": 1}
     out = capsys.readouterr().out
-    assert "итого (scenario): verified 0/4" in out
+    assert "итого (scenario): verified 0/5" in out
     assert "    ×1 blocked [сценарий 1/4]: нет отчёта со страницы" in out
     assert " 1/4 " in out  # колонка scn в строке прогона
 
