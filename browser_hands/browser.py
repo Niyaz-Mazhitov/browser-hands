@@ -6,6 +6,10 @@ CDP-клиента. Модель никогда не выдаёт селекто
 
 Вкладка бывает своей (`owned=True`: создали, эмулируем viewport 1120×780, закрываем) и чужой — открытой вкладкой
 пользователя (`owned=False`): её не закрываем, не переводим и не меняем ей размер; в конце только `release()`.
+
+Ожидания — по событиям и состояниям, не по времени (docs/plan-waits.md §2): `await_ready` (кадры без значимых мутаций,
+запросы вкладки после действия, readyState, шрифты, конечные анимации, aria-busy) и `await_change` (следующее изменение,
+затем `await_ready`). Единственный потолок одного ожидания — `min(остаток дедлайна − запас, fuse_s)`.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .cdp import CDPClient, CDPError, CDPTimeout, ChromeDisconnected, TabGone
+from .config import Thresholds
 from .types import Timing
 
 log = logging.getLogger(__name__)
@@ -32,14 +37,10 @@ log = logging.getLogger(__name__)
 READ_STATE = Path(__file__).with_name("snapshot.js").read_text(encoding="utf-8")
 MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
 
-# Успокоение (после действия, WAIT, загрузки, перед вторым шансом): DOM молчит `quiet` мс, не раньше двух кадров
-# и `floor` мс, не дольше `ceiling` мс. Значимая мутация — childList, characterData и атрибуты из `attributes`, если
-# значение изменилось; не внутри script/style/template/noscript. `style` не в списке: JS-анимации пишут его каждый кадр.
-SETTLE_FLOOR_MS = 50
-SETTLE_QUIET_MS = 200
-SETTLE_CEILING_MS = 1500
-SETTLE_DEADLINE_MARGIN_S = 0.5  # потолок ≤ остаток дедлайна минус это: ответ успевает до дедлайна CDP-вызова
-SETTLE_ATTRIBUTES = (
+# Готовность страницы к решению — по событиям и состояниям, не по времени (docs/plan-waits.md §2). Значимая мутация —
+# childList, characterData и атрибуты из `MUTATION_ATTRIBUTES`, если значение изменилось; не внутри
+# script/style/template/noscript. `style` не в списке: JS-анимации пишут его каждый кадр.
+MUTATION_ATTRIBUTES = (
     "class",
     "hidden",
     "open",
@@ -51,30 +52,69 @@ SETTLE_ATTRIBUTES = (
     "aria-selected",
     "aria-checked",
 )
+# Кадров подряд без значимых мутаций, после которых DOM считается успокоившимся (§2 п. 1). Единица — кадр страницы,
+# не мс. Обоснование: к первому кадру после действия обработчики и микрозадачи уже отработали, а то, что они поставили
+# на rAF/setTimeout(0)/MessageChannel, легло в DOM; второй тихий кадр подряд ловит цепочку «rAF → commit», которой
+# фреймворки откладывают отрисовку на следующий кадр. Одного кадра мало (второе звено цепочки не видно), три и больше
+# не ловят нового класса работы, а только добавляют кадр задержки: всё, что дольше кадра (таймеры, сеть, переходы),
+# закрывают сигналы сети, анимаций и aria-busy, а не счёт кадров.
+QUIET_FRAMES = 2
+WAIT_DEADLINE_MARGIN_S = 0.5  # предохранитель ≤ остаток дедлайна минус это: ответ успевает до дедлайна CDP-вызова
+# Сеть (учёт запросов вкладки, §2 п. 2) во вкладке пользователя — только после замера WhatsApp (§0.2, §8): поток
+# WS-кадров и буфер ответов Chrome в чужой вкладке. До него — сеть только в своей вкладке (`owned`), у пользователя —
+# DOM-сигналы (кадры, readyState, шрифты, анимации, aria-busy).
+USER_TAB_NETWORK = False
+# Буферы тел ответов не нужны (читаем только события): нули принимает Chrome 154 headless (зонд 26.09); эффект на
+# память вкладки не замерялся.
+NETWORK_ENABLE = {"maxTotalBufferSize": 0, "maxResourceBufferSize": 0, "maxPostDataSize": 0}
 
-# Только чтение; выполняется после того, как действие записано, даже если его прерывает навигация. Кадры — rAF и
-# performance.now(); setTimeout — потолок и запасной путь для фоновой вкладки без кадров.
-# Итог — {reason, ms, mutations}: quiet — тишина; options — видимые подсказки комбобокса после ввода; ceiling — потолок;
-# frames — тишина по таймеру, кадров анимации не было. На выходе observer отключён, таймеры сняты.
-SETTLE = """(p => new Promise(resolve => {
-  const start=performance.now(), action=p.action||{};
-  const field=window.__jevFast?.nodes.get(action.node);
-  const autocomplete=action.kind==='fill' && field?.getAttribute('role')==='combobox';
-  let last=start, frames=0, mutations=0, done=false, observer=null, cap=0, backup=0;
-  const finish=reason=>{
-    if (done) return;
-    done=true;
-    if (observer) observer.disconnect();
-    clearTimeout(cap);
-    clearTimeout(backup);
-    resolve({reason, ms:Math.round(performance.now()-start), mutations});
-  };
+# Общие куски выражений ожидания: какая мутация значима и где её слушать (body; до body — весь документ).
+_SIGNIFICANT = """
   const significant=r=>{
     const e=r.target.nodeType===1 ? r.target : r.target.parentElement;
     if (!e || e.closest('script,style,template,noscript')) return false;
     return r.type!=='attributes' || e.getAttribute(r.attributeName)!==r.oldValue;
   };
-  const options=()=>{
+  const watch=callback=>{
+    try {
+      const root=document.body||document.documentElement;
+      if (!root) return null;
+      const o=new MutationObserver(callback);
+      o.observe(root, {subtree:true, childList:true, characterData:true, attributes:true,
+        attributeFilter:p.attributes, attributeOldValue:true});
+      return o;
+    } catch (e) { return null; }
+  };
+"""
+
+# Только чтение; выполняется после того, как действие записано, даже если его прерывает навигация (§2 п. 1, 3–6).
+# Готово, когда `p.frames` кадров подряд без значимых мутаций И документ загружен (readyState complete), шрифты
+# загружены, нет идущих конечных анимаций (бесконечные — спиннеры — не ждём) и видимых [aria-busy=true]. Комбобокс после
+# ввода с видимыми подсказками — готово сразу. Скрытая вкладка (rAF не идёт) — ходы MessageChannel вместо кадров;
+# условие не выполнено — ход ждёт мутацию, readystatechange или fonts.ready (без холостого цикла). Единственный таймер —
+# предохранитель `p.fuse_ms`. Итог — {reason, ms, mutations, frames}: quiet | options | frames (без кадров) | fuse.
+# На выходе observer отключён, таймер и слушатели сняты.
+READY = (
+    """(p => new Promise(resolve => {
+  const start=performance.now(), action=p.action||{};
+  const field=window.__jevFast?.nodes.get(action.node);
+  const autocomplete=action.kind==='fill' && field?.getAttribute('role')==='combobox';
+  let frames=0, turns=0, quiet=0, dirty=false, mutations=0, done=false, parked=false, observer=null, fuse=0;
+  let channel=null;
+  const finish=reason=>{
+    if (done) return;
+    done=true;
+    if (observer) observer.disconnect();
+    clearTimeout(fuse);
+    if (channel) {
+      channel.port1.onmessage=null;
+      channel.port1.close();
+      document.removeEventListener('readystatechange', resume);
+    }
+    resolve({reason, ms:Math.round(performance.now()-start), mutations, frames});
+  };"""
+    + _SIGNIFICANT
+    + """  const options=()=>{
     const ids=(field?.getAttribute('aria-controls')||field?.getAttribute('aria-owns')||'')
       .split(/\\s+/).filter(Boolean);
     const roots=ids.length ? ids.map(id=>document.getElementById(id)).filter(Boolean) : [document];
@@ -84,33 +124,97 @@ SETTLE = """(p => new Promise(resolve => {
         e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});
     });
   };
-  const quiet=now=>now-start>=p.floor && now-last>=p.quiet;
+  const shown=e=>e.checkVisibility ? e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) : true;
+  const busy=()=>[...document.querySelectorAll('[aria-busy="true"]')].some(shown);
+  const animating=()=>{
+    try {
+      return (document.getAnimations?.() ?? []).some(a=>a.playState==='running' &&
+        Number.isFinite(a.effect?.getComputedTiming?.().endTime));
+    } catch (e) { return false; }
+  };
+  const ready=hidden=>document.readyState==='complete' && document.fonts?.status!=='loading' && !busy() &&
+    (hidden || !animating());
+  const step=()=>{
+    if (dirty) { dirty=false; quiet=0; } else quiet++;
+  };
   const tick=()=>{
     if (done) return;
-    const now=performance.now();
-    if (++frames>=2 && autocomplete && options()) return finish('options');
-    if (frames>=2 && quiet(now)) return finish('quiet');
-    if (now-start>=p.ceiling) return finish('ceiling');
+    frames++;
+    step();
+    if (frames>=2 && autocomplete && options()) return finish('options');
+    if (quiet>=p.frames && ready(false)) return finish('quiet');
     requestAnimationFrame(tick);
   };
-  const check=()=>{
-    if (done) return;
-    const now=performance.now();
-    if (quiet(now)) return finish(frames>=2 ? 'quiet' : 'frames');
-    backup=setTimeout(check, Math.max(16, p.quiet-(now-last), p.floor-(now-start)));
+  const turn=()=>{
+    if (done || document.visibilityState!=='hidden') return;
+    turns++;
+    step();
+    if (turns>=2 && autocomplete && options()) return finish('options');
+    if (quiet>=p.frames) {
+      if (ready(true)) return finish('frames');
+      parked=true;
+      return;
+    }
+    channel.port2.postMessage(0);
   };
-  try {
-    observer=new MutationObserver(records=>{
-      if (done) return;
-      const n=records.filter(significant).length;
-      if (n) { mutations+=n; last=performance.now(); }
-    });
-    if (document.body) observer.observe(document.body, {subtree:true, childList:true, characterData:true,
-      attributes:true, attributeFilter:p.attributes, attributeOldValue:true});
-  } catch (e) { observer=null; }
-  cap=setTimeout(()=>finish('ceiling'), p.ceiling);
-  backup=setTimeout(check, p.quiet+p.floor);
+  const resume=()=>{
+    if (!parked || done) return;
+    parked=false;
+    channel.port2.postMessage(0);
+  };
+  observer=watch(records=>{
+    if (done) return;
+    const n=records.filter(significant).length;
+    if (n) { mutations+=n; dirty=true; resume(); }
+  });
+  fuse=setTimeout(()=>finish('fuse'), p.fuse_ms);
   requestAnimationFrame(tick);
+  if (document.visibilityState==='hidden') {
+    channel=new MessageChannel();
+    channel.port1.onmessage=turn;
+    document.addEventListener('readystatechange', resume);
+    document.fonts?.ready?.then(resume, ()=>{});
+    channel.port2.postMessage(0);
+  }
+}))("""
+)
+
+# Ожидание изменения (WAIT Jev, второй взгляд, §2): первая значимая мутация или конец CSS-анимации/перехода; иначе
+# предохранитель. Только чтение; итог — {reason: mutation | animation | fuse, ms}; на выходе observer, слушатели и
+# таймер сняты.
+CHANGE = (
+    """(p => new Promise(resolve => {
+  const start=performance.now(), ends=['animationend','transitionend','animationcancel','transitioncancel'];
+  let done=false, observer=null, fuse=0;
+  const finish=reason=>{
+    if (done) return;
+    done=true;
+    if (observer) observer.disconnect();
+    for (const type of ends) document.removeEventListener(type, ended, true);
+    clearTimeout(fuse);
+    resolve({reason, ms:Math.round(performance.now()-start)});
+  };
+  const ended=()=>finish('animation');"""
+    + _SIGNIFICANT
+    + """  observer=watch(records=>{ if (!done && records.some(significant)) finish('mutation'); });
+  for (const type of ends) document.addEventListener(type, ended, true);
+  fuse=setTimeout(()=>finish('fuse'), p.fuse_ms);
+}))("""
+)
+
+# Своя вкладка после Page.navigate (он отвечает после commit — зонд 26.09): документ загружен — событие
+# readystatechange → complete (то же, что load); иначе предохранитель навигации. true — загружен, false — нет.
+LOAD = """(p => new Promise(resolve => {
+  if (document.readyState==='complete') return resolve(true);
+  let cap=0;
+  const end=value=>{
+    document.removeEventListener('readystatechange', check);
+    clearTimeout(cap);
+    resolve(value);
+  };
+  const check=()=>{ if (document.readyState==='complete') end(true); };
+  document.addEventListener('readystatechange', check);
+  cap=setTimeout(()=>end(false), p.fuse_ms);
 }))("""
 
 # Код-владелец id узлов: цель — реальный наблюдаемый элемент, никогда не селектор от модели.
@@ -222,6 +326,7 @@ class Tab:
         viewport: tuple[int, int] = (1120, 780),
         on_release: Callable[[str], None] | None = None,
         owned: bool = True,
+        network: bool | None = None,
     ) -> None:
         self.client = client
         self.session_id = session_id
@@ -232,13 +337,18 @@ class Tab:
         self.screenshot_width = viewport[0]  # ширина кадра вкладки пользователя (её viewport не трогаем)
         self.viewport = viewport  # у вкладки пользователя — её innerWidth/innerHeight (замер и каждый снимок)
         self.dpr = 1.0  # devicePixelRatio вкладки пользователя; своя эмулируется с DPR 1
-        self.deadline: float | None = None  # monotonic; ограничивает таймауты CDP-вызовов агента и потолок успокоения
-        self.cancel: threading.Event | None = None  # отмена прогона: выставлена — успокоение не начинается
-        self.after_input: dict[str, Any] | None = None  # исполненное действие: следующий observe() сначала успокоит
-        self.last_settle: dict[str, Any] | None = None  # итог последнего успокоения {reason, ms, mutations} или None
+        self.deadline: float | None = None  # monotonic; ограничивает таймауты CDP-вызовов и предохранитель ожиданий
+        self.cancel: threading.Event | None = None  # отмена прогона: выставлена — ожидание не начинается и прерывается
+        self.fuse_s = Thresholds().wait_fuse_s  # предохранитель одного ожидания (агент может задать свой Thresholds)
+        # учёт запросов вкладки (Network.enable): своя — да, пользователя — по USER_TAB_NETWORK (plan-waits.md §0.2)
+        self.network = (owned or USER_TAB_NETWORK) if network is None else network
+        self.after_input: dict[str, Any] | None = None  # исполненное действие: следующий observe() сначала подождёт
+        self.last_settle: dict[str, Any] | None = None  # итог последнего ожидания после действия (await_*) или None
         self.closed = False
         self._on_release = on_release
         self._focus_emulated = False
+        self._network_enabled = False
+        self._epoch = 0  # client.seq перед командой последнего действия: запросы, начатые позже, — от действия
         self._owner: str | None = None  # своя метка __bhOwner (claim); release() удаляет её, только если она наша
         self._foreign = False  # метка чужая: release() страницу не трогает
         self._browser_s = 0.0
@@ -275,7 +385,8 @@ class Tab:
             time.sleep(seconds)
 
     def pause(self, seconds: float) -> None:
-        """Подождать (агент ждёт появления элементов); время идёт в `wait_ms`."""
+        """Подождать (агент ждёт появления элементов); время идёт в `wait_ms`. Совместимость: agent.py до пакета
+        «сценарий» (docs/plan-waits.md §6.2 — там `await_change` вместо опроса); у вкладки своих пауз больше нет."""
         self._sleep(seconds)
 
     def _budget(self) -> float | None:
@@ -302,7 +413,8 @@ class Tab:
     # --- жизненный цикл ----------------------------------------------------------------------------------------
 
     def setup(self) -> None:
-        """Своя вкладка: viewport 1120×780 с DPR 1. Любая: focus emulation (снимает `release()`).
+        """Своя вкладка: viewport 1120×780 с DPR 1. Любая: focus emulation (снимает `release()`). С учётом сети
+        (`network`: своя вкладка, у пользователя — по USER_TAB_NETWORK) — `Network.enable` без буферов тел.
 
         Вкладке пользователя размер не меняем: `setDeviceMetricsOverride` только при `owned`."""
         if self.owned:
@@ -315,6 +427,10 @@ class Tab:
         # таймауте Chrome мог его включить, и release() выключит.
         self._focus_emulated = True
         self.call("Emulation.setFocusEmulationEnabled", {"enabled": True})
+        if self.network:
+            self._network_enabled = True  # как у focus emulation: при таймауте Chrome мог включить, release() выключит
+            self.call("Network.enable", dict(NETWORK_ENABLE))
+            self._epoch = self.client.seq
 
     def claim(self, owner: str, *, timeout: float = CLAIM_TIMEOUT_S) -> bool:
         """Мьютекс вкладки пользователя: один `Runtime.evaluate` `window.__bhOwner ??= owner`. True — метка наша или её
@@ -352,24 +468,47 @@ class Tab:
         return True
 
     def navigate(self, url: str, *, timeout: float = NAVIGATE_TIMEOUT_S) -> None:
-        """`Page.navigate` и опрос `document.readyState` до `complete` (не дольше `timeout`); всё — `wait_ms`.
+        """`Page.navigate` (отвечает после commit), загрузка документа (`LOAD`: readyState → complete, не дольше
+        `timeout` и дедлайна), затем `await_ready({"kind": "load"})`; всё — `wait_ms`. Не загрузился за `timeout` —
+        дальше без ожидания готовности, как раньше.
 
         Только своя вкладка: во вкладке пользователя агент начинает с того, что открыто."""
         if not self.owned:
             raise RuntimeError("Page.navigate во вкладке пользователя запрещён")
+        self._epoch = self.client.seq
         response = self.call("Page.navigate", {"url": url}, wait=True)
         if response.get("errorText"):
             raise NavigationFailed(f"Navigation to {url_host(url)} failed: {response['errorText']}")
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                ready = self.evaluate("document.readyState", wait=True) == "complete"
-            except (StalePage, CDPError):
-                ready = False  # контекст пересоздаётся во время загрузки
-            if ready:
-                self.settle({"kind": "load"})  # JS страницы достраивает интерфейс и после load
-                return
-            self._sleep(0.02)
+        if self._await_load(timeout):
+            self.await_ready({"kind": "load"})  # JS страницы достраивает интерфейс и после load
+
+    def _await_load(self, timeout: float) -> bool:
+        """`LOAD` в документе после commit: True — readyState complete. Документ сменился (редирект) — ждать его
+        запросы (`_wait_network`) и повторить, не больше STALE_RETRIES раз; отмена, дедлайн и `timeout` — False."""
+        limit = timeout
+        if self.deadline is not None:
+            limit = min(limit, self.deadline - time.monotonic() - WAIT_DEADLINE_MARGIN_S)
+        until = time.monotonic() + limit
+        with self._timed(wait=True):
+            for _ in range(STALE_RETRIES):
+                left = until - time.monotonic()
+                if self._cancelled() or left <= 0:
+                    return False
+                expression = LOAD + json.dumps({"fuse_ms": max(1, round(left * 1000))}) + ")"
+                try:
+                    response = self.client.call(
+                        "Runtime.evaluate",
+                        {"expression": expression, "awaitPromise": True, "returnByValue": True},
+                        session_id=self.session_id,
+                        timeout=left + WAIT_DEADLINE_MARGIN_S,
+                    )
+                except CDPError as exc:
+                    response = {"exceptionDetails": {"text": str(exc)}}
+                if not response.get("exceptionDetails"):
+                    return response.get("result", {}).get("value") is True
+                log.debug("загрузка: документ сменился, жду его запросы")
+                self._wait_network(until)
+        return False
 
     def close(self) -> None:
         """Закрыть свою вкладку; повторный вызов и обрыв соединения не бросают исключений.
@@ -388,14 +527,15 @@ class Tab:
             return  # остаётся в owned_targets: Chrome закроет её при следующем connect()
         except CDPError as exc:
             log.debug("closeTarget %s: %s", self.target_id, exc)  # уже закрыта
+        self.client.forget_network(self.session_id)
         if self._on_release:
             self._on_release(self.target_id)
 
     def release(self, *, timeout: float = SCREENSHOT_TIMEOUT_S) -> None:
         """Оставить вкладку открытой (keep_open, вкладка пользователя): во вкладке пользователя одним вызовом удалить
         кэш снимка и свою метку `__bhOwner` (чужую — нет; при чужой метке страницу не трогать), выключить focus
-        emulation, если включали, и отсоединить сессию (Chrome снимает эмуляцию), забыть target. `timeout` — на все
-        вызовы вместе; ошибки (вкладка закрыта, обрыв, Chrome молчит) — в DEBUG. Никогда не закрывает вкладку."""
+        emulation и сеть, если включали, и отсоединить сессию (Chrome снимает эмуляцию), забыть target. `timeout` —
+        на все вызовы вместе; ошибки (вкладка закрыта, обрыв, Chrome молчит) — в DEBUG. Никогда не закрывает вкладку."""
         if self.closed:
             return
         self.closed = True
@@ -409,6 +549,8 @@ class Tab:
             calls.append(("Runtime.evaluate", {"expression": cleanup}, self.session_id, timeout / 3))
         if self._focus_emulated:
             calls.append(("Emulation.setFocusEmulationEnabled", {"enabled": False}, self.session_id, timeout))
+        if self._network_enabled:  # вкладка не остаётся с включённой сетью (и до detach)
+            calls.append(("Network.disable", {}, self.session_id, timeout))
         calls.append(("Target.detachFromTarget", {"sessionId": self.session_id}, None, timeout))
         for method, params, session_id, cap in calls:
             try:
@@ -416,66 +558,229 @@ class Tab:
                 self.client.call(method, params, session_id=session_id, timeout=min(cap, left))
             except (CDPError, CDPTimeout, ChromeDisconnected, TabGone) as exc:
                 log.debug("%s %s: %s", method, self.session_id, exc)
-        self._focus_emulated = False
+        self._focus_emulated = self._network_enabled = False
+        self.client.forget_network(self.session_id)
         if self._on_release:
             self._on_release(self.target_id)
 
     # --- наблюдение --------------------------------------------------------------------------------------------
 
-    def settle(self, action: dict[str, Any] | None = None) -> dict[str, Any] | None:
-        """Дождаться тишины DOM (`SETTLE`): один `Runtime.evaluate` с `awaitPromise`, только чтение, время — `wait_ms`.
+    def _cancelled(self) -> bool:
+        return self.cancel is not None and self.cancel.is_set()
 
-        Потолок — `SETTLE_CEILING_MS`, но не дальше `deadline − SETTLE_DEADLINE_MARGIN_S` (иначе CDPTimeout уронил бы
-        прогон раньше дедлайна); места нет или выставлена отмена — не ждём. Прерван навигацией (`CDPError`,
-        `exceptionDetails`) — None. Итог — в `last_settle` и строкой DEBUG."""
-        self.last_settle = None
-        if self.cancel is not None and self.cancel.is_set():
-            log.debug("settle пропущен: отмена")
-            return None
-        ceiling = SETTLE_CEILING_MS
+    def _fuse(self) -> float:
+        """Потолок одного ожидания: `fuse_s`, но не дальше `deadline − WAIT_DEADLINE_MARGIN_S` (иначе CDPTimeout уронил
+        бы прогон раньше дедлайна). ≤ 0 — не ждать."""
+        fuse = self.fuse_s
         if self.deadline is not None:
-            ceiling = min(ceiling, int((self.deadline - time.monotonic() - SETTLE_DEADLINE_MARGIN_S) * 1000))
-            if ceiling <= 0:
-                log.debug("settle пропущен: до дедлайна меньше %g с", SETTLE_DEADLINE_MARGIN_S)
-                return None
-        action = action or {}
-        params = {
-            "action": {k: action[k] for k in ("kind", "node") if k in action},
-            "floor": SETTLE_FLOOR_MS,
-            "quiet": SETTLE_QUIET_MS,
-            "ceiling": ceiling,
-            "attributes": list(SETTLE_ATTRIBUTES),
-        }
-        expression = SETTLE + json.dumps(params) + ")"
-        try:
-            response = self.call(
-                "Runtime.evaluate", {"expression": expression, "awaitPromise": True, "returnByValue": True}, wait=True
-            )
-        except CDPError as exc:
-            log.debug("settle прерван: %s", exc)
-            return None
-        value = response.get("result", {}).get("value")
-        if response.get("exceptionDetails") or not isinstance(value, dict):
-            log.debug("settle прерван: документ сменился")
-            return None
-        self.last_settle = value
-        log.debug("settle %s %s мс, мутаций %s", value.get("reason"), value.get("ms"), value.get("mutations"))
-        return value
+            fuse = min(fuse, self.deadline - time.monotonic() - WAIT_DEADLINE_MARGIN_S)
+        return fuse
+
+    def _pending(self) -> int:
+        """Запросов вкладки в полёте, начатых после эпохи действия (без учёта сети — 0)."""
+        return self.client.pending_since(self.session_id, self._epoch) if self.network else 0
+
+    def _wait_network(self, until: float) -> bool:
+        """Насос событий, пока запросы после эпохи не завершатся (или отмена), не дольше `until` (monotonic). True —
+        завершились; без учёта сети — сразу True."""
+        if not self.network:
+            return True
+        left = until - time.monotonic()
+        if left <= 0:
+            return self._pending() == 0
+        return self.client.wait_events(self.session_id, lambda: self._cancelled() or self._pending() == 0, left)
+
+    def settle(self, action: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        """Совместимость (agent.py до пакета «сценарий», scripts/eval.py): `await_ready`; None — не ждали."""
+        return self.await_ready(action) or None
 
     def await_ready(self, action: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Страница готова к решению после действия (docs/plan-waits.md §2). Контракт §4.2: пока — `settle(action)`.
+        """Страница готова к решению после действия (docs/plan-waits.md §2): только чтение, время — `wait_ms`.
 
-        Итог — `{reason, ms, mutations}`; пусто — не ждали (отмена, до дедлайна не осталось места) или ожидание прервала
-        навигация."""
-        return self.settle(action) or {}
+        Цикл: промис `READY` (кадры, readyState, шрифты, анимации, aria-busy, подсказки комбобокса) → запросы вкладки,
+        начатые после эпохи действия, завершены? нет — насос событий до их завершения → снова `READY` (ответ мог
+        изменить DOM) — пока оба условия не выполнятся в одном проходе. Каждый проход кончается событием; единственный
+        потолок — предохранитель `_fuse()`: истёк — `fuse`, запросы в полёте — фоновые до конца жизни сессии. Документ
+        сменился (навигация) — проход повторяется в новом, не больше STALE_RETRIES раз.
+
+        Итог — `{reason, wait_reason, ms, mutations, frames, passes, pending_requests}` (`wait_reason` = `reason`:
+        quiet | options | frames | fuse) и в `last_settle`; пусто — не ждали: отмена, нет места до дедлайна, документ
+        так и не дал ответа."""
+        result = self._ready(action or {})
+        self.last_settle = result or None
+        return result
+
+    def _ready(self, action: dict[str, Any]) -> dict[str, Any]:
+        self.after_input = None  # ожидание после действия — вот оно
+        if self._cancelled():
+            log.debug("await_ready пропущен: отмена")
+            return {}
+        fuse = self._fuse()
+        if fuse <= 0:
+            log.debug("await_ready пропущен: до дедлайна меньше %g с", WAIT_DEADLINE_MARGIN_S)
+            return {}
+        started = time.monotonic()
+        until = started + fuse
+        mutations = frames = passes = interrupted = 0
+        reason: str | None = None
+        with self._timed(wait=True):
+            while reason is None:
+                left = until - time.monotonic()
+                if self._cancelled():
+                    log.debug("await_ready прерван: отмена")
+                    return {}
+                if left <= 0:
+                    reason = "fuse"
+                    break
+                value = self._ready_pass(action, left)
+                passes += 1
+                if value is None:
+                    interrupted += 1
+                    if interrupted >= STALE_RETRIES:
+                        log.debug("await_ready: документ сменяется %d раз подряд — снимок решит", interrupted)
+                        return {}
+                    self._wait_network(until)  # новый документ: его запросы
+                    continue
+                if not value:
+                    log.debug("await_ready: нет итога от страницы")
+                    return {}
+                mutations += int(value.get("mutations") or 0)
+                frames += int(value.get("frames") or 0)
+                if value.get("reason") == "fuse" or not isinstance(value.get("reason"), str):
+                    reason = "fuse"
+                elif self._pending() == 0:
+                    reason = value["reason"]
+                elif not self._wait_network(until):
+                    reason = "fuse"
+        pending = self._pending()
+        if reason == "fuse" and self.network:
+            self.client.mark_background(self.session_id)
+        result = {
+            "reason": reason,
+            "wait_reason": reason,
+            "ms": round((time.monotonic() - started) * 1000),
+            "mutations": mutations,
+            "frames": frames,
+            "passes": passes,
+            "pending_requests": pending,
+        }
+        log.debug(
+            "await_ready %s %s мс, мутаций %s, кадров %s, проходов %s, запросов в полёте %s",
+            reason,
+            result["ms"],
+            mutations,
+            frames,
+            passes,
+            pending,
+        )
+        return result
+
+    def _ready_pass(self, action: dict[str, Any], left: float) -> dict[str, Any] | None:
+        """Один проход `READY` (не дольше `left` с). None — документ сменился; {} — ответ без итога."""
+        params = {
+            "action": {k: action[k] for k in ("kind", "node") if k in action},  # метка и значение в страницу не уходят
+            "fuse_ms": max(1, round(left * 1000)),
+            "frames": QUIET_FRAMES,
+            "attributes": list(MUTATION_ATTRIBUTES),
+        }
+        try:
+            response = self.client.call(
+                "Runtime.evaluate",
+                {"expression": READY + json.dumps(params) + ")", "awaitPromise": True, "returnByValue": True},
+                session_id=self.session_id,
+                timeout=left + WAIT_DEADLINE_MARGIN_S,
+            )
+        except CDPError as exc:
+            log.debug("await_ready: проход прерван: %s", exc)
+            return None
+        if response.get("exceptionDetails"):
+            log.debug("await_ready: проход прерван: документ сменился")
+            return None
+        value = response.get("result", {}).get("value")
+        return value if isinstance(value, dict) else {}
 
     def await_change(self) -> dict[str, Any]:
         """Дождаться следующего изменения страницы, затем `await_ready` (WAIT Jev, WAIT в проверке, второй взгляд; §2).
 
-        Контракт §4.2: пока — пауза 0,1 с, как у WAIT в `act`, и `settle`; время — `wait_ms`, итог — как у
-        `await_ready`."""
-        self._sleep(0.1)
-        return self.await_ready({"kind": "wait"})
+        Изменение — первое из: значимая мутация или конец CSS-анимации/перехода (промис `CHANGE`), с учётом сети — ещё
+        завершение любого запроса вкладки или WS-кадр (подсказка «сейчас что-то изменится»), смена документа. Каждое
+        из двух ожиданий — не дольше предохранителя; изменения не было — `fuse`, без `await_ready`. Итог — как у
+        `await_ready`, плюс `change` (что разбудило) и `ready` (чем кончилась готовность); `wait_reason` — `change`,
+        если изменение было и страница затем готова, иначе `fuse`. Пусто — не ждали (отмена, нет места до дедлайна)."""
+        self.after_input = None
+        self.last_settle = None
+        if self._cancelled():
+            log.debug("await_change пропущен: отмена")
+            return {}
+        fuse = self._fuse()
+        if fuse <= 0:
+            log.debug("await_change пропущен: до дедлайна меньше %g с", WAIT_DEADLINE_MARGIN_S)
+            return {}
+        started = time.monotonic()
+        marks = self.client.network_marks(self.session_id) if self.network else (0, 0)
+
+        def moved() -> bool:
+            return self._cancelled() or (self.network and self.client.network_marks(self.session_id) != marks)
+
+        params = {"fuse_ms": max(1, round(fuse * 1000)), "attributes": list(MUTATION_ATTRIBUTES)}
+        with self._timed(wait=True):
+            try:
+                response = self.client.call_until(
+                    "Runtime.evaluate",
+                    {"expression": CHANGE + json.dumps(params) + ")", "awaitPromise": True, "returnByValue": True},
+                    session_id=self.session_id,
+                    timeout=fuse + WAIT_DEADLINE_MARGIN_S,
+                    stop=moved,
+                )
+            except CDPError as exc:
+                response = {"exceptionDetails": {"text": str(exc)}}
+        change: str | None
+        if response is None:
+            if self._cancelled():
+                log.debug("await_change прерван: отмена")
+                return {}
+            finished, _ws = self.client.network_marks(self.session_id)
+            change = "network" if finished != marks[0] else "websocket"
+        elif response.get("exceptionDetails"):
+            change = "navigation"
+        else:
+            value = response.get("result", {}).get("value")
+            change = value.get("reason") if isinstance(value, dict) else None
+            change = change if change in {"mutation", "animation", "fuse"} else None
+        if change == "fuse":
+            result = {
+                "reason": "fuse",
+                "wait_reason": "fuse",
+                "change": None,
+                "ms": round((time.monotonic() - started) * 1000),
+                "mutations": 0,
+                "frames": 0,
+                "passes": 0,
+                "pending_requests": self._pending(),
+            }
+            self.last_settle = result
+            log.debug("await_change: изменений нет за %s мс", result["ms"])
+            return result
+        ready = self._ready({"kind": "wait"})
+        if not ready and (change is None or self._cancelled()):
+            return {}
+        ready_reason = ready.get("reason")
+        reason = "change" if change is not None and ready_reason != "fuse" else (ready_reason or "change")
+        result = {
+            "mutations": 0,
+            "frames": 0,
+            "passes": 0,
+            "pending_requests": self._pending(),
+            **ready,
+            "reason": reason,
+            "wait_reason": reason,
+            "change": change,
+            "ready": ready_reason,
+            "ms": round((time.monotonic() - started) * 1000),
+        }
+        self.last_settle = result
+        log.debug("await_change %s → %s (%s), %s мс", change, reason, ready_reason, result["ms"])
+        return result
 
     def field_values(self, specs: list[dict[str, Any]]) -> list[str | None]:
         """Что сейчас в полях, куда печатали (`[{node, label}]` из снимка): один `Runtime.evaluate` (`FIELD_VALUES`),
@@ -498,9 +803,15 @@ class Tab:
         return [value if isinstance(value, str) else None for value in values]
 
     def observe(self, screenshot: bool = False) -> dict[str, Any]:
-        if self.after_input:
-            action, self.after_input = self.after_input, None
-            self.settle(action)
+        """Снимок страницы. После действия (`after_input`) — сначала ожидание: WAIT — `await_change`, иначе
+        `await_ready`. Документ сменяется (StalePage) — повтор после готовности нового документа (`READY` ждёт
+        readyState complete событием), не больше STALE_RETRIES раз; итог этих ожиданий `last_settle` не трогает."""
+        action = self.after_input
+        if action:
+            if action.get("kind") == "wait":
+                self.await_change()
+            else:
+                self.await_ready(action)
         for attempt in range(STALE_RETRIES):
             mark = self._browser_s
             try:
@@ -509,7 +820,7 @@ class Tab:
                 self._as_wait(self._browser_s - mark)  # документ грузится: это ожидание, не работа CDP
                 if attempt == STALE_RETRIES - 1:
                     raise
-                self._sleep(0.02)
+                self._ready({"kind": "retry"})
         raise StalePage("Page did not settle")
 
     def _observe(self, screenshot: bool) -> dict[str, Any]:
@@ -560,10 +871,9 @@ class Tab:
     def act(self, action: dict[str, Any], page: dict[str, Any], text: str | None = None) -> dict[str, Any]:
         if not self.fresh(page, action):
             raise StalePage("Page changed since this decision. Observe again.")
-        if action["kind"] == "wait":
-            self._sleep(0.1)
+        self._epoch = self.client.seq  # WAIT и SELECT (его change — внутри evaluate); у ввода — уточняется в _act
         result = self._act(action, text)
-        self.after_input = action  # и после WAIT: снимок через 100 мс на грузящейся странице был бы тем же
+        self.after_input = action  # следующий observe() подождёт: WAIT — изменения, остальное — готовности
         return result
 
     def _act(self, action: dict[str, Any], text: str | None) -> dict[str, Any]:
@@ -571,6 +881,7 @@ class Tab:
         if kind == "scroll":
             width, height = self.viewport
             x, y = round(width * 550 / 1120), round(height * 650 / 780)
+            self._epoch = self.client.seq
             self.call(
                 "Input.dispatchMouseEvent",
                 {"type": "mouseWheel", "x": x, "y": y, "deltaX": 0, "deltaY": action["delta"]},
@@ -594,6 +905,7 @@ class Tab:
                 raise StalePage("Target changed or is covered. Observe again.")
             if kind != "select":
                 x, y = target["x"], target["y"]
+                self._epoch = self.client.seq  # эпоха — перед первой командой ввода
                 for event in ("mousePressed", "mouseReleased"):
                     self.call(
                         "Input.dispatchMouseEvent",
