@@ -605,7 +605,7 @@ def test_sweep_on_fake_core_writes_cells_round_robin_with_reports(tmp_path, monk
     assert summary["sweep"] == "axes" and summary["modes"] == ["goal", "scenario"]
     assert len(summary["cells"]) == len(cells) * 2 and summary["cells"][0]["runs"] == 2
     out = capsys.readouterr().out
-    assert "## delay net=1 · goal" in out and "итого (развёртка axes, goal, scenario): ячеек 12" in out
+    assert "## delay net=1 · goal" in out and "итого (развёртка axes, goal, scenario): ячеек 6," in out
     assert out.splitlines()[0].startswith("cell")
 
 
@@ -727,6 +727,7 @@ def test_sweep_report_tables_curves_and_before_after(tmp_path, capsys):
     assert "| 1600 | 1/5 (4–62 %) | 9.0 / 9.0 |" in text
     assert "  1600 before ████················ 1/5  медиана 9.0 с" in text
     assert "       after  ████████████████████ 5/5" in text
+    assert text.index("## remount · scenario") < text.index("## remount · goal")  # ось за осью, режимы подряд
     assert (
         "## remount · goal" in text
         and "| 0 | 3/3" in text

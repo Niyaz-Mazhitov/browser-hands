@@ -129,7 +129,9 @@ def bar(k: int, n: int) -> str:
 def format_report(datasets: Sequence[Dataset]) -> str:
     """Markdown: по оси и режиму — таблица (колонки по наборам) и ASCII-кривая доли успехов; в конце — итоги."""
     groups = [axis_groups(rows) for _, rows in datasets]
-    keys = list(dict.fromkeys(key for group in groups for key in group))
+    found = list(dict.fromkeys(key for group in groups for key in group))
+    axes = list(dict.fromkeys(axis for axis, _ in found))  # ось за осью, внутри — режимы в порядке файла
+    keys = sorted(found, key=lambda key: axes.index(key[0]))
     names = [label for label, _ in datasets]
     multi = len(datasets) > 1
     width = max(map(len, names)) if multi else 0

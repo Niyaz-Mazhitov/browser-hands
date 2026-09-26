@@ -961,7 +961,8 @@ def format_sweep(summary: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) 
 
     lines = [format_report([(summary.get("label") or "sweep", list(rows))])]
     lines.append(
-        f"итого (развёртка {summary['sweep']}, {', '.join(summary['modes'])}): ячеек {len(summary['cells'])}, "
+        f"итого (развёртка {summary['sweep']}, {', '.join(summary['modes'])}): "
+        f"ячеек {len({cell['cell'] for cell in summary['cells']})}, "
         f"verified {summary['verified']}/{summary['runs']}; cost ${summary['cost_total']:.4f}"
     )
     if summary.get("stopped"):
