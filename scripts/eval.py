@@ -20,6 +20,7 @@ import contextlib
 import functools
 import json
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -66,6 +67,13 @@ FORM_EXPECTED: dict[str, Any] = {
 }
 SEARCH_LABEL = "Search or start a new chat"
 SEARCH_QUERY = "Раб"  # --fixtures-only: совпадает с «Рабочий» и отвлекающим «Работа»
+# search-remount: поле сообщения пересоздаётся через REMOUNT_MS после открытия чата (текст пропадает, как в WhatsApp
+# 26.09), после Send — «Sending…» ещё SEND_STATUS_MS, у исходящих кнопки «HH:MM Sent» — есть куда кликнуть лишний раз
+REMOUNT_MS = 900
+SEND_STATUS_MS = 1500
+COMPOSER_TO = f"Type a message to {CHAT}"  # подпись поля при remount, как в WhatsApp
+STATUS_SENT = re.compile(r"\d\d:\d\d Sent")
+STATUS_SENDING = re.compile(r"\d\d:\d\d Sending…")
 WIKI_URL = "https://en.wikipedia.org/wiki/Main_Page"
 WIKI_GOAL = "Find and open the Wikipedia article about Gödel's incompleteness theorems."  # как bench/live_wikipedia
 WIKI_QUERY = "Gödel's incompleteness theorems"
@@ -174,6 +182,13 @@ TASKS: dict[str, Task] = {
         Task("search", "app.html?delay=700", CHAT_GOAL, chat_problem, CHAT_SCENARIO),
         Task("search-spinner", "app.html?delay=700&spinner=1", CHAT_GOAL, chat_problem, CHAT_SCENARIO),
         Task("boot", "app.html?boot=4000&delay=700", CHAT_GOAL, chat_problem, CHAT_SCENARIO),
+        Task(
+            "search-remount",
+            f"app.html?delay=700&remount={REMOUNT_MS}&sendstatus={SEND_STATUS_MS}",
+            CHAT_GOAL,
+            chat_problem,
+            CHAT_SCENARIO,
+        ),
         Task("form", "form.html", FORM_GOAL, form_problem, FORM_SCENARIO),
         Task("wiki", "", WIKI_GOAL, None, WIKI_SCENARIO, url=WIKI_URL, verify_result=wiki_problem),
     )
@@ -362,21 +377,22 @@ def step_number(step: Any) -> dict[str, Any]:
 @contextlib.contextmanager
 def record_decisions(sink: list[dict[str, Any]]) -> Iterator[None]:
     """На время прогона оборачивает `browser_hands.agent.choose`: на каждое решение Jev — что было на странице
-    (видимый текст, элементы), под какой шаг сценария и что выбрано. Ядро не меняется; нет такой функции — ничего
-    не пишет."""
+    (видимый текст, элементы), под какой шаг сценария, что выбрано и `t_ms` — когда пришёл ответ (мс от входа в
+    контекст, ≈ начало прогона). Ядро не меняется; нет такой функции — ничего не пишет."""
     original = getattr(agent_module, "choose", None)
     if original is None:
         yield
         return
+    started = time.monotonic()
 
     def recording(clients: Any, state: dict[str, Any], goal: str, history: Any, *args: Any, **kwargs: Any) -> Any:
         where = {**seen(state), **step_number(kwargs.get("step"))}
         try:
             decision = original(clients, state, goal, history, *args, **kwargs)
         except Exception as exc:
-            sink.append({**where, "error": f"{type(exc).__name__}: {exc}"})
+            sink.append({**where, "error": f"{type(exc).__name__}: {exc}", "t_ms": _since(started)})
             raise
-        sink.append({**where, **chosen(state, decision)})
+        sink.append({**where, **chosen(state, decision), "t_ms": _since(started)})
         return decision
 
     setattr(agent_module, "choose", recording)
@@ -384,6 +400,10 @@ def record_decisions(sink: list[dict[str, Any]]) -> Iterator[None]:
         yield
     finally:
         setattr(agent_module, "choose", original)
+
+
+def _since(started: float) -> int:
+    return round((time.monotonic() - started) * 1000)
 
 
 def trail(decisions: Sequence[Mapping[str, Any]]) -> str:
@@ -736,6 +756,60 @@ def check_boot(driver: Driver, server: FixtureServer, run: str) -> str:
     return "первый снимок без элементов, через 2,5 с есть; " + chat_flow(driver, server, run, spinner=False)
 
 
+def labels(page: Mapping[str, Any], pattern: re.Pattern[str]) -> list[str]:
+    """Подписи кнопок-статусов сообщений в снимке («HH:MM Sent» / «HH:MM Sending…»)."""
+    return [str(a.get("label")) for a in page.get("actions") or () if pattern.fullmatch(str(a.get("label") or ""))]
+
+
+def check_remount(driver: Driver, server: FixtureServer, run: str) -> str:
+    """Поле сообщения пересоздаётся через REMOUNT_MS после открытия чата (новый узел, текст пропал, Send спрятан);
+    повторный ввод остаётся; после Send — «Sending…», через SEND_STATUS_MS — «Sent»; клик по «HH:MM Sent» открывает
+    «Message info», отчёт при этом прежний."""
+    driver.open(server.url(with_params(TASKS["search-remount"].page, run=run)))
+    driver.do("fill", label=SEARCH_LABEL, text=SEARCH_QUERY)
+    time.sleep(1.0)
+    need(has_chat(driver.observe()), f"через 1 с после ввода «{CHAT}» нет в списке")
+    clicked = time.monotonic()
+    driver.do("click", prefix=CHAT)
+    typed = driver.do("fill", label=COMPOSER_TO, text=MESSAGE)
+    typed_ms = round((time.monotonic() - clicked) * 1000)
+    before = find_action(typed, "fill", label=COMPOSER_TO)
+    need(before and before.get("value") == MESSAGE, f"ввод через {typed_ms} мс после клика: текста в поле нет")
+    need(find_action(typed, "click", label="Send"), "после ввода нет Send")
+    assert before is not None
+    time.sleep(max(0.0, REMOUNT_MS / 1000 - (time.monotonic() - clicked)) + 0.4)
+    wiped = driver.observe()
+    after = find_action(wiped, "fill", label=COMPOSER_TO)
+    need(after, f"после пересоздания нет поля «{COMPOSER_TO}»")
+    assert after is not None
+    need(after["node"] != before["node"], "поле не пересоздано: тот же узел")
+    need(not after.get("value"), f"текст пережил пересоздание: {after.get('value')!r}")
+    need(not find_action(wiped, "click", label="Send"), "Send виден при пустом поле")
+    need(find_action(wiped, "click", label="Voice message"), "при пустом поле нет «Voice message»")
+    past = labels(wiped, STATUS_SENT)
+    need(past, "у прошлых сообщений нет кнопок «HH:MM Sent»")
+    driver.do("fill", label=COMPOSER_TO, text=MESSAGE)
+    time.sleep(1.0)
+    kept = find_action(driver.observe(), "fill", label=COMPOSER_TO)
+    need(kept and kept.get("value") == MESSAGE, "повторный ввод пропал: пересоздание не одно")
+    sending = labels(driver.do("click", label="Send"), STATUS_SENDING)
+    need(len(sending) == 1, f"сразу после Send кнопок «HH:MM Sending…»: {len(sending)}, ожидалась 1")
+    problem = chat_problem(server.wait_report(run))
+    need(problem is None, f"отчёт страницы сразу после Send: {problem}")
+    time.sleep(SEND_STATUS_MS / 1000 + 0.3)
+    done = driver.observe()
+    need(not labels(done, STATUS_SENDING), f"через {SEND_STATUS_MS} мс статус всё ещё «Sending…»")
+    info = driver.do("click", label=labels(done, STATUS_SENT)[-1])
+    need("Message info" in info["text"], "клик по «HH:MM Sent» не открыл «Message info»")
+    problem = chat_problem(server.wait_report(run))
+    need(problem is None, f"отчёт страницы после «Message info»: {problem}")
+    return (
+        f"ввод через {typed_ms} мс после клика — текст есть; через {REMOUNT_MS} мс поле новое, пустое, без Send; "
+        f"повторный ввод остался; «{sending[0]}» → «Sent»; прошлых «HH:MM Sent» в снимке {len(past)}; "
+        "клик по статусу — «Message info»"
+    )
+
+
 def check_form(driver: Driver, server: FixtureServer, run: str) -> str:
     driver.open(server.url(with_params(TASKS["form"].page, run=run)))
     driver.do("fill", label="Name", text=FORM_EXPECTED["name"])
@@ -753,6 +827,7 @@ FIXTURE_CHECKS: dict[str, Callable[[Driver, FixtureServer, str], str]] = {
     "search": check_search,
     "search-spinner": check_spinner,
     "boot": check_boot,
+    "search-remount": check_remount,
     "form": check_form,
 }
 
