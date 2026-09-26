@@ -29,7 +29,7 @@ from browser_hands.server import (
     format_result,
     normalize_url,
 )
-from tests.fakes import JPEG, FakeCore, make_result
+from tests.fakes import JPEG, FakeCore, make_result, unconfirmed_result
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -766,6 +766,20 @@ def test_format_result_scenario_lines():
 
     verbose = format_result(make_result("blocked", steps=1, scenario=(0, 4)), verbose=True, steps=steps)
     assert "1. CLICK Target 1 [шаг 1]  [0.7 с, conf 0.90, изменилась: да, https://example.test/1]" in verbose
+
+
+def test_unconfirmed_scenario_says_the_step_is_probably_done_and_to_check_the_screenshot():
+    steps = [ScenarioStep(f"Step {i}") for i in range(1, 5)]
+    lines = format_result(unconfirmed_result(), steps=steps).splitlines()
+    assert lines[:4] == [
+        "status: unconfirmed",
+        "error: step 4 of 4: probably done, not confirmed — check the screenshot",
+        "сценарий: 3 из 4 выполнено",
+        "шаг 4 из 4 не подтверждён (вероятно, выполнен — проверь скриншот): Step 4",
+    ]
+    assert not any(line.startswith("остановился") for line in lines)
+    unknown = format_result(unconfirmed_result())  # сценарий вызова не передан
+    assert "\nшаг 4 из 4 не подтверждён (вероятно, выполнен — проверь скриншот)\n" in unknown
 
 
 GOAL_TEXT = (
