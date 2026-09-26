@@ -69,7 +69,7 @@ SEARCH_LABEL = "Search or start a new chat"
 SEARCH_QUERY = "Раб"  # --fixtures-only: совпадает с «Рабочий» и отвлекающим «Работа»
 # search-remount: поле сообщения пересоздаётся через REMOUNT_MS после открытия чата (текст пропадает, как в WhatsApp
 # 26.09), после Send — «Sending…» ещё SEND_STATUS_MS, у исходящих кнопки «HH:MM Sent» — есть куда кликнуть лишний раз
-REMOUNT_MS = 900
+REMOUNT_MS = 1600  # 900 агент переживал (решение устаревало); 1600 воспроизводит WhatsApp 26.09 (0/5 до правок)
 SEND_STATUS_MS = 1500
 COMPOSER_TO = f"Type a message to {CHAT}"  # подпись поля при remount, как в WhatsApp
 STATUS_SENT = re.compile(r"\d\d:\d\d Sent")
@@ -82,20 +82,20 @@ WIKI_ARTICLE = "/wiki/Gödel's_incompleteness_theorems"  # в url после unq
 # Сценарии задач (`--mode scenario`): do — по-английски (Jev на нём точнее), text — дословно (plan-scenarios §0.5)
 CHAT_SCENARIO: tuple[dict[str, str], ...] = (
     {"do": "Type the chat name into the chat search box", "text": CHAT},
-    {"do": f"Open the chat named «{CHAT}» in the chat list"},
+    {"do": f"Open the chat named «{CHAT}» in the chat list (done when its header shows «{CHAT}»)"},
     {"do": "Type the message into the message box of the open chat", "text": MESSAGE},
-    {"do": "Send the message"},
+    {"do": "Send the message (done when it appears in the chat)"},
 )
 FORM_SCENARIO: tuple[dict[str, str], ...] = (
     {"do": "Fill the Name field", "text": FORM_EXPECTED["name"]},
     {"do": "Fill the Email field", "text": FORM_EXPECTED["email"]},
     {"do": f"Select {FORM_EXPECTED['country']} in the Country dropdown"},
     {"do": "Tick the checkbox «I agree to the terms»"},
-    {"do": "Submit the form"},
+    {"do": "Submit the form (done when a thank-you message is shown)"},
 )
 WIKI_SCENARIO: tuple[dict[str, str], ...] = (
     {"do": "Type the query into the Wikipedia search box", "text": WIKI_QUERY},
-    {"do": "Open the matching article from the suggestions or search results"},
+    {"do": "Open the matching article from the suggestions or search results (done when the article page is open)"},
 )
 MODES = ("goal", "scenario")
 

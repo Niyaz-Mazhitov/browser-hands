@@ -107,7 +107,7 @@ def test_task_pages_exist_and_carry_the_labels_the_scenarios_use():
 def test_remount_task_turns_on_the_whatsapp_like_page_parts():
     task = stand.TASKS["search-remount"]
     params = dict(parse_qsl(urlsplit(task.page).query))
-    assert params == {"delay": "700", "remount": "900", "sendstatus": "1500"}
+    assert params == {"delay": "700", "remount": "1600", "sendstatus": "1500"}
     assert (int(params["remount"]), int(params["sendstatus"])) == (stand.REMOUNT_MS, stand.SEND_STATUS_MS)
     assert task.goal == stand.CHAT_GOAL and task.scenario == stand.CHAT_SCENARIO
     for other in ("search", "search-spinner", "boot"):  # прежние задачи — без пересоздания и статусов
@@ -136,7 +136,7 @@ def test_status_labels_match_only_message_status_buttons():
 def test_delay_flag_changes_only_pages_with_a_search_delay():
     assert stand.page_for(stand.TASKS["search"], delay=900) == "app.html?delay=900"
     assert stand.page_for(stand.TASKS["boot"], delay=900) == "app.html?boot=4000&delay=900"
-    assert stand.page_for(stand.TASKS["search-remount"], delay=900) == "app.html?delay=900&remount=900&sendstatus=1500"
+    assert stand.page_for(stand.TASKS["search-remount"], delay=900) == "app.html?delay=900&remount=1600&sendstatus=1500"
     remount = stand.page_for(stand.TASKS["search-remount"], delay=None, remount=1600)
     assert remount == "app.html?delay=700&remount=1600&sendstatus=1500"
     assert stand.page_for(stand.TASKS["search"], delay=None, remount=1600) == "app.html?delay=700"  # remount нет
