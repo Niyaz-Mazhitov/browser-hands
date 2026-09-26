@@ -651,6 +651,15 @@ def test_fixture_pages_cover_variants_overrides_and_sweep_cells():
     assert sweep[0][1] == "app.html?delay=0&remount=0&sendstatus=0&net=1"
 
 
+def test_readme_describes_the_sweep_and_the_remount_default():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    dev = " ".join(readme[readme.index("## Разработка") :].split())
+    assert "0,9 с" not in dev
+    assert f"{stand.REMOUNT_MS / 1000:g}".replace(".", ",") + " с" in dev  # время пересоздания — как REMOUNT_MS
+    for part in ("--sweep axes", "net=1", "net=0", "remount=800,1600", "scripts/sweep_report.py", "--fuse"):
+        assert part in dev
+
+
 # --- sweep_report --------------------------------------------------------------------------------------------------
 
 
