@@ -53,6 +53,10 @@ STEP_DONE_CRITERIA = {
     "yes": "The current step is visibly complete on the CURRENT page.",
     "no": "The current step is not complete yet, or the page does not show it.",
 }
+# Факт для Jev: запросы вкладки, начатые последним действием, ещё в полёте (`Tab.loading`, фоновые тоже) — только
+# число, без адресов и тел; одинаково в режиме цели, сценария и проверки. Нет таких запросов — ключа нет (тело запроса
+# режима цели прежнее, tests/snapshots/jev_goal_request.json).
+LOADING = "Page is still loading: {n} network request(s) started by the last action have not finished yet."
 
 
 class ModelTimeout(TimeoutError):
@@ -375,9 +379,12 @@ def build_request(
     *,
     step: StepContext | None = None,
     verify: bool = False,
+    loading: int = 0,
 ) -> tuple[dict[str, Any], dict[str, str], dict[str, dict[str, dict[str, Any]]], dict[str, dict[str, Any]]]:
     """Тело одного запроса к Jev: операция + спекулятивные цели для каждой доступной операции. При `step` — цель
-    шага (объект), правила шага, DONE про шаг и голова `step_done`; `goal` тогда — внутри `step`.
+    шага (объект), правила шага, DONE про шаг и голова `step_done`; `goal` тогда — внутри `step`. `loading` > 0 —
+    в `state.page.loading` факт «страница ещё загружается» (`LOADING`: сколько запросов, начатых последним действием,
+    в полёте), в любом режиме.
 
     `verify` (только со `step`) — режим проверки после неподтверждённого DONE: из операций — WAIT, DONE и BLOCKED;
     целей для CLICK, TYPE_TEXT, SELECT и прокрутки нет вовсе, у элементов нет списка операций — поля и значения видны
@@ -421,10 +428,13 @@ def build_request(
             "criteria": dict(STEP_DONE_CRITERIA),
             "instructions": done_instructions,
         }
+    page: dict[str, Any] = {k: state[k] for k in ("url", "title", "text")}
+    if loading > 0:
+        page["loading"] = LOADING.format(n=loading)
     body = {
         "model": config.jev_model,
         "state": {
-            "page": {k: state[k] for k in ("url", "title", "text")},
+            "page": page,
             "elements": elements,
             "recent_actions": [_recent_action(h) for h in history[-HISTORY_FOR_CHOICE:]],
         },
@@ -442,14 +452,18 @@ def choose(
     timeout: float | None = None,
     step: StepContext | None = None,
     verify: bool = False,
+    loading: int = 0,
 ) -> Decision:
     """Один запрос к Jev; проверяется и исполняется только голова выбранной операции. При `step` проверяется и голова
     `step_done` (нет или невалидна — `ValueError`, как у операции): `Decision.step_done` = вероятность `yes`.
-    `verify` — режим проверки (`build_request`): ответ вне WAIT/DONE/BLOCKED невалиден."""
+    `verify` — режим проверки (`build_request`): ответ вне WAIT/DONE/BLOCKED невалиден. `loading` — запросов, начатых
+    последним действием, в полёте (факт в `state.page`, `build_request`)."""
     config = clients.config
     if not config.jev_api_key:
         raise ValueError("No Jev API key: set OPENROUTER_API_KEY or BROWSER_HANDS_JEV_API_KEY.")
-    body, operations, targets, controls = build_request(config, state, goal, history, step=step, verify=verify)
+    body, operations, targets, controls = build_request(
+        config, state, goal, history, step=step, verify=verify, loading=loading
+    )
     started = time.perf_counter()
     result = clients.post(
         config.jev_url, config.jev_api_key, body, limit=config.jev_timeout_s, timeout=timeout, name="Jev"

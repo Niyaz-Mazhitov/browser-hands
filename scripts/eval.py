@@ -681,10 +681,17 @@ def step_number(step: Any) -> dict[str, Any]:
     return {} if number is None else {"scenario_step": number}
 
 
+def loading_of(value: Any) -> dict[str, Any]:
+    """Факт «страница ещё загружается», который видел Jev (`choose(loading=N)`: запросов последнего действия в
+    полёте); 0 или ядро без него — пусто."""
+    return {"loading": value} if type(value) is int and value > 0 else {}
+
+
 @contextlib.contextmanager
 def record_decisions(sink: list[dict[str, Any]], *, started: float | None = None) -> Iterator[None]:
     """На время прогона оборачивает `browser_hands.agent.choose`: на каждое решение Jev — что было на странице
-    (видимый текст, элементы), под какой шаг сценария, что выбрано и `t_ms` — когда пришёл ответ (мс от `started`,
+    (видимый текст, элементы, `loading` — запросов последнего действия в полёте), под какой шаг сценария, что выбрано
+    и `t_ms` — когда пришёл ответ (мс от `started`,
     по умолчанию — от входа в контекст, ≈ начало прогона). Ядро не меняется; нет такой функции — ничего не пишет."""
     original = getattr(agent_module, "choose", None)
     if original is None:
@@ -693,7 +700,7 @@ def record_decisions(sink: list[dict[str, Any]], *, started: float | None = None
     started = time.monotonic() if started is None else started
 
     def recording(clients: Any, state: dict[str, Any], goal: str, history: Any, *args: Any, **kwargs: Any) -> Any:
-        where = {**seen(state), **step_number(kwargs.get("step"))}
+        where = {**seen(state), **step_number(kwargs.get("step")), **loading_of(kwargs.get("loading"))}
         try:
             decision = original(clients, state, goal, history, *args, **kwargs)
         except Exception as exc:
@@ -724,6 +731,8 @@ def trail(decisions: Sequence[Mapping[str, Any]]) -> str:
         part = f"{d.get('op')} «{str(target)[:32]}»" if target else str(d.get("op"))
         if d.get("step_done") is not None:  # режим сценария: шаг и p(«шаг выполнен»)
             part += f" (шаг {d.get('scenario_step', '?')}, p={d['step_done']:.2f})"
+        if d.get("loading"):  # Jev видел «страница ещё загружается»
+            part += f" [грузится {d['loading']}]"
         parts.append(part)
     return " → ".join(parts)
 

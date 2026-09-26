@@ -399,6 +399,28 @@ def test_record_decisions_keeps_the_scenario_step_and_step_done():
     assert stand.trail(sink).startswith("CLICK «Send» (шаг 2, p=0.83) → CLICK «Send» (шаг ?, p=0.83)")
 
 
+def test_record_decisions_keeps_the_loading_fact_jev_saw():
+    from browser_hands import agent
+
+    original = agent.choose
+    state = {"url": "http://127.0.0.1/app.html", "text": "", "actions": [{"id": "wait", "kind": "wait", "label": "W"}]}
+
+    class Decision:
+        choice, operation, confidence = "wait", "WAIT", 0.7
+
+    sink: list = []
+    agent.choose = lambda clients, state, goal, history, **kwargs: Decision()
+    try:
+        with stand.record_decisions(sink):
+            agent.choose(None, state, "g", [], timeout=1.0, loading=1)
+            agent.choose(None, state, "g", [], timeout=1.0, loading=0)
+    finally:
+        agent.choose = original
+    first, second = sink
+    assert first["loading"] == 1 and "loading" not in second
+    assert stand.trail(sink) == "WAIT «W» [грузится 1] → WAIT «W»"
+
+
 def test_fixture_checks_cover_every_local_task():
     assert set(stand.FIXTURE_CHECKS) == set(stand.DEFAULT_TASKS)
     assert not hasattr(

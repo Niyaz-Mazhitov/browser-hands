@@ -867,3 +867,32 @@ def test_history_note_reaches_jev_only_where_it_is_set():
         "note": "text vanished after typing (page re-rendered)",
     }
     assert all("note" not in a for a in recent[:-2] + recent[-1:])
+
+
+# --- медленные ответы: факт «страница ещё загружается» (docs/core-notes.md, feat/waits-fix) -----------------------
+
+
+def test_loading_fact_reaches_jev_in_every_mode_only_as_a_count():
+    config = ModelConfig(jev_api_key="test-jev")
+    step = model.StepContext(tuple(SCENARIO), 2)
+    bodies = [
+        model.build_request(config, rich_page(), "goal", rich_history(), loading=2)[0],
+        model.build_request(config, rich_page(), "", rich_history(), step=step, loading=2)[0],
+        model.build_request(config, rich_page(), "", rich_history(), step=step, verify=True, loading=2)[0],
+    ]
+    fact = "Page is still loading: 2 network request(s) started by the last action have not finished yet."
+    assert [b["state"]["page"]["loading"] for b in bodies] == [fact] * 3
+    assert list(bodies[0]["state"]["page"]) == ["url", "title", "text", "loading"]
+    quiet, *_ = model.build_request(config, rich_page(), "goal", rich_history(), loading=0)
+    assert "loading" not in quiet["state"]["page"]  # тело прежнее (снимок режима цели)
+
+
+def test_choose_sends_the_loading_fact():
+    def answer(_u, _k, body, **_kw):
+        return {"answers": {"operation": choice(body["questions"]["operation"]["criteria"], "WAIT")}}
+
+    post = Mock(side_effect=answer)
+    state = {**rich_page(), "actions": [{"id": "wait", "kind": "wait", "label": "Wait for the page to update"}]}
+    decision = model.choose(make_clients(post), state, "goal", [], loading=1)
+    assert decision.operation == "WAIT"
+    assert post.call_args.args[2]["state"]["page"]["loading"].startswith("Page is still loading: 1 network")
