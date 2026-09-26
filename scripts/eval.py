@@ -682,15 +682,15 @@ def step_number(step: Any) -> dict[str, Any]:
 
 
 def loading_of(value: Any) -> dict[str, Any]:
-    """Факт «страница ещё загружается», который видел Jev (`choose(loading=N)`: запросов последнего действия в
-    полёте); 0 или ядро без него — пусто."""
+    """Факт «страница ещё загружается», который видел Jev (`choose(loading=N)`: запросов действий в полёте);
+    0 или ядро без него — пусто."""
     return {"loading": value} if type(value) is int and value > 0 else {}
 
 
 @contextlib.contextmanager
 def record_decisions(sink: list[dict[str, Any]], *, started: float | None = None) -> Iterator[None]:
     """На время прогона оборачивает `browser_hands.agent.choose`: на каждое решение Jev — что было на странице
-    (видимый текст, элементы, `loading` — запросов последнего действия в полёте), под какой шаг сценария, что выбрано
+    (видимый текст, элементы, `loading` — запросов действий агента в полёте), под какой шаг сценария, что выбрано
     и `t_ms` — когда пришёл ответ (мс от `started`,
     по умолчанию — от входа в контекст, ≈ начало прогона). Ядро не меняется; нет такой функции — ничего не пишет."""
     original = getattr(agent_module, "choose", None)

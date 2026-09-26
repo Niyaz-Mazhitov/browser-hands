@@ -5,8 +5,9 @@
 сгенерированный текст переиспользуется только при идентичном контексте; исполнение записывается до наблюдения;
 3 действия подряд без изменения страницы (кроме WAIT) → ожидание изменения и свежий снимок (как второй шанс перед
 BLOCKED; снова — после действия, сменившего страницу, или пока в полёте запросы, начатые этими действиями), иначе
-blocked. Jev видит факт «страница ещё загружается»: сколько запросов, начатых последним действием, в полёте
-(`Tab.loading`, фоновые тоже; только число) — в любом режиме. Повторы — сетевые, внутри `ModelClients.post`, и один
+blocked. Jev видит факт «страница ещё загружается»: сколько запросов, начатых действиями с последней смены страницы,
+в полёте (`Tab.in_flight`, фоновые тоже; только число) — в любом режиме. Повторы — сетевые, внутри `ModelClients.post`,
+и один
 запрос к текстовой модели при невалидном ответе, ошибке провайдера или таймауте (до ввода). BLOCKED переспрашивается
 один раз после ожидания изменения страницы (снова — после действия, изменившего её).
 Отмена (`cancel`) проверяется перед каждым вызовом модели и каждым действием: `failed` / `cancelled`, без новых мутаций.
@@ -161,7 +162,7 @@ def matches(value: Any, text: str) -> bool:
 
 
 def _count(value: Any) -> int:
-    """Число запросов из `Tab.loading`/`Tab.in_flight`; не целое (вкладка без учёта сети, заглушка) — 0."""
+    """Число запросов из `Tab.in_flight`; не целое (вкладка без учёта сети, заглушка) — 0."""
     return value if type(value) is int and value > 0 else 0
 
 
@@ -602,16 +603,25 @@ class Agent(AgentLike):
         """Режим цели: текст, пропавший из этого поля (`_typed_vanish`), — ввести снова его же, без текстовой модели."""
         return next((r.text for r in reversed(self._retype) if _same_field(r, action)), None)
 
+    def _in_flight(self) -> int:
+        """Запросов вкладки в полёте, начатых действиями с последней смены страницы: последним действием (или
+        ожиданием), после которого страница изменилась, и всеми следующими; фоновые тоже (`Tab.in_flight`). Изменений
+        не было — с первого действия; действий не было — 0. Трасса delay 3000: после ввода в поиск Jev кликает по полю
+        (клик запросов не начинает) — ответ поиска всё ещё в пути, страница загружается."""
+        anchor = next((h for h in reversed(self._history) if h.get("page_changed") is not False), None)
+        if anchor is None and self._history:
+            anchor = self._history[0]
+        since = None if anchor is None else anchor.get("epoch")
+        return _count(self._require_tab().in_flight(since if type(since) is int else None))
+
     def _stalled(self, page: dict[str, Any]) -> None:
         """`NO_PROGRESS_STEPS` действий подряд без изменения страницы. Перед `blocked` — ожидание изменения и свежий
         снимок, как второй шанс перед BLOCKED (`_look_again`, решение — в следующем тике): один раз, пока действие не
-        сменит страницу, и снова — пока в полёте запросы, начатые этими действиями или действием перед ними (фоновые
-        тоже: предохранитель их пережил, ответ ещё придёт — действия шли по недогруженной странице). Запись ожидания в
+        сменит страницу, и снова — пока в полёте запросы, начатые действиями с последней смены страницы (`_in_flight`,
+        фоновые тоже: предохранитель их пережил, ответ ещё придёт — действия шли по недогруженной странице). Запись в
         истории разрывает серию: следующая проверка — не раньше ещё `NO_PROGRESS_STEPS` действий без изменений (их
         ограничивают `max_steps`, бюджет решений и `STEP_ACTIONS_LIMIT`)."""
-        start = len(self._history) - NO_PROGRESS_STEPS
-        since = self._history[max(start - 1, 0)].get("epoch")
-        in_flight = _count(self._require_tab().in_flight(since if type(since) is int else None))
+        in_flight = self._in_flight()
         if self._stall_look_used and not in_flight:
             raise _Stop("blocked", f"No page change after {NO_PROGRESS_STEPS} consecutive actions")
         self._stall_look_used = True
@@ -779,7 +789,7 @@ class Agent(AgentLike):
                 "target": None,
                 "page_changed": None,
                 "url": page["url"],
-                "epoch": tab.action_epoch,  # эпоха последнего действия (`_stalled`): ожидание запросов не начинает
+                "epoch": tab.action_epoch,  # эпоха последнего действия (`_in_flight`): ожидание запросов не начинает
             }
         )
         tab.await_change()
@@ -798,10 +808,10 @@ class Agent(AgentLike):
         if self._jev_calls >= budget:
             raise _Stop("step_limit", f"Model-call budget exhausted ({self._jev_calls} decisions)")
         self._check_cancel()
-        # Факт для Jev (любой режим): запросы, начатые последним действием, ещё в полёте — страница загружается.
-        loading = _count(tab.loading())
+        # Факт для Jev (любой режим): запросы, начатые действиями с последней смены страницы, ещё в полёте.
+        loading = self._in_flight()
         if loading:
-            log.debug("страница загружается: запросов последнего действия в полёте — %d", loading)
+            log.debug("страница загружается: запросов действий в полёте — %d", loading)
         remaining = self._remaining()
         started = time.perf_counter()
         try:
@@ -973,7 +983,7 @@ class Agent(AgentLike):
                 "target": decision.target,
                 "page_changed": None,
                 "url": page["url"],
-                # эпоха действия (`Tab.action_epoch`; у WAIT — прежняя): чьи запросы ещё в полёте (`_stalled`)
+                # эпоха действия (`Tab.action_epoch`; у WAIT — прежняя): чьи запросы ещё в полёте (`_in_flight`)
                 "epoch": tab.action_epoch,
             }
         )

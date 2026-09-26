@@ -1110,18 +1110,18 @@ def clicked_with_a_slow_request(fake_tab):
     return fake_tab.await_ready(p["actions"][2])
 
 
-def test_loading_counts_requests_of_the_last_action_even_after_the_fuse(fake_tab):
+def test_in_flight_counts_requests_of_the_action_even_after_the_fuse(fake_tab):
     fake_tab.fuse_s = 0.3
-    assert fake_tab.loading() == 0 and fake_tab.action_epoch is None  # действий ещё не было
+    assert fake_tab.action_epoch is None and fake_tab.in_flight(fake_tab.action_epoch) == 0  # действий ещё не было
     result = clicked_with_a_slow_request(fake_tab)
     assert (result["wait_reason"], result["pending_requests"]) == ("fuse", 1)
     assert fake_tab.client.pending_since("S1", fake_tab._epoch) == 0  # фон: ожиданий больше не держит
     assert fake_tab.action_epoch == fake_tab._epoch
-    assert fake_tab.loading() == 1  # но ответа нет — страница ещё загружается (запрос `boot` — не от действия)
+    assert fake_tab.in_flight(fake_tab.action_epoch) == 1  # но ответа нет — страница загружается (`boot` — не от клика)
     assert fake_tab.in_flight(0) == 2 and fake_tab.in_flight(None) == 0
     fake_tab.server.on["Target.getTargets"] = lambda f, ws: (net(ws, "Network.loadingFinished", "search"), reply(ws, f))
     fake_tab.client.call("Target.getTargets")
-    assert fake_tab.loading() == 0
+    assert fake_tab.in_flight(fake_tab.action_epoch) == 0
 
 
 def test_wait_after_the_fuse_is_woken_when_the_backgrounded_request_of_the_action_finishes(fake_tab):
@@ -1142,10 +1142,10 @@ def test_wait_after_the_fuse_is_woken_when_the_backgrounded_request_of_the_actio
     result = fake_tab.await_change()
     assert (result["wait_reason"], result["change"], result["ready"]) == ("change", "network", "quiet")
     assert time.monotonic() - started < 2.0
-    assert fake_tab.loading() == 0
+    assert fake_tab.in_flight(fake_tab.action_epoch) == 0
 
 
-def test_navigation_is_not_an_action_for_loading(fake_tab):
+def test_navigation_is_not_an_action_epoch(fake_tab):
     server = fake_tab.server
 
     def navigate(frame, ws):
@@ -1158,13 +1158,13 @@ def test_navigation_is_not_an_action_for_loading(fake_tab):
     )
     fake_tab.fuse_s = 0.2
     fake_tab.navigate("https://example.test/")
-    assert fake_tab.loading() == 0 and fake_tab.in_flight(0) == 1
+    assert fake_tab.action_epoch is None and fake_tab.in_flight(fake_tab.action_epoch) == 0
+    assert fake_tab.in_flight(0) == 1
 
 
-def test_user_tab_without_network_never_reports_loading():
+def test_user_tab_without_network_never_reports_requests_in_flight():
     tab = make_tab(Mock(), owned=False, network=None)
-    tab.action_epoch = 0
-    assert tab.network is False and tab.loading() == 0 and tab.in_flight(0) == 0
+    assert tab.network is False and tab.in_flight(0) == 0
 
 
 def test_user_tab_on_fake_cdp_enables_no_network_and_waits_on_dom_signals_only(fake_tab):

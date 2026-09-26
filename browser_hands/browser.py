@@ -349,8 +349,8 @@ class Tab:
         self._focus_emulated = False
         self._network_enabled = False
         self._epoch = 0  # client.seq перед командой последнего действия: запросы, начатые позже, — от действия
-        # то же, но только исполненного действия агента (`act`), без навигации: «запросы, начатые последним действием»
-        # (`loading`); None — действий ещё не было
+        # то же, но только исполненного действия агента (`act`), без навигации: агент помнит её у каждого действия и
+        # спрашивает `in_flight` — какие запросы его действий ещё в полёте; None — действий ещё не было
         self.action_epoch: int | None = None
         self._owner: str | None = None  # своя метка __bhOwner (claim); release() удаляет её, только если она наша
         self._foreign = False  # метка чужая: release() страницу не трогает
@@ -589,11 +589,6 @@ class Tab:
         if not self.network or since is None:
             return 0
         return self.client.in_flight_since(self.session_id, since)
-
-    def loading(self) -> int:
-        """«Страница ещё загружается»: запросов в полёте, начатых последним исполненным действием (`action_epoch`),
-        фоновые тоже — факт для наблюдения Jev (только число). До первого действия и без учёта сети — 0."""
-        return self.in_flight(self.action_epoch)
 
     def _wait_network(self, until: float) -> bool:
         """Насос событий, пока запросы после эпохи не завершатся (или отмена), не дольше `until` (monotonic). True —

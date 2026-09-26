@@ -880,7 +880,7 @@ def test_loading_fact_reaches_jev_in_every_mode_only_as_a_count():
         model.build_request(config, rich_page(), "", rich_history(), step=step, loading=2)[0],
         model.build_request(config, rich_page(), "", rich_history(), step=step, verify=True, loading=2)[0],
     ]
-    fact = "Page is still loading: 2 network request(s) started by the last action have not finished yet."
+    fact = "Page is still loading: 2 network request(s) started by recent actions have not finished yet."
     assert [b["state"]["page"]["loading"] for b in bodies] == [fact] * 3
     assert list(bodies[0]["state"]["page"]) == ["url", "title", "text", "loading"]
     quiet, *_ = model.build_request(config, rich_page(), "goal", rich_history(), loading=0)
