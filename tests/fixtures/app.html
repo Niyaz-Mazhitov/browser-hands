@@ -1,16 +1,22 @@
 <!doctype html>
 <!--
-  Стенд надёжности (scripts/eval.py): WhatsApp-подобная страница без сети, один файл.
+  Стенд надёжности (scripts/eval.py): WhatsApp-подобная страница, один файл; сеть — только к своему серверу стенда.
   Параметры в query: boot=<мс> — экран загрузки без элементов для действия (по умолчанию 0);
   delay=<мс> — задержка результатов поиска (700); spinner=1 — пока ищем, список заменён строкой
   «Searching» с точками, меняются каждые 100 мс (без него список молчит до результатов);
   history=<символов> — объём переписки в открытом чате (3000); run=<id> — метка прогона для отчёта.
-  remount=<мс> — как WhatsApp, догружающий чат: через столько после открытия чата поле сообщения удаляется и создаётся
-  заново (новый узел, пустой: введённый текст пропадает, Send прячется); подпись поля — «Type a message to <чат>»
+  net=1 (по умолчанию, если страница открыта с сервера) — задержки поиска и подтверждения Send — настоящие запросы:
+  fetch GET /api/search?q=…&delay=<delay> и POST /api/send?delay=<мс>, пауза — на сервере стенда (FixtureServer);
+  net=0 — те же задержки таймерами (setTimeout), сети нет. Открыта файлом — всегда таймеры.
+  remount=<мс>[,<мс>…] — как WhatsApp, догружающий чат: через столько после открытия чата поле сообщения удаляется и
+  создаётся заново (новый узел, пустой: введённый текст пропадает, Send прячется); список — несколько пересозданий;
+  всегда таймер (у WhatsApp это событие websocket, не запрос). Подпись поля — «Type a message to <чат>»
   (без remount — «Type a message»). sendstatus=<мс> — Send: сообщение сразу в списке со статусом «Sending…» (часики),
   через столько — «Sent» (галочка); статус у исходящих — кнопка «HH:MM Sent» (у прошлых тоже), клик — панель
-  «Message info». Оба по умолчанию выключены (0): без sendstatus сообщение появляется через 300 мс, статус — не кнопка.
-  Отчёт: state() читает только DOM → POST /report при каждом изменении и sendBeacon на pagehide.
+  «Message info». Оба по умолчанию выключены (0): без sendstatus сообщение появляется через senddelay=<мс> (300),
+  статус — не кнопка.
+  Отчёт: state() читает DOM (открытый чат, поиск, отправленные, текст поля composer) и разобранные параметры params →
+  POST /report при каждом изменении и sendBeacon на pagehide.
   Чаты «Работа» и «Рабочий» — ниже края списка: без поиска их не видно (как в настоящем WhatsApp).
 -->
 <html lang="ru">
@@ -155,7 +161,10 @@
   };
   const BOOT = num('boot', 0), DELAY = num('delay', 700), HISTORY = num('history', 3000);
   const SPINNER = params.get('spinner') === '1', RUN = params.get('run') || '';
-  const REMOUNT = num('remount', 0), SENDSTATUS = num('sendstatus', 0);
+  const SENDSTATUS = num('sendstatus', 0), SENDDELAY = num('senddelay', 300);
+  const REMOUNT = (params.get('remount') || '').split(',').map(Number)  // список: remount=800,1600
+    .filter(value => Number.isFinite(value) && value > 0).sort((a, b) => a - b);
+  const NET = num('net', 1) > 0 && location.protocol.startsWith('http');  // файлом — таймеры: сервера нет
   const $ = id => document.getElementById(id);
   const el = (tag, cls, text) => {
     const e = document.createElement(tag);
@@ -204,7 +213,8 @@
   const list = $('chats'), search = $('search'), clear = $('clear');
   const send = $('send'), voice = $('voice');
   let composer = $('composer');  // remount заменяет узел: всегда через эту переменную
-  let current = null, shownQuery = '', searchTimer = 0, spinTimer = 0, remountTimer = 0, sentKey = 0;
+  let current = null, shownQuery = '', searchTimer = 0, spinTimer = 0, remountTimers = [], sentKey = 0;
+  let searchSeq = 0, searchAbort = null;
 
   const textOf = box => box.innerText.replace(/ /g, ' ').trim();
   const normalize = box => { if (!textOf(box)) box.replaceChildren(); };  // пустое поле → :empty (плейсхолдер)
@@ -249,24 +259,47 @@
     spinTimer = setInterval(() => { line.textContent = 'Searching' + '.'.repeat(++tick % 4); }, 100);
   }
 
+  // Ответ «сервера»: net=1 — запрос к стенду с паузой на сервере, net=0 — таймер той же длины.
+  function later(ms, api, init, done) {
+    if (!NET) return {timer: setTimeout(done, ms)};
+    const abort = new AbortController();
+    const url = `/api/${api}?${new URLSearchParams({delay: ms, run: RUN, ...(init.query || {})})}`;
+    fetch(url, {method: init.method || 'GET', body: init.body, signal: abort.signal, cache: 'no-store'})
+      .then(response => response.json()).then(done).catch(() => {});  // прерван новым вводом — молчим
+    return {abort};
+  }
+  function cancelSearch() {
+    searchSeq++;
+    clearTimeout(searchTimer);
+    searchAbort?.abort();
+    searchAbort = null;
+  }
+
   search.addEventListener('input', () => {
     normalize(search);
     const query = textOf(search);
     clear.hidden = !query;
-    clearTimeout(searchTimer);
+    cancelSearch();
     stopSpinner();
     if (!query) {
       renderList('');
       return;
     }
     if (SPINNER) startSpinner();  // без спиннера список молчит до результатов
-    searchTimer = setTimeout(() => { stopSpinner(); renderList(query); }, DELAY);
+    const id = searchSeq;
+    const pending = later(DELAY, 'search', {query: {q: query}}, () => {
+      if (id !== searchSeq) return;  // пришёл ответ на прежний ввод
+      stopSpinner();
+      renderList(query);
+    });
+    searchTimer = pending.timer || 0;
+    searchAbort = pending.abort || null;
   });
   search.addEventListener('keydown', event => { if (event.key === 'Enter') event.preventDefault(); });
   clear.addEventListener('click', () => {
     search.replaceChildren();
     clear.hidden = true;
-    clearTimeout(searchTimer);
+    cancelSearch();
     stopSpinner();
     renderList('');
   });
@@ -326,10 +359,11 @@
     composer.replaceChildren();
     updateComposer();
     renderMessages(chat);
-    clearTimeout(remountTimer);
-    if (REMOUNT > 0) {
+    remountTimers.forEach(clearTimeout);
+    remountTimers = [];
+    if (REMOUNT.length) {
       composer.setAttribute('aria-label', `Type a message to ${chat.name}`);
-      remountTimer = setTimeout(remountComposer, REMOUNT);
+      remountTimers = REMOUNT.map(ms => setTimeout(remountComposer, ms));
     }
   }
 
@@ -344,7 +378,8 @@
   function sendMessage() {
     const text = textOf(composer), chat = current;
     if (!text || !chat) return;
-    if (SENDSTATUS > 0) {  // сразу в списке «Sending…», поле очищено; через SENDSTATUS мс — «Sent»
+    const body = JSON.stringify({chat: chat.name, text});
+    if (SENDSTATUS > 0) {  // сразу в списке «Sending…», поле очищено; ответ сервера через SENDSTATUS мс — «Sent»
       const now = new Date().toTimeString().slice(0, 5);
       const message = {out: true, fresh: true, text, time: now, status: 'sending', key: ++sentKey};
       chat.messages.push(message);
@@ -353,13 +388,13 @@
       updateComposer();
       if (current === chat) renderMessages(chat);
       if (!spinTimer) renderList(shownQuery);
-      setTimeout(() => {
+      later(SENDSTATUS, 'send', {method: 'POST', body}, () => {
         message.status = 'sent';
         document.querySelector(`#messages [data-key="${message.key}"] .meta`)?.replaceWith(meta(message));
-      }, SENDSTATUS);
+      });
       return;
     }
-    setTimeout(() => {  // сервер «подтвердил» через 300 мс: сообщение в списке, поле очищено
+    later(SENDDELAY, 'send', {method: 'POST', body}, () => {  // сервер подтвердил: сообщение в списке, поле очищено
       const now = new Date();
       chat.messages.push({out: true, fresh: true, text, time: now.toTimeString().slice(0, 5), key: ++sentKey});
       chat.time = now.toTimeString().slice(0, 5);
@@ -367,7 +402,7 @@
       updateComposer();
       if (current === chat) renderMessages(chat);
       if (!spinTimer) renderList(shownQuery);
-    }, 300);
+    });
   }
 
   function wireComposer(box) {
@@ -382,7 +417,9 @@
   wireComposer(composer);
   send.addEventListener('click', sendMessage);
 
-  // Отчёт стенду: только то, что видно в DOM.
+  // Отчёт стенду: то, что видно в DOM, и параметры, как их поняла страница (стенд сверяет их с ячейкой).
+  const PARAMS = {delay: DELAY, remount: REMOUNT, sendstatus: SENDSTATUS, senddelay: SENDDELAY, net: NET ? 1 : 0,
+    spinner: SPINNER ? 1 : 0, boot: BOOT};
   let seq = 0, lastJson = '';
   function state() {
     const open = !$('conv').hidden;
@@ -392,6 +429,8 @@
       openChat: open ? $('chat-title').textContent : null,
       query: textOf(search),
       sent: [...document.querySelectorAll('#messages [data-out]')].map(e => e.querySelector('.text').textContent),
+      composer: open ? textOf(composer) : null,
+      params: PARAMS,
     };
   }
   function report(beacon) {
