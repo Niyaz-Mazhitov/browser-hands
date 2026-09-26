@@ -347,7 +347,10 @@ def test_three_unchanged_actions_are_blocked(monkeypatch):
     monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e3", "CLICK")))
     result = agent.run()
     assert result.status == "blocked" and "No page change" in result.error
-    assert len(result.steps) == 3
+    # 3 без изменений → ожидание изменения и свежий снимок (второй шанс) → ещё 3 без изменений → blocked
+    assert len(result.steps) == 6 and result.jev_calls == 6
+    tab.await_change.assert_called_once_with()
+    assert [h["kind"] for h in agent._history] == ["click"] * 3 + ["wait"] + ["click"] * 3
 
 
 BLOCKED = decision("BLOCKED", "BLOCKED")
@@ -1780,11 +1783,12 @@ def test_scenario_no_progress_counts_only_actions_of_the_current_step(monkeypatc
     agent = make_agent(tab, steps=[*steps, ScenarioStep("Submit")], goal="")
     typed = decision("e1", "TYPE_TEXT", step_done=0.0)
     click = decision("e3", "CLICK", step_done=0.0)
-    monkeypatch.setattr(loop, "choose", scripted(typed, typed, typed, click, click, click))
+    monkeypatch.setattr(loop, "choose", scripted(typed, typed, typed, *[click] * 6))
     result = agent.run()
-    # три текстовых шага по одному действию — не «3 подряд без изменений»; внутри шага 4 — да
+    # три текстовых шага по одному действию — не «3 подряд без изменений»; внутри шага 4 — да (после второго шанса)
     assert result.status == "blocked" and result.error == "No page change after 3 consecutive actions"
-    assert result.scenario_done == 3 and [s.scenario_step for s in result.steps] == [1, 2, 3, 4, 4, 4]
+    assert result.scenario_done == 3 and [s.scenario_step for s in result.steps] == [1, 2, 3, 4, 4, 4, 4, 4, 4]
+    tab.await_change.assert_called_once_with()
 
 
 LONG_LABEL = "Very long chat name that goes on and on well beyond forty characters"
@@ -2455,3 +2459,78 @@ def test_steps_carry_the_wait_reason_and_pending_requests_of_their_wait(monkeypa
     assert tab.await_ready.call_args_list[0].args[0]["id"] == "e3"
     assert labels(tab) == ["Go", "Go"]  # WAIT — ожидание изменения, без Tab.act
     assert tab.after_input is None  # ждали сами: observe() второй раз не ждёт
+
+
+# --- медленные ответы и текст в режиме цели (feat/waits-fix) -------------------------------------------------------
+
+
+def test_jev_sees_how_many_requests_of_the_last_action_are_still_in_flight(monkeypatch):
+    tab = make_tab()
+    tab.loading.side_effect = [0, 1, 0]  # до действия; после ввода ответ поиска ещё не пришёл; пришёл
+    agent = make_agent(tab)
+    choose = scripted(decision("e3", "CLICK"), decision("wait", "WAIT"), DONE)
+    monkeypatch.setattr(loop, "choose", choose)
+    assert agent.run().status == "done"
+    assert [c.kwargs["loading"] for c in choose.call_args_list] == [0, 1, 0]
+
+
+def test_jev_sees_the_loading_fact_in_scenario_mode_too(monkeypatch):
+    tab = make_tab()
+    tab.loading.return_value = 2
+    agent = make_agent(tab, steps=TWO, goal="")
+    choose = scripted(decision("e3", "CLICK", step_done=0.9), decision("e3", "CLICK", step_done=0.9))
+    monkeypatch.setattr(loop, "choose", choose)
+    assert agent.run().status == "done"
+    assert {c.kwargs["loading"] for c in choose.call_args_list} == {2}
+
+
+def still_pages(*texts):
+    """Снимки по очереди, последний повторяется: одинаковый текст — страница «не меняется»."""
+    queue = list(texts)
+    return lambda *_a, **_k: page(queue.pop(0) if len(queue) > 1 else queue[0])
+
+
+def test_no_page_change_waits_for_a_change_and_looks_again_before_blocked(monkeypatch, caplog):
+    """delay 3000 (трасса): три клика по полю поиска, пока ответ поиска не пришёл, — не повод для blocked: ожидание
+    изменения и свежий снимок, решает Jev."""
+    tab = make_tab()
+    tab.observe.side_effect = still_pages("Search", "Search", "Search", "Search", "Results")
+    agent = make_agent(tab)
+    choose = scripted(*[decision("e3", "CLICK")] * 3, DONE)
+    monkeypatch.setattr(loop, "choose", choose)
+    result, lines = info_lines(caplog, agent.run)
+    assert result.status == "done" and len(result.steps) == 3 and choose.call_count == 4
+    tab.await_change.assert_called_once_with()
+    assert agent._history[-1]["kind"] == "wait" and agent._history[-1]["page_changed"] is True  # Jev видит ожидание
+    assert "no page change after 3 actions: жду изменения страницы и спрашиваю ещё раз (example.test)" in lines
+    assert lines[-1].startswith("browse done:")
+
+
+def test_no_page_change_keeps_waiting_while_requests_of_those_actions_are_in_flight(monkeypatch):
+    tab = make_tab()
+    epochs = iter(range(100, 200))
+
+    def act(action, _page, text=None):
+        tab.action_epoch = next(epochs)  # эпоха каждого исполненного действия (как Tab.act)
+        return {"executed": action["id"]}
+
+    tab.act.side_effect = act
+    tab.action_epoch = None
+    tab.observe.side_effect = still_pages("Search", "Typed")  # первый клик сменил страницу, дальше — ничего
+    tab.in_flight.side_effect = [1, 1, 0]  # ответ поиска в полёте две проверки, потом его нет
+    agent = make_agent(tab)
+    monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e3", "CLICK")))
+    result = agent.run()
+    assert result.status == "blocked" and result.error == "No page change after 3 consecutive actions"
+    assert len(result.steps) == 1 + 3 * 3 and tab.await_change.call_count == 2
+    # чьи запросы: действия перед серией (100 — клик, сменивший страницу), потом — эпоха на момент ожидания
+    assert [c.args[0] for c in tab.in_flight.call_args_list] == [100, 103, 106]
+
+
+def test_second_chance_before_no_progress_blocked_comes_back_after_a_page_change(monkeypatch):
+    tab = make_tab()
+    tab.observe.side_effect = still_pages(*["A"] * 5, *["B"] * 4)  # после ожидания и клика — новая страница
+    agent = make_agent(tab)
+    monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e3", "CLICK")))
+    result = agent.run()
+    assert result.status == "blocked" and tab.await_change.call_count == 2  # по разу на страницу A и B

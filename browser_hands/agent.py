@@ -3,7 +3,10 @@
 Перенос `jev_ultrafast/agent.py` (MIT, Browser Use) в блокирующий `Agent.run() -> RunResult`. Инварианты источника:
 решение потребляется до любой мутации (повтор не кликнет дважды); `StalePage` → переснять и выбрать заново;
 сгенерированный текст переиспользуется только при идентичном контексте; исполнение записывается до наблюдения;
-3 действия подряд без изменения страницы (кроме WAIT) → blocked. Повторы — сетевые, внутри `ModelClients.post`, и один
+3 действия подряд без изменения страницы (кроме WAIT) → ожидание изменения и свежий снимок (как второй шанс перед
+BLOCKED; снова — после действия, сменившего страницу, или пока в полёте запросы, начатые этими действиями), иначе
+blocked. Jev видит факт «страница ещё загружается»: сколько запросов, начатых последним действием, в полёте
+(`Tab.loading`, фоновые тоже; только число) — в любом режиме. Повторы — сетевые, внутри `ModelClients.post`, и один
 запрос к текстовой модели при невалидном ответе, ошибке провайдера или таймауте (до ввода). BLOCKED переспрашивается
 один раз после ожидания изменения страницы (снова — после действия, изменившего её).
 Отмена (`cancel`) проверяется перед каждым вызовом модели и каждым действием: `failed` / `cancelled`, без новых мутаций.
@@ -153,6 +156,11 @@ def matches(value: Any, text: str) -> bool:
     return bool(bare) and _alnum(value) == bare
 
 
+def _count(value: Any) -> int:
+    """Число запросов из `Tab.loading`/`Tab.in_flight`; не целое (вкладка без учёта сети, заглушка) — 0."""
+    return value if type(value) is int and value > 0 else 0
+
+
 def wait_fields(result: Any) -> tuple[str | None, int]:
     """`Step.wait_reason` и `pending_requests` из итога `Tab.await_ready`/`await_change`: `wait_reason` (иначе `reason`)
     и число запросов в полёте (`pending_requests`, иначе `pending`: число или их список). Не ждали (`{}`) — None и 0."""
@@ -247,6 +255,9 @@ class Agent(AgentLike):
         self._invariants: list[Invariant] = []  # тексты шагов, закрытых кодом, которые должны оставаться в полях
         self._uncertain = 0  # неуверенных действий подряд (уверенность ниже thresholds.min_action_confidence)
         self._done_look_used = False  # режим цели: неуверенный DONE уже получил второй взгляд
+        # «Нет изменений после NO_PROGRESS_STEPS действий»: ожидание перед blocked уже было (снова — после действия,
+        # сменившего страницу, или пока в полёте запросы, начатые этими действиями)
+        self._stall_look_used = False
         self._model_calls = 0
         self._jev_calls = 0
         self._scenario_no = 1  # текущий шаг сценария (с 1)
@@ -511,7 +522,7 @@ class Agent(AgentLike):
         self._scenario_done += 1
         self._step_actions = 0
         self._step_history = len(self._history)
-        self._second_chance_used = False
+        self._second_chance_used = self._stall_look_used = False
         self._checking, self._check_waits, self._uncertain = False, 0, 0
         if self._scenario_done >= total:
             raise _Stop("done")
@@ -539,13 +550,29 @@ class Agent(AgentLike):
         self._invariants = [i for i in self._invariants if i.step < j]
         self._step_actions = 0
         self._step_history = len(self._history)
-        self._second_chance_used = False
+        self._second_chance_used = self._stall_look_used = False
         self._checking, self._check_waits, self._uncertain = False, 0, 0
         if self._history:
             self._history[-1]["note"] = INVARIANT_BROKEN.format(step=j)
         log.info("шаг %d/%d: текст шага %d пропал — возвращаюсь к шагу %d (%d-й раз)", was, total, j, j, count)
         if count > RETYPE_LIMIT:
             raise _Stop("blocked", f"{self._step_name()}: typed text does not stay in the field")
+
+    def _stalled(self, page: dict[str, Any]) -> None:
+        """`NO_PROGRESS_STEPS` действий подряд без изменения страницы. Перед `blocked` — ожидание изменения и свежий
+        снимок, как второй шанс перед BLOCKED (`_look_again`, решение — в следующем тике): один раз, пока действие не
+        сменит страницу, и снова — пока в полёте запросы, начатые этими действиями или действием перед ними (фоновые
+        тоже: предохранитель их пережил, ответ ещё придёт — действия шли по недогруженной странице). Запись ожидания в
+        истории разрывает серию: следующая проверка — не раньше ещё `NO_PROGRESS_STEPS` действий без изменений (их
+        ограничивают `max_steps`, бюджет решений и `STEP_ACTIONS_LIMIT`)."""
+        start = len(self._history) - NO_PROGRESS_STEPS
+        since = self._history[max(start - 1, 0)].get("epoch")
+        in_flight = _count(self._require_tab().in_flight(since if type(since) is int else None))
+        if self._stall_look_used and not in_flight:
+            raise _Stop("blocked", f"No page change after {NO_PROGRESS_STEPS} consecutive actions")
+        self._stall_look_used = True
+        loading = f", {in_flight} requests of these actions in flight" if in_flight else ""
+        self._look_again(page, f"no page change after {NO_PROGRESS_STEPS} actions{loading}")
 
     def _check_step_limit(self) -> None:
         """Сценарий: на шаге уже `STEP_ACTIONS_LIMIT` действий — `step_limit`, следующее не исполняется."""
@@ -562,7 +589,7 @@ class Agent(AgentLike):
         self._history[-1].update(page_changed=changed, url=new_page["url"])
         step.page_changed, step.url = changed, new_page["url"]
         if changed:
-            self._second_chance_used = self._done_look_used = False
+            self._second_chance_used = self._done_look_used = self._stall_look_used = False
         return changed
 
     def _refresh_page(self) -> None:
@@ -690,6 +717,7 @@ class Agent(AgentLike):
                 "target": None,
                 "page_changed": None,
                 "url": page["url"],
+                "epoch": tab.action_epoch,  # эпоха последнего действия (`_stalled`): ожидание запросов не начинает
             }
         )
         tab.await_change()
@@ -708,6 +736,10 @@ class Agent(AgentLike):
         if self._jev_calls >= budget:
             raise _Stop("step_limit", f"Model-call budget exhausted ({self._jev_calls} decisions)")
         self._check_cancel()
+        # Факт для Jev (любой режим): запросы, начатые последним действием, ещё в полёте — страница загружается.
+        loading = _count(tab.loading())
+        if loading:
+            log.debug("страница загружается: запросов последнего действия в полёте — %d", loading)
         remaining = self._remaining()
         started = time.perf_counter()
         try:
@@ -719,6 +751,7 @@ class Agent(AgentLike):
                 timeout=remaining,
                 step=self._step_context(),
                 verify=self._checking,
+                loading=loading,
             )
         finally:
             self._model_calls += 1
@@ -873,6 +906,8 @@ class Agent(AgentLike):
                 "target": decision.target,
                 "page_changed": None,
                 "url": page["url"],
+                # эпоха действия (`Tab.action_epoch`; у WAIT — прежняя): чьи запросы ещё в полёте (`_stalled`)
+                "epoch": tab.action_epoch,
             }
         )
         step = Step(
@@ -948,4 +983,4 @@ class Agent(AgentLike):
         if len(repeated) == NO_PROGRESS_STEPS and all(
             h["page_changed"] is False and h["kind"] != "wait" for h in repeated
         ):
-            raise _Stop("blocked", f"No page change after {NO_PROGRESS_STEPS} consecutive actions")
+            self._stalled(new_page)
